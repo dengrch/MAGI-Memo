@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "equations": {
+    "eq-eeee555566667777eeee555566667777-0001": {
+      "id": "eq-eeee555566667777eeee555566667777-0001",
+      "blockid": "ce41f9057e2c53925253dafa4f662b9c",
+      "heading": "Combined",
+      "parent_headings": [],
+      "format": "latex",
+      "content": "F = ma",
+      "caption": "",
+      "footnotes": []
+    }
+  }
+}

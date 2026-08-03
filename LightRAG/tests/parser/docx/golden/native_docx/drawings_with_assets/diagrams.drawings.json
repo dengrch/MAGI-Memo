@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "drawings": {
+    "im-dddd444455556666dddd444455556666-0001": {
+      "id": "im-dddd444455556666dddd444455556666-0001",
+      "blockid": "82c9efee34c100ad2d87db6c62b1d374",
+      "heading": "Diagrams",
+      "parent_headings": [],
+      "format": "png",
+      "path": "diagrams.blocks.assets/fig1.png",
+      "src": "docx://image1",
+      "caption": "",
+      "footnotes": []
+    },
+    "im-dddd444455556666dddd444455556666-0002": {
+      "id": "im-dddd444455556666dddd444455556666-0002",
+      "blockid": "82c9efee34c100ad2d87db6c62b1d374",
+      "heading": "Diagrams",
+      "parent_headings": [],
+      "format": "jpg",
+      "path": "diagrams.blocks.assets/fig2.jpg",
+      "src": "docx://image2",
+      "caption": "",
+      "footnotes": []
+    }
+  }
+}

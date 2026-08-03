@@ -1,0 +1,325 @@
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+// import { MiniMap } from '@react-sigma/minimap'
+import { SigmaContainer, useRegisterEvents, useSigma } from '@react-sigma/core'
+import { Settings as SigmaSettings } from 'sigma/settings'
+import { GraphSearchOption, OptionItem } from '@react-sigma/graph-search'
+import {
+  EdgeArrowProgram,
+  EdgeLineProgram,
+  EdgeRectangleProgram,
+  NodePointProgram,
+  NodeCircleProgram
+} from 'sigma/rendering'
+import { NodeBorderProgram } from '@sigma/node-border'
+import { EdgeCurvedArrowProgram, createEdgeCurveProgram } from '@sigma/edge-curve'
+
+import FocusOnNode from '@/components/graph/FocusOnNode'
+import LayoutsControl from '@/components/graph/LayoutsControl'
+import GraphControl from '@/components/graph/GraphControl'
+// import ThemeToggle from '@/components/ThemeToggle'
+import ZoomControl from '@/components/graph/ZoomControl'
+import FullScreenControl from '@/components/graph/FullScreenControl'
+import Settings from '@/components/graph/Settings'
+import GraphSearch from '@/components/graph/GraphSearch'
+import GraphLabels from '@/components/graph/GraphLabels'
+import PropertiesView from '@/components/graph/PropertiesView'
+import SettingsDisplay from '@/components/graph/SettingsDisplay'
+import Legend from '@/components/graph/Legend'
+import LegendButton from '@/components/graph/LegendButton'
+
+import { useSettingsStore } from '@/stores/settings'
+import { useGraphStore } from '@/stores/graph'
+import useIsDarkMode from '@/hooks/useIsDarkMode'
+import { labelColorDarkTheme, labelColorLightTheme, edgeColorDarkTheme, EDGE_PERF_LIMIT } from '@/lib/constants'
+
+import '@react-sigma/core/lib/style.css'
+import '@react-sigma/graph-search/lib/style.css'
+
+// Function to create sigma settings based on theme.
+// `enableEdgeEvents` MUST be passed in (not toggled at runtime): sigma allocates
+// the edge WebGL picking buffer once at construction based on this flag, so a
+// later setSettings({ enableEdgeEvents: true }) cannot retroactively enable edge
+// hover/click. We therefore key it off the user setting here and let the
+// SigmaContainer rebuild the instance when the setting changes.
+const createSigmaSettings = (
+  isDarkTheme: boolean,
+  enableEdgeEvents: boolean
+): Partial<SigmaSettings> => ({
+  allowInvalidContainer: true,
+  // Nodes use the border program so every node gets a white ring (the
+  // @sigma/node-border default reads `borderColor` for the ring, `color` for
+  // the fill; ring thickness is a fixed 10% of the radius). Single GPU draw
+  // call -- cheap even at 70k+ nodes. (Earlier "border blanks the canvas"
+  // reports were actually the fetch effect never firing -- once that was
+  // fixed, the border program rendered fine.)
+  defaultNodeType: 'border',
+  // 'rect' (EdgeRectangleProgram) draws straight quads that RESPECT the edge
+  // size attribute; EdgeLineProgram renders fixed ~1px GL lines and ignores
+  // size entirely. Rectangles are still far cheaper than tessellated curves.
+  defaultEdgeType: 'rect',
+  renderEdgeLabels: false,
+  // Skip edge rendering while panning/zooming - big win on large graphs.
+  hideEdgesOnMove: true,
+  edgeProgramClasses: {
+    rect: EdgeRectangleProgram,
+    line: EdgeLineProgram,
+    arrow: EdgeArrowProgram,
+    curvedArrow: EdgeCurvedArrowProgram,
+    // kept registered for backward compatibility with edges that still
+    // carry type: 'curvedNoArrow'
+    curvedNoArrow: createEdgeCurveProgram()
+  },
+  nodeProgramClasses: {
+    point: NodePointProgram,
+    default: NodePointProgram,
+    circle: NodeCircleProgram,
+    border: NodeBorderProgram
+  },
+  labelGridCellSize: 60,
+  labelRenderedSizeThreshold: 12,
+  // Off by default (edge picking renders edges to an extra buffer every frame —
+  // costly on large graphs); turning on the "Edge Events" setting rebuilds the
+  // instance with the picking buffer so edges become hover/click-selectable.
+  enableEdgeEvents,
+  // Without per-edge reducers (disabled when nothing is focused), edges with
+  // no color attribute fall back to this.
+  defaultEdgeColor: isDarkTheme ? edgeColorDarkTheme : '#d3d3d3',
+  labelColor: {
+    color: isDarkTheme ? labelColorDarkTheme : labelColorLightTheme,
+    attribute: 'labelColor'
+  },
+  edgeLabelColor: {
+    color: isDarkTheme ? labelColorDarkTheme : labelColorLightTheme,
+    attribute: 'labelColor'
+  },
+  edgeLabelSize: 8,
+  labelSize: 12
+})
+
+const GraphEvents = () => {
+  const registerEvents = useRegisterEvents()
+  const sigma = useSigma()
+  const [draggedNode, setDraggedNode] = useState<string | null>(null)
+
+  useEffect(() => {
+    // Register the events
+    registerEvents({
+      downNode: (e) => {
+        setDraggedNode(e.node)
+        sigma.getGraph().setNodeAttribute(e.node, 'highlighted', true)
+      },
+      // On mouse move, if the drag mode is enabled, we change the position of the draggedNode
+      mousemovebody: (e) => {
+        if (!draggedNode) return
+        // Get new position of node
+        const pos = sigma.viewportToGraph(e)
+        sigma.getGraph().setNodeAttribute(draggedNode, 'x', pos.x)
+        sigma.getGraph().setNodeAttribute(draggedNode, 'y', pos.y)
+
+        // Prevent sigma to move camera:
+        e.preventSigmaDefault()
+        e.original.preventDefault()
+        e.original.stopPropagation()
+      },
+      // On mouse up, we reset the autoscale and the dragging mode
+      mouseup: () => {
+        if (draggedNode) {
+          setDraggedNode(null)
+          sigma.getGraph().removeNodeAttribute(draggedNode, 'highlighted')
+        }
+      },
+      // Disable the autoscale at the first down interaction
+      mousedown: (e) => {
+        // Only set custom BBox if it's a drag operation (mouse button is pressed)
+        const mouseEvent = e.original as MouseEvent
+        if (mouseEvent.buttons !== 0 && !sigma.getCustomBBox()) {
+          sigma.setCustomBBox(sigma.getBBox())
+        }
+      }
+    })
+  }, [registerEvents, sigma, draggedNode])
+
+  return null
+}
+
+const GraphViewer = () => {
+  const sigmaRef = useRef<any>(null)
+  const prevTheme = useRef<string>('')
+
+  const selectedNode = useGraphStore.use.selectedNode()
+  const focusedNode = useGraphStore.use.focusedNode()
+  const moveToSelectedNode = useGraphStore.use.moveToSelectedNode()
+  const isFetching = useGraphStore.use.isFetching()
+  const isLayoutComputing = useGraphStore.use.isLayoutComputing()
+
+  const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
+  const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
+  const enableNodeDrag = useSettingsStore.use.enableNodeDrag()
+  const showLegend = useSettingsStore.use.showLegend()
+  const theme = useSettingsStore.use.theme()
+  const enableEdgeEvents = useSettingsStore.use.enableEdgeEvents()
+  const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+
+  // Edge events are disabled above EDGE_PERF_LIMIT regardless of the user
+  // setting: the picking buffer renders edges to an extra frame buffer every
+  // frame, which is too costly on large graphs. The user setting is preserved
+  // (Settings greys the menu item but keeps its value), so dropping back below
+  // the limit auto-restores edge events.
+  const effectiveEdgeEvents = enableEdgeEvents && graphEdgeCount <= EDGE_PERF_LIMIT
+
+  const [isThemeSwitching, setIsThemeSwitching] = useState(false)
+
+  // Resolve effective dark mode (handles theme === 'system' against the OS
+  // preference, and stays reactive to OS color-scheme changes).
+  const isDarkMode = useIsDarkMode()
+
+  // Memoize sigma settings to prevent unnecessary re-creation. Keyed on the
+  // RESOLVED dark mode, not the raw theme: under theme === 'system' + OS dark
+  // the old `theme === 'dark'` check produced light-theme defaults, which the
+  // idle-state (null reducers) graph rendered verbatim.
+  // enableEdgeEvents is in the deps because it must be baked in at construction
+  // (the picking buffer can't be added later); toggling it rebuilds the instance.
+  const memoizedSigmaSettings = useMemo(
+    () => createSigmaSettings(isDarkMode, effectiveEdgeEvents),
+    [isDarkMode, effectiveEdgeEvents]
+  )
+
+  // Detect theme changes and briefly show a loading overlay to avoid flash of
+  // unstyled content. setState is inside setTimeout (async), not synchronously
+  // in the effect body, so react-hooks/set-state-in-effect is not triggered.
+  useEffect(() => {
+    const isThemeChange = prevTheme.current && prevTheme.current !== theme
+    if (isThemeChange) {
+      console.log('Theme switching detected:', prevTheme.current, '->', theme)
+      prevTheme.current = theme
+
+      const switchTimer = setTimeout(() => setIsThemeSwitching(true), 0)
+      const timer = setTimeout(() => {
+        setIsThemeSwitching(false)
+        console.log('Theme switching completed')
+      }, 150)
+
+      return () => {
+        clearTimeout(switchTimer)
+        clearTimeout(timer)
+      }
+    }
+    prevTheme.current = theme
+    console.log('Initialized sigma settings for theme:', theme)
+  }, [theme])
+
+  // Clean up sigma instance when component unmounts
+  useEffect(() => {
+    return () => {
+      // TAB is mount twice in vite dev mode, this is a workaround
+
+      const sigma = useGraphStore.getState().sigmaInstance
+      if (sigma) {
+        try {
+          // Destroy sigma，and clear WebGL context
+          sigma.kill()
+          useGraphStore.getState().setSigmaInstance(null)
+          console.log('Cleared sigma instance on Graphviewer unmount')
+        } catch (error) {
+          console.error('Error cleaning up sigma instance:', error)
+        }
+      }
+    }
+  }, [])
+
+  // Note: There was a useLayoutEffect hook here to set up the sigma instance and graph data,
+  // but testing showed it wasn't executing or having any effect, while the backup mechanism
+  // in GraphControl was sufficient. This code was removed to simplify implementation
+
+  const onSearchFocus = useCallback((value: GraphSearchOption | null) => {
+    if (value === null) useGraphStore.getState().setFocusedNode(null)
+    else if (value.type === 'nodes') useGraphStore.getState().setFocusedNode(value.id)
+  }, [])
+
+  const onSearchSelect = useCallback((value: GraphSearchOption | null) => {
+    if (value === null) {
+      useGraphStore.getState().setSelectedNode(null)
+    } else if (value.type === 'nodes') {
+      useGraphStore.getState().setSelectedNode(value.id, true)
+    }
+  }, [])
+
+  const autoFocusedNode = useMemo(() => focusedNode ?? selectedNode, [focusedNode, selectedNode])
+  const searchInitSelectedNode = useMemo(
+    (): OptionItem | null => (selectedNode ? { type: 'nodes', id: selectedNode } : null),
+    [selectedNode]
+  )
+
+  // Always render SigmaContainer but control its visibility with CSS
+  return (
+    <div className="relative h-full w-full overflow-hidden">
+      <SigmaContainer
+        settings={memoizedSigmaSettings}
+        className="!bg-background !size-full overflow-hidden"
+        ref={sigmaRef}
+      >
+        <GraphControl />
+
+        {enableNodeDrag && <GraphEvents />}
+
+        <FocusOnNode node={autoFocusedNode} move={moveToSelectedNode} />
+
+        <div className="absolute top-2 left-2 flex items-start gap-2">
+          <GraphLabels />
+          {showNodeSearchBar && !isThemeSwitching && (
+            <GraphSearch
+              value={searchInitSelectedNode}
+              onFocus={onSearchFocus}
+              onChange={onSearchSelect}
+            />
+          )}
+        </div>
+
+        <div className="bg-background/60 absolute bottom-2 left-2 flex flex-col rounded-xl border-2 backdrop-blur-lg">
+          <LayoutsControl />
+          <ZoomControl />
+          <FullScreenControl />
+          <LegendButton />
+          <Settings />
+          {/* <ThemeToggle /> */}
+        </div>
+
+        {showPropertyPanel && (
+          <div className="absolute top-2 right-2 z-10">
+            <PropertiesView />
+          </div>
+        )}
+
+        {showLegend && (
+          <div className="absolute right-2 bottom-10 z-0">
+            <Legend className="bg-background/60 backdrop-blur-lg" />
+          </div>
+        )}
+
+        {/* <div className="absolute bottom-2 right-2 flex flex-col rounded-xl border-2">
+          <MiniMap width="100px" height="100px" />
+        </div> */}
+
+        <SettingsDisplay />
+      </SigmaContainer>
+
+      {/* Loading overlay - shown for data fetch, theme switch, or layout run. */}
+      {(isFetching || isThemeSwitching || isLayoutComputing) && (
+        <div className="bg-background/80 absolute inset-0 z-10 flex items-center justify-center">
+          <div className="text-center">
+            <div className="border-primary mx-auto mb-2 h-8 w-8 animate-spin rounded-full border-4 border-t-transparent"></div>
+            <p>
+              {isThemeSwitching
+                ? 'Switching Theme...'
+                : isFetching
+                  ? 'Loading Graph Data...'
+                  : 'Computing Layout...'}
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default GraphViewer

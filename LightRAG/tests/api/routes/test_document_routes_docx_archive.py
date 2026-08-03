@@ -1,0 +1,3340 @@
+import importlib
+import sys
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+_original_argv = sys.argv[:]
+sys.argv = [sys.argv[0]]
+_document_routes = importlib.import_module("lightrag.api.routers.document_routes")
+_lightrag = importlib.import_module("lightrag.lightrag")
+_pipeline = importlib.import_module("lightrag.pipeline")
+_base = importlib.import_module("lightrag.base")
+_constants = importlib.import_module("lightrag.constants")
+_utils = importlib.import_module("lightrag.utils")
+_parser_routing = importlib.import_module("lightrag.parser.routing")
+_parser_registry = importlib.import_module("lightrag.parser.registry")
+_parser_base = importlib.import_module("lightrag.parser.base")
+sys.argv = _original_argv
+
+DocStatus = _base.DocStatus
+DeletionResult = _base.DeletionResult
+DocProcessingStatus = _base.DocProcessingStatus
+DocSchedulingRecord = _base.DocSchedulingRecord
+SourceAbsent = _base.SourceAbsent
+SourceConflict = _base.SourceConflict
+SourceUnique = _base.SourceUnique
+FULL_DOCS_FORMAT_LIGHTRAG = _constants.FULL_DOCS_FORMAT_LIGHTRAG
+FULL_DOCS_FORMAT_PENDING_PARSE = _constants.FULL_DOCS_FORMAT_PENDING_PARSE
+PARSED_DIR_NAME = _constants.PARSED_DIR_NAME
+PROCESS_OPTION_CHUNK_FIXED = _constants.PROCESS_OPTION_CHUNK_FIXED
+compute_mdhash_id = _utils.compute_mdhash_id
+LightRAG = _lightrag.LightRAG
+resolve_stored_document_parser_engine = (
+    _parser_routing.resolve_stored_document_parser_engine
+)
+get_parser = _parser_registry.get_parser
+ParseContext = _parser_base.ParseContext
+
+
+async def _parse_via_registry(rag, engine, doc_id, file_path, content_data):
+    """Drive a parser the way the pipeline worker does (registry dispatch)."""
+    result = await get_parser(engine).parse(
+        ParseContext(rag, doc_id, file_path, content_data)
+    )
+    return result.to_dict()
+
+
+pipeline_index_file = _document_routes.pipeline_index_file
+pipeline_enqueue_scan_batch = _document_routes.pipeline_enqueue_scan_batch
+_ScanCandidate = _document_routes._ScanCandidate
+pipeline_index_texts = _document_routes.pipeline_index_texts
+pipeline_enqueue_file = _document_routes.pipeline_enqueue_file
+run_scanning_process = _document_routes.run_scanning_process
+DocumentManager = _document_routes.DocumentManager
+create_document_routes = _document_routes.create_document_routes
+
+pytestmark = pytest.mark.offline
+
+
+async def _await_managed(managed_tasks):
+    """Await every managed background task to completion so each child's finally
+    runs (releasing its reservation). The endpoints now start reservation-holding
+    work as tracked asyncio tasks (``start_reserved_background_task``) instead of
+    deferred Starlette callbacks, so tests drain the managed set rather than
+    manually invoking a queued callback. Snapshot first — the task's done-callback
+    discards it from the set."""
+    import asyncio
+
+    for task in list(managed_tasks):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _ensure_shared_storage_initialized():
+    """Initialize the shared_storage module-level dicts before each test.
+
+    The scan endpoint and the enqueue/scanning guards read
+    ``pipeline_status`` via ``get_namespace_data``, which raises if
+    shared dicts have never been initialized.  Tests using mocked
+    ``LightRAG`` instances don't run ``initialize_storages``, so we set
+    up the shared store here and reset pipeline_status state per-test
+    to avoid leakage.
+    """
+    import importlib
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    shared_storage.initialize_share_data()
+    yield
+    # Reset pipeline_status to a clean state so subsequent tests don't
+    # inherit ``busy`` / ``scanning`` flags set by prior runs.
+    if shared_storage._shared_dicts is not None:
+        for key in list(shared_storage._shared_dicts.keys()):
+            if key.endswith("pipeline_status") or key == "pipeline_status":
+                ns = shared_storage._shared_dicts[key]
+                if isinstance(ns, dict):
+                    ns["busy"] = False
+                    ns["scanning"] = False
+
+
+class _FakeDocStatus:
+    def __init__(self):
+        self.docs = {}
+
+    async def get_by_id(self, doc_id):
+        return self.docs.get(doc_id)
+
+
+class _FakeRag:
+    def __init__(self, final_status=DocStatus.PROCESSED):
+        self.doc_status = _FakeDocStatus()
+        self.final_status = final_status
+        self.enqueued = []
+        self.errors = []
+        # _resolve_text_chunking reads addon_params; {} -> default chunker config.
+        self.addon_params = {}
+
+    async def apipeline_enqueue_documents(
+        self,
+        input,
+        ids=None,
+        file_paths=None,
+        track_id=None,
+        docs_format=None,
+        parse_engine=None,
+        process_options=None,
+        chunk_options=None,
+        from_scan=False,
+    ):
+        item = {
+            "input": input,
+            "file_path": file_paths,
+            "track_id": track_id,
+            "docs_format": docs_format,
+            "parse_engine": parse_engine,
+            "process_options": process_options,
+            "chunk_options": chunk_options,
+            "from_scan": from_scan,
+        }
+        self.enqueued.append(item)
+        return track_id
+
+    async def apipeline_process_enqueue_documents(self):
+        for item in self.enqueued:
+            file_path = item["file_path"]
+            doc_id = compute_mdhash_id(file_path, prefix="doc-")
+            self.doc_status.docs[doc_id] = {
+                "status": self.final_status,
+                "file_path": file_path,
+                "track_id": item["track_id"],
+            }
+
+    async def apipeline_enqueue_error_documents(self, error_files, track_id=None):
+        self.errors.append((error_files, track_id))
+
+
+class _DuplicateEnqueueRag(_FakeRag):
+    async def apipeline_enqueue_documents(self, *args, **kwargs):
+        self.enqueued.append({"args": args, "kwargs": kwargs})
+        return None
+
+
+class _ScanDocStatus:
+    """doc_status double implementing the typed source-resolution contract.
+
+    Rows are keyed by the string that doubles as their doc id; a canonical source
+    key matches a row when it equals that key's basename. Unless a fixture pins
+    ``metadata`` explicitly, a row is treated as scan/upload-origin — those always
+    record the physical basename that created them in ``metadata.source_file``,
+    which is what tells a resumed file apart from an alias (LR2 §8.3.E/F/G).
+    """
+
+    def __init__(self, docs_by_path):
+        self.docs_by_path = docs_by_path
+        self.deleted_ids: list[str] = []
+
+    async def get_doc_by_file_path(self, file_path):
+        return self.docs_by_path.get(file_path)
+
+    async def get_doc_by_file_basename(self, basename):
+        # Still the upload path's duplicate check (the SCAN moved to the typed
+        # resolver below); a single primary row per basename is all it models.
+        for stored_path, doc in self.docs_by_path.items():
+            if Path(stored_path).name == basename:
+                return stored_path, doc
+        return None
+
+    def _metadata(self, doc_id, row):
+        metadata = row.get("metadata")
+        if metadata is None:
+            return {"source_file": Path(doc_id).name}
+        return metadata
+
+    def _status(self, row):
+        status = row.get("status")
+        return status if isinstance(status, DocStatus) else DocStatus(status)
+
+    async def resolve_doc_source_strict(self, canonical_source_key):
+        candidates = [
+            (doc_id, row)
+            for doc_id, row in self.docs_by_path.items()
+            if Path(doc_id).name == canonical_source_key
+            and not (self._metadata(doc_id, row) or {}).get("is_duplicate")
+        ]
+        if not candidates:
+            return SourceAbsent()
+        if len(candidates) > 1:
+            return SourceConflict(
+                candidate_count=len(candidates),
+                sample_doc_ids=tuple(doc_id for doc_id, _ in candidates[:2]),
+            )
+        doc_id, row = candidates[0]
+        return SourceUnique(
+            doc_id=doc_id,
+            doc=DocSchedulingRecord(
+                id=doc_id,
+                status=self._status(row),
+                created_at=row.get("created_at", ""),
+                updated_at=row.get("updated_at", ""),
+                file_path=row.get("file_path") or Path(doc_id).name,
+                track_id=row.get("track_id"),
+                has_custom_chunk_journal=False,
+            ),
+        )
+
+    async def get_full_docs_by_ids(self, doc_ids, *, strict=False):
+        hydrated = {}
+        for doc_id in doc_ids:
+            row = self.docs_by_path.get(doc_id)
+            if row is None:
+                continue
+            hydrated[doc_id] = DocProcessingStatus(
+                content_summary=row.get("content_summary", ""),
+                content_length=row.get("content_length", 0),
+                file_path=row.get("file_path") or Path(doc_id).name,
+                status=self._status(row),
+                created_at=row.get("created_at", ""),
+                updated_at=row.get("updated_at", ""),
+                track_id=row.get("track_id"),
+                metadata=self._metadata(doc_id, row),
+            )
+        return hydrated
+
+    async def delete(self, ids):
+        for doc_id in ids:
+            self.docs_by_path.pop(doc_id, None)
+            self.deleted_ids.append(doc_id)
+
+
+class _ScanFullDocs:
+    """Minimal full_docs double for run_scanning_process.
+
+    The scan distinguishes a resumable FAILED row (content was stored, only a
+    downstream step failed) from an extraction-error stub recorded by
+    ``apipeline_enqueue_error_documents`` (no full_docs entry) — and per LR2
+    §8.3.D only a STRICT point read may drive that destructive decision, so this
+    double declares the capability.
+    """
+
+    supports_strict_point_reads = True
+
+    def __init__(self, docs_by_id):
+        self.docs_by_id = docs_by_id
+
+    async def get_by_id(self, doc_id):
+        return self.docs_by_id.get(doc_id)
+
+    async def get_by_id_strict(self, doc_id):
+        return self.docs_by_id.get(doc_id)
+
+
+class _ScanRag:
+    def __init__(self, docs_by_path, full_docs_by_id=None):
+        self.doc_status = _ScanDocStatus(docs_by_path)
+        # Default: every doc_status row has a corresponding full_docs entry,
+        # i.e. the "resumable" FAILED case.  Tests simulating extraction-error
+        # stubs pass ``full_docs_by_id={}`` (or omit specific doc_ids) so the
+        # scan classifies them as retry-as-new instead of resume.  The mock
+        # uses the doc_status path-as-doc_id convention from _ScanDocStatus.
+        if full_docs_by_id is None:
+            full_docs_by_id = {path: {"content": ""} for path in docs_by_path}
+        self.full_docs = _ScanFullDocs(full_docs_by_id)
+        self.process_calls = 0
+        # A workspace per instance: a scan publishes a sticky manual retry
+        # request that only a REAL pipeline run ACKs, and the /scan reservation
+        # refuses while an earlier request is queued (LR2 §8.1). With a shared
+        # workspace one endpoint test would then refuse the next one.
+        self.workspace = f"scan-test-{uuid4().hex}"
+        self.reset_calls = []
+        self.enqueued = []
+        self.errors = []
+
+    async def apipeline_enqueue_documents(
+        self,
+        input,
+        ids=None,
+        file_paths=None,
+        track_id=None,
+        docs_format=None,
+        parse_engine=None,
+        process_options=None,
+        from_scan=False,
+    ):
+        item = {
+            "input": input,
+            "file_path": file_paths,
+            "track_id": track_id,
+            "docs_format": docs_format,
+            "parse_engine": parse_engine,
+            "process_options": process_options,
+            "from_scan": from_scan,
+        }
+        self.enqueued.append(item)
+        return track_id
+
+    async def apipeline_enqueue_error_documents(self, error_files, track_id=None):
+        self.errors.append((error_files, track_id))
+
+    async def apipeline_process_enqueue_documents(self):
+        self.process_calls += 1
+
+    async def apipeline_reset_failed_for_scan(
+        self, request_id, *, scan_owner_token=None
+    ):
+        # LR2 §8.1: the real pipeline drains to idle and resets FAILED→PENDING
+        # here, BEFORE discovery. The mock records the call and reports the
+        # reset complete so classification proceeds.
+        self.reset_calls.append((request_id, scan_owner_token))
+        return True
+
+
+class _DuplicateUploadRag:
+    def __init__(self, docs_by_path):
+        self.doc_status = _ScanDocStatus(docs_by_path)
+        self.workspace = f"upload-test-{uuid4().hex}"
+
+
+class _DeleteRag:
+    def __init__(self, result):
+        self.result = result
+        self.workspace = f"delete-test-{uuid4().hex}"
+        self.deleted_doc_ids = []
+
+    async def adelete_by_doc_id(self, doc_id, delete_llm_cache=False):
+        self.deleted_doc_ids.append((doc_id, delete_llm_cache))
+        return self.result
+
+    async def apipeline_process_enqueue_documents(self):
+        return None
+
+
+class _ParseFullDocs:
+    def __init__(self, source_path):
+        self.source_path = source_path
+        self.events = []
+        self.data = {}
+
+    async def get_by_id(self, doc_id):
+        # ``_persist_parsed_full_docs`` merges with the existing pending_parse
+        # record so metadata seeded at enqueue time (process_options,
+        # canonical_basename, ...) survives the parse-result overwrite. These
+        # tests only seed the row via the parser, so returning None is fine.
+        record = self.data.get(doc_id)
+        return dict(record) if record is not None else None
+
+    async def upsert(self, data):
+        self.events.append("upsert")
+        self.data.update(data)
+
+    async def index_done_callback(self):
+        self.events.append("index_done")
+        assert self.source_path.exists()
+
+
+class _ParseDocStatus:
+    """Minimal doc_status double for the parse_* archive tests.
+
+    ``_persist_parsed_full_docs`` patches the row's ``content_hash`` through the
+    targeted-field update; ``missing_ok`` makes a missing row a no-op, which is
+    what these tests want — they only assert on full_docs side effects.
+    """
+
+    async def get_by_id(self, doc_id):
+        return None
+
+    async def upsert(self, data):
+        return None
+
+    async def update_doc_status_fields(self, doc_id, fields, *, missing_ok=False):
+        return None
+
+
+class _ParseTokenizer(_utils.TokenizerInterface):
+    def encode(self, content: str):
+        return [ord(ch) for ch in content]
+
+    def decode(self, tokens):
+        return "".join(chr(t) for t in tokens)
+
+
+class _ParseRag:
+    _persist_parsed_full_docs = LightRAG._persist_parsed_full_docs
+
+    def __init__(self, working_dir, source_path):
+        self.working_dir = str(working_dir)
+        self.full_docs = _ParseFullDocs(source_path)
+        self.doc_status = _ParseDocStatus()
+        self.tokenizer = _utils.Tokenizer(
+            model_name="char", tokenizer=_ParseTokenizer()
+        )
+
+    def _resolve_source_file_for_parser(self, file_path):
+        return file_path
+
+
+async def test_pipeline_index_file_leaves_lightrag_document_docx_for_parser_archive(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "sample.docx"
+    file_path.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    await pipeline_index_file(rag, file_path, "track-docx")
+
+    assert file_path.exists()
+    assert not (tmp_path / PARSED_DIR_NAME / file_path.name).exists()
+    assert rag.enqueued[0]["file_path"] == str(file_path)
+    assert rag.enqueued[0]["docs_format"] == FULL_DOCS_FORMAT_PENDING_PARSE
+    assert rag.enqueued[0]["parse_engine"] == "native"
+
+
+async def test_pipeline_enqueue_lightrag_document_docx_does_not_move_source(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "pending.docx"
+    file_path.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-docx"
+    )
+
+    assert success is True
+    assert returned_track_id == "track-docx"
+    assert file_path.exists()
+    assert not (tmp_path / PARSED_DIR_NAME / file_path.name).exists()
+    assert rag.enqueued[0]["file_path"] == str(file_path)
+    assert rag.enqueued[0]["docs_format"] == FULL_DOCS_FORMAT_PENDING_PARSE
+    assert rag.enqueued[0]["parse_engine"] == "native"
+
+
+async def test_pipeline_enqueue_docx_defers_to_legacy_parser(tmp_path, monkeypatch):
+    # Legacy now defers extraction to the worker stage; enqueue just records a
+    # PENDING_PARSE row with parse_engine=legacy (no eager extraction here).
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:legacy")
+    file_path = tmp_path / "plain.docx"
+    file_path.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-docx"
+    )
+
+    assert success is True
+    assert returned_track_id == "track-docx"
+    assert rag.enqueued == [
+        {
+            "input": "",
+            "file_path": str(file_path),
+            "track_id": "track-docx",
+            "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+            "parse_engine": "legacy",
+            "process_options": PROCESS_OPTION_CHUNK_FIXED,
+            "chunk_options": None,
+            "from_scan": False,
+        }
+    ]
+    # Deferred: the source stays in place until the worker archives it.
+    assert file_path.exists()
+
+
+async def test_pipeline_enqueue_md_defers_to_legacy_parser(tmp_path, monkeypatch):
+    # Unhinted .md defaults to the legacy engine and now defers extraction to
+    # the worker stage (PENDING_PARSE), like every other engine.
+    monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
+    file_path = tmp_path / "notes.md"
+    file_path.write_text("# Notes\n\nmarkdown content", encoding="utf-8")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(rag, file_path, "track-md")
+
+    assert success is True
+    assert returned_track_id == "track-md"
+    assert rag.enqueued == [
+        {
+            "input": "",
+            "file_path": str(file_path),
+            "track_id": "track-md",
+            "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+            "parse_engine": "legacy",
+            "process_options": PROCESS_OPTION_CHUNK_FIXED,
+            "chunk_options": None,
+            "from_scan": False,
+        }
+    ]
+    # Deferred: the source stays in place until the worker archives it.
+    assert file_path.exists()
+
+
+async def test_pipeline_enqueue_legacy_duplicate_archives_with_unique_name(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
+    file_path = tmp_path / "duplicate.md"
+    file_path.write_text("duplicate content", encoding="utf-8")
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    (parsed_dir / file_path.name).write_text("existing", encoding="utf-8")
+    rag = _DuplicateEnqueueRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-dup"
+    )
+
+    assert success is False
+    assert returned_track_id == "track-dup"
+    assert not file_path.exists()
+    assert (parsed_dir / file_path.name).read_text(encoding="utf-8") == "existing"
+    assert (parsed_dir / "duplicate_001.md").read_text(
+        encoding="utf-8"
+    ) == "duplicate content"
+
+
+async def test_pipeline_enqueue_parser_routed_pdf_defers_without_extraction(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "pdf:mineru,*:legacy")
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://fake-mineru")
+
+    # Extraction is always deferred now (no enqueue-stage extraction for any
+    # engine), so the pdf simply enqueues as PENDING_PARSE for mineru.
+    file_path = tmp_path / "paper.pdf"
+    file_path.write_bytes(b"fake-pdf")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-pdf"
+    )
+
+    assert success is True
+    assert returned_track_id == "track-pdf"
+    assert file_path.exists()
+    assert rag.enqueued == [
+        {
+            "input": "",
+            "file_path": str(file_path),
+            "track_id": "track-pdf",
+            "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+            "parse_engine": "mineru",
+            "process_options": PROCESS_OPTION_CHUNK_FIXED,
+            "chunk_options": None,
+            "from_scan": False,
+        }
+    ]
+
+
+async def test_pipeline_enqueue_passes_process_options_from_filename_hint(
+    tmp_path, monkeypatch
+):
+    """Filename hint ``[native-iet]`` flows into apipeline_enqueue_documents."""
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "report.[native-iet].docx"
+    file_path.write_bytes(b"docx-bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-options"
+    )
+
+    assert success is True
+    assert returned_track_id == "track-options"
+    assert rag.enqueued == [
+        {
+            "input": "",
+            "file_path": str(file_path),
+            "track_id": "track-options",
+            "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
+            "parse_engine": "native",
+            "process_options": "iet",
+            "chunk_options": None,
+            "from_scan": False,
+        }
+    ]
+    # Native engine deferral keeps the source file in place for the parser.
+    assert file_path.exists()
+
+
+async def test_pipeline_enqueue_rejects_invalid_filename_hint(tmp_path, monkeypatch):
+    """Bad filename processing hints must become file-processing errors."""
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "report.[abc].docx"
+    file_path.write_bytes(b"docx-bytes")
+    rag = _FakeRag()
+
+    success, returned_track_id = await pipeline_enqueue_file(
+        rag, file_path, "track-bad-hint"
+    )
+
+    assert success is False
+    assert returned_track_id == "track-bad-hint"
+    assert rag.enqueued == []
+    assert len(rag.errors) == 1
+    error_files, track_id = rag.errors[0]
+    assert track_id == "track-bad-hint"
+    assert error_files[0]["file_path"] == file_path.name
+    assert error_files[0]["error_description"] == (
+        "[File Extraction]Filename hint error"
+    )
+    assert "unsupported parser engine 'abc'" in error_files[0]["original_error"]
+    assert file_path.exists()
+
+
+async def test_pipeline_enqueue_lightrag_parser_rule_provides_default_options(
+    tmp_path, monkeypatch
+):
+    """LIGHTRAG_PARSER ``docx:native-iet`` becomes the default ``process_options``."""
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native-iet,*:legacy")
+    file_path = tmp_path / "rule_default.docx"
+    file_path.write_bytes(b"docx-bytes")
+    rag = _FakeRag()
+
+    success, _ = await pipeline_enqueue_file(rag, file_path, "track-rule-default")
+
+    assert success is True
+    assert len(rag.enqueued) == 1
+    enqueued = rag.enqueued[0]
+    assert enqueued["parse_engine"] == "native"
+    assert enqueued["process_options"] == "iet"
+
+
+async def test_pipeline_enqueue_scan_batch_leaves_lightrag_document_docx_batch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    first = tmp_path / "first.docx"
+    second = tmp_path / "second.[mineru].docx"
+    first.write_bytes(b"first docx bytes")
+    second.write_bytes(b"second docx bytes")
+    rag = _FakeRag()
+
+    await pipeline_enqueue_scan_batch(
+        rag,
+        [_ScanCandidate(second, 0), _ScanCandidate(first, 0)],
+        "track-scan",
+    )
+
+    # ``second.[mineru].docx`` needs MINERU_LOCAL_ENDPOINT, so only first.docx
+    # actually enqueues here. Assert that explicitly: an empty ``rag.enqueued``
+    # would satisfy every ``all(...)`` below and the test would prove nothing.
+    assert [item["file_path"] for item in rag.enqueued] == [str(first)]
+
+    assert first.exists()
+    assert second.exists()
+    assert not (tmp_path / PARSED_DIR_NAME / first.name).exists()
+    assert not (tmp_path / PARSED_DIR_NAME / second.name).exists()
+    assert all(
+        item["docs_format"] == FULL_DOCS_FORMAT_PENDING_PARSE for item in rag.enqueued
+    )
+    assert all(item["parse_engine"] == "native" for item in rag.enqueued)
+    assert all(
+        item["process_options"] == PROCESS_OPTION_CHUNK_FIXED for item in rag.enqueued
+    )
+
+
+async def test_pipeline_enqueue_scan_batch_preserves_the_spool_order(
+    tmp_path, monkeypatch
+):
+    """Fix-proof: the batch is enqueued in the order the spool handed it over.
+
+    Global oldest-file-first ordering is recorded into doc_status one
+    ``created_at=now()`` row at a time, so this helper is the last place it can
+    be silently destroyed. It used to re-sort each batch with
+    ``sorted(..., key=get_pinyin_sort_key)``; with these two names that sort
+    reverses the batch, so re-introducing it fails here.
+    """
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    older = tmp_path / "zebra.docx"
+    newer = tmp_path / "alpha.docx"
+    older.write_bytes(b"older docx bytes")
+    newer.write_bytes(b"newer docx bytes")
+    rag = _FakeRag()
+
+    # Spool order (by mtime) deliberately opposes alphabetical/pinyin order.
+    enqueued = await pipeline_enqueue_scan_batch(
+        rag,
+        [_ScanCandidate(older, 0), _ScanCandidate(newer, 0)],
+        "track-scan",
+    )
+
+    assert enqueued == 2
+    assert [item["file_path"] for item in rag.enqueued] == [str(older), str(newer)]
+
+
+async def test_pipeline_enqueue_scan_batch_reuses_the_spooled_file_size(
+    tmp_path, monkeypatch
+):
+    """The size discovery stat'ed travels with the candidate — no second stat.
+
+    INPUT_DIR is frequently a network mount, so the enqueue phase must not pay
+    another metadata round-trip per file just to fill in an error-report field.
+    """
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    doc = tmp_path / "sized.docx"
+    doc.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    stats: list[Path] = []
+    real_stat = Path.stat
+
+    def _counting_stat(self, *args, **kwargs):
+        stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _counting_stat)
+
+    await pipeline_enqueue_scan_batch(rag, [_ScanCandidate(doc, 4096)], "track-scan")
+
+    assert len(rag.enqueued) == 1
+    assert doc not in stats
+
+
+async def test_pipeline_enqueue_file_stats_when_no_size_is_supplied(
+    tmp_path, monkeypatch
+):
+    """The non-scan ingress paths still get their size the ordinary way.
+
+    Counterpart to the test above: the stat is SKIPPED only because the caller
+    supplied the size, not because it was dropped for everyone.
+    """
+    doc = tmp_path / "unsized.docx"
+    doc.write_bytes(b"docx bytes")
+    rag = _FakeRag()
+
+    stats: list[Path] = []
+    real_stat = Path.stat
+
+    def _counting_stat(self, *args, **kwargs):
+        stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _counting_stat)
+
+    success, _track = await pipeline_enqueue_file(rag, doc, "track-upload")
+
+    assert success is True
+    assert doc in stats
+
+
+async def test_pipeline_index_texts_sets_api_default_process_options():
+    rag = _FakeRag()
+
+    await pipeline_index_texts(
+        rag,
+        ["first text", "second text"],
+        file_sources=["first.txt", "second.txt"],
+        track_id="track-texts",
+    )
+
+    assert len(rag.enqueued) == 1
+    item = rag.enqueued[0]
+    assert item["input"] == ["first text", "second text"]
+    assert item["file_path"] == ["first.txt", "second.txt"]
+    assert item["track_id"] == "track-texts"
+    assert item["docs_format"] is None
+    assert item["parse_engine"] is None
+    assert item["process_options"] == PROCESS_OPTION_CHUNK_FIXED
+    assert item["from_scan"] is False
+    # No chunking config -> default F snapshot is still passed through.
+    assert isinstance(item["chunk_options"], dict)
+    assert "fixed_token" in item["chunk_options"]
+
+
+async def test_scan_processed_same_name_archives_with_unique_name(
+    tmp_path, monkeypatch
+):
+    file_path = tmp_path / "already-parsed.docx"
+    file_path.write_bytes(b"docx bytes")
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    (parsed_dir / file_path.name).write_bytes(b"previous parsed file")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(file_path): {
+                "status": DocStatus.PROCESSED.value,
+                "file_path": str(file_path),
+                "track_id": "track-existing",
+            }
+        }
+    )
+
+    async def fail_if_reenqueue(*args, **kwargs):
+        raise AssertionError("existing docx should not be re-enqueued")
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", fail_if_reenqueue
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    assert not file_path.exists()
+    assert (parsed_dir / file_path.name).read_bytes() == b"previous parsed file"
+    assert (parsed_dir / "already-parsed_001.docx").read_bytes() == b"docx bytes"
+
+
+async def test_scan_processed_canonical_name_archives_hinted_file(
+    tmp_path, monkeypatch
+):
+    file_path = tmp_path / "already-parsed.[native].docx"
+    file_path.write_bytes(b"docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            "already-parsed.docx": {
+                "status": DocStatus.PROCESSED.value,
+                "file_path": "already-parsed.docx",
+                "track_id": "track-existing",
+            }
+        }
+    )
+
+    async def fail_if_reenqueue(*args, **kwargs):
+        raise AssertionError("canonical duplicate should not be re-enqueued")
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", fail_if_reenqueue
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    assert not file_path.exists()
+    assert (tmp_path / PARSED_DIR_NAME / file_path.name).read_bytes() == b"docx bytes"
+
+
+async def test_scan_archives_scan_wide_canonical_duplicates(tmp_path, monkeypatch):
+    plain_file = tmp_path / "same.docx"
+    hinted_file = tmp_path / "same.[native].docx"
+    plain_file.write_bytes(b"plain docx bytes")
+    hinted_file.write_bytes(b"hinted docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+    calls = []
+
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append(
+            {
+                "rag": rag_arg,
+                "file_paths": [candidate.path for candidate in candidates],
+                "track_id": track_id,
+                "kwargs": kwargs,
+            }
+        )
+        return len(candidates)
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # LR2 §8.4/§8.5: the winner is whichever physical file claimed the canonical
+    # key FIRST in the scan-wide disk spool. Discovery is a single unordered
+    # pass, so the previous "hinted variant always wins" preference is gone by
+    # design. Exactly one variant is enqueued and the other is ARCHIVED, never
+    # deleted; which one wins is not promised.
+    assert len(calls) == 1
+    assert len(calls[0]["file_paths"]) == 1
+    winner = calls[0]["file_paths"][0]
+    loser = plain_file if winner == hinted_file else hinted_file
+    # from_scan is implied by pipeline_enqueue_scan_batch — the scan is its only
+    # caller — so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
+    archived_names = {
+        path.name for path in (tmp_path / PARSED_DIR_NAME).iterdir() if path.is_file()
+    }
+    assert archived_names == {loser.name}
+    assert winner.exists()
+    assert not loser.exists()
+
+
+async def test_scan_rejects_invalid_filename_hint(tmp_path, monkeypatch):
+    monkeypatch.setenv("LIGHTRAG_PARSER", "docx:native")
+    file_path = tmp_path / "bad-scan.[native-FR].docx"
+    file_path.write_bytes(b"docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    assert rag.enqueued == []
+    assert len(rag.errors) == 1
+    error_files, track_id = rag.errors[0]
+    assert track_id == "track-scan"
+    assert error_files[0]["file_path"] == file_path.name
+    assert error_files[0]["error_description"] == (
+        "[File Extraction]Filename hint error"
+    )
+    assert "multiple chunking modes" in error_files[0]["original_error"]
+    # LR2 §8.1: every scan ends with exactly ONE processing drive, even when no
+    # file was enqueued — resume targets and the FAILED rows the pre-discovery
+    # reset turned into PENDING have no other trigger (an empty queue makes it a
+    # cheap no-op).
+    assert rag.process_calls == 1
+    assert file_path.exists()
+
+
+async def test_scan_existing_non_processed_reprocesses_file(tmp_path, monkeypatch):
+    file_path = tmp_path / "retry.docx"
+    file_path.write_bytes(b"docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(file_path): {
+                "status": DocStatus.PARSING.value,
+                "file_path": str(file_path),
+                "track_id": "track-existing",
+            }
+        }
+    )
+    calls = []
+
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append(
+            {
+                "rag": rag_arg,
+                "file_paths": [candidate.path for candidate in candidates],
+                "track_id": track_id,
+                "kwargs": kwargs,
+            }
+        )
+        return len(candidates)
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # Resume targets bypass pipeline_index_files entirely: routing them
+    # through apipeline_enqueue_documents would treat the same canonical
+    # basename as a duplicate (returning None), causing the source to be
+    # archived as if it were a duplicate while leaving the unfinished
+    # doc_status row untouched.  Instead, the scan kicks off
+    # apipeline_process_enqueue_documents directly so the existing PARSING
+    # row is picked up by the pipeline's resume logic, and the source file
+    # stays in place for any pending-parse engine that still needs it.
+    assert calls == []
+    assert rag.process_calls == 1
+    assert file_path.exists()
+
+
+async def test_scan_mixed_new_and_resume_routes_only_new_through_enqueue(
+    tmp_path, monkeypatch
+):
+    """When a scan finds both a new file and one matching an unfinished
+    doc_status row, only the new file goes through pipeline_index_files;
+    the resume target stays in place.  run_scanning_process always
+    triggers apipeline_process_enqueue_documents whenever resume targets
+    exist — even when new files were also enqueued — because
+    pipeline_index_files only runs that call after at least one new file
+    successfully enqueues.  Without the unconditional trigger, an all-
+    failed batch of new files would silently strand the resume rows.
+    """
+    new_file = tmp_path / "fresh.docx"
+    resume_file = tmp_path / "retry.docx"
+    new_file.write_bytes(b"fresh docx bytes")
+    resume_file.write_bytes(b"retry docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(resume_file): {
+                "status": DocStatus.FAILED.value,
+                "file_path": str(resume_file),
+                "track_id": "track-existing",
+            }
+        }
+    )
+    calls = []
+
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append(
+            {
+                "rag": rag_arg,
+                "file_paths": [candidate.path for candidate in candidates],
+                "track_id": track_id,
+                "kwargs": kwargs,
+            }
+        )
+        return len(candidates)
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # Only the new file goes through the enqueue path; the resume file
+    # stays in input/ for any pending-parse engine that still needs the
+    # source on disk.
+    assert len(calls) == 1
+    assert calls[0]["file_paths"] == [new_file]
+    # from_scan is implied by pipeline_enqueue_scan_batch (the scan is its only
+    # caller), so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
+    # The unconditional trigger fires once — guaranteeing the resume row
+    # advances even if pipeline_index_files's internal trigger were to be
+    # skipped (e.g. if every new file was rejected by enqueue).
+    assert rag.process_calls == 1
+    assert resume_file.exists()
+    assert new_file.exists()
+
+
+async def test_scan_failed_extraction_record_without_full_docs_is_retried(
+    tmp_path, monkeypatch
+):
+    """Stub doc_status rows recorded by apipeline_enqueue_error_documents
+    have no full_docs entry — _validate_and_fix_document_consistency
+    preserves them for manual review and excludes them from processing,
+    so the resume path can never advance them.  When the user fixes the
+    file and re-scans we must drop the stale stub and route the file
+    through the normal new-file enqueue, otherwise the fix never lands.
+    """
+    file_path = tmp_path / "fixed.docx"
+    file_path.write_bytes(b"now-readable bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(file_path): {
+                "status": DocStatus.FAILED.value,
+                "file_path": str(file_path),
+                "track_id": "track-old",
+                "metadata": {"error_type": "file_extraction_error"},
+            }
+        },
+        full_docs_by_id={},  # Extraction error: no full_docs entry was ever written.
+    )
+    calls = []
+
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append(
+            {
+                "rag": rag_arg,
+                "file_paths": [candidate.path for candidate in candidates],
+                "track_id": track_id,
+                "kwargs": kwargs,
+            }
+        )
+        return len(candidates)
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # The stale FAILED stub is deleted and the file is routed as new so
+    # the standard enqueue path can re-extract content.  No resume
+    # trigger fires because there are no resume targets.
+    assert rag.doc_status.deleted_ids == [str(file_path)]
+    assert len(calls) == 1
+    assert calls[0]["file_paths"] == [file_path]
+    # from_scan is implied by pipeline_enqueue_scan_batch (the scan is its only
+    # caller), so the batch call carries no extra keyword.
+    assert calls[0]["kwargs"] == {}
+    # One drive per scan (LR2 §8.1); the batch itself never drives processing.
+    assert rag.process_calls == 1
+    assert file_path.exists()
+
+
+async def test_scan_failed_with_full_docs_resumes_normally(tmp_path, monkeypatch):
+    """A FAILED row that DOES have a full_docs entry came from a downstream
+    failure after content was successfully stored; the pipeline's resume
+    logic resets it to PENDING and replays.  The scan must not delete it.
+    """
+    file_path = tmp_path / "downstream-failed.docx"
+    file_path.write_bytes(b"docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(file_path): {
+                "status": DocStatus.FAILED.value,
+                "file_path": str(file_path),
+                "track_id": "track-old",
+            }
+        }
+        # full_docs default-seeded for the path → resumable FAILED.
+    )
+    calls = []
+
+    async def capture_pipeline(rag_arg, candidates, track_id, **kwargs):
+        calls.append([candidate.path for candidate in candidates])
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", capture_pipeline
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # No stub deletion; resume path runs.
+    assert rag.doc_status.deleted_ids == []
+    assert calls == []
+    assert rag.process_calls == 1
+    assert file_path.exists()
+
+
+async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
+    tmp_path, monkeypatch
+):
+    """The exact P2 scenario: a scan batch contains a resume target plus
+    new files that all fail / are rejected during enqueue.
+    pipeline_index_files's internal process_enqueue is gated on at least
+    one successful enqueue; without the unconditional resume trigger in
+    run_scanning_process the PARSING/FAILED row would stay stuck.
+
+    We simulate "all new files rejected" with a pipeline_index_files mock
+    that records its invocation but does not call process_enqueue (mirroring
+    the real helper's behaviour when every per-file enqueue returns False).
+    """
+    new_file = tmp_path / "fresh.docx"
+    resume_file = tmp_path / "retry.docx"
+    new_file.write_bytes(b"fresh docx bytes")
+    resume_file.write_bytes(b"retry docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag(
+        {
+            str(resume_file): {
+                "status": DocStatus.PARSING.value,
+                "file_path": str(resume_file),
+                "track_id": "track-existing",
+            }
+        }
+    )
+
+    async def index_files_all_rejected(rag_arg, candidates, track_id, **kwargs):
+        # Mirror the real helper when every per-file enqueue is rejected: the
+        # batch lands nothing (0), and enqueue never drives processing anyway.
+        return 0
+
+    monkeypatch.setattr(
+        _document_routes, "pipeline_enqueue_scan_batch", index_files_all_rejected
+    )
+
+    await run_scanning_process(rag, doc_manager, "track-scan")
+
+    # Even though pipeline_index_files's internal trigger never fired, the
+    # scan still kicks process_enqueue once so the resume row advances.
+    assert rag.process_calls == 1
+    assert resume_file.exists()
+    assert new_file.exists()
+
+
+async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
+    tmp_path, monkeypatch
+):
+    # Other tests (e.g. test_auth.py) may replace global_args with a SimpleNamespace
+    # that lacks max_upload_size; pin a known state so the upload endpoint runs.
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag(
+        {
+            "failed.docx": {
+                "status": DocStatus.FAILED.value,
+                "file_path": "failed.docx",
+                "track_id": "track-failed",
+                "metadata": {"error_type": "file_extraction_error"},
+            }
+        }
+    )
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="failed.docx",
+        file=BytesIO(b"replacement docx bytes"),
+    )
+
+    # Strict name pre-check: same-canonical record in doc_status now raises 409
+    # rather than returning a "duplicated" 200 response.  Clients must delete
+    # the existing record before re-uploading.
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 409
+    assert "failed.docx" in excinfo.value.detail
+    assert "Status: failed" in excinfo.value.detail
+    assert not (tmp_path / "failed.docx").exists()
+
+
+async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    (tmp_path / "existing.docx").write_bytes(b"existing docx bytes")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="existing.[native].docx",
+        file=BytesIO(b"replacement docx bytes"),
+    )
+
+    # Strict name pre-check: an INPUT directory file with the same canonical
+    # basename now blocks the upload with 409.
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 409
+    assert "existing.docx" in excinfo.value.detail
+    assert not (tmp_path / "existing.[native].docx").exists()
+
+
+async def test_upload_rejects_malformed_hint_with_detail(tmp_path, monkeypatch):
+    """A malformed filename hint fails the upload synchronously with the
+    detailed hint error in the 400 body (it used to be accepted and only
+    surface later as an error document)."""
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        # F and R are two chunking modes -> invalid hint combination.
+        filename="bad.[native-FR].docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 400
+    assert "multiple chunking modes" in excinfo.value.detail
+
+
+async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypatch):
+    """Under the new contract, ``busy=True`` no longer blocks uploads.
+    The upload reserves a pending-enqueue slot, schedules its bg task,
+    and returns success; the bg task's enqueue is permitted while the
+    pipeline is busy and the running loop picks up the new doc via the
+    ingress mailbox.
+    """
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+    pipeline_status["busy"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="while_busy.docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    # Gate the managed child so the enqueue slot stays reserved until we let it
+    # finish — the deterministic replacement for the old "task queued but not
+    # run" deferral.
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+        await gate.wait()
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
+
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+
+    # Endpoint accepted the upload despite busy=True.
+    assert response.status == "success"
+    assert (tmp_path / "while_busy.docx").exists()
+    # The slot has been transferred to the managed task, which is parked in the
+    # gated child; until it finishes pending_enqueues stays at 1 so a concurrent
+    # /scan would refuse.
+    assert pipeline_status["pending_enqueues"] == 1
+    assert len(managed) == 1
+
+    # Let the child complete; its finally releases the slot.
+    gate.set()
+    await _await_managed(managed)
+    assert pipeline_status["pending_enqueues"] == 0
+
+
+async def test_upload_returns_409_when_scanning_classification(tmp_path, monkeypatch):
+    """Upload must refuse with 409 when scan is in its CLASSIFICATION
+    phase (``scanning_exclusive=True``).  Scan's processing phase
+    (``scanning=True`` but ``scanning_exclusive=False``) is permissive
+    — see ``test_upload_succeeds_during_scan_processing_phase`` below.
+    """
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = True
+    pipeline_status["scanning_exclusive"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="while_scanning.docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 409
+    assert "classifying" in excinfo.value.detail.lower()
+    assert not (tmp_path / "while_scanning.docx").exists()
+
+
+async def test_upload_returns_409_when_manual_freeze(tmp_path, monkeypatch):
+    """LR2 Phase 3: while a manual retry has frozen new ingress
+    (``manual_freeze_requested=True``) to drain the pipeline and reset FAILED,
+    a new upload must refuse with 409 (MANUAL_FREEZE) — not silently land in a
+    window that violates the reset's "no failed producer" precondition."""
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = True
+    pipeline_status["manual_freeze_requested"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="while_freezing.docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    with pytest.raises(_document_routes.HTTPException) as excinfo:
+        await upload_endpoint(set(), upload_file)
+    assert excinfo.value.status_code == 409
+    assert "retry of failed documents" in excinfo.value.detail.lower()
+    assert not (tmp_path / "while_freezing.docx").exists()
+
+
+async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatch):
+    """User-reported scenario: while pipeline is doing scan-driven
+    processing (``scanning=True`` but ``scanning_exclusive=False``),
+    new uploads must be accepted.  Scan's processing phase is
+    behaviourally identical to busy=True — uploads coexist via the
+    ingress mailbox.
+    """
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    # Classification done; scan is now driving the processing pipeline.
+    pipeline_status["scanning"] = True
+    pipeline_status["scanning_exclusive"] = False
+    pipeline_status["busy"] = True
+    pipeline_status["pending_enqueues"] = 0
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="upload_during_scan_processing.docx",
+        file=BytesIO(b"docx bytes"),
+    )
+
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+        await gate.wait()
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
+
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+
+    # Endpoint accepted the upload despite scan in progress.
+    assert response.status == "success"
+    assert (tmp_path / "upload_during_scan_processing.docx").exists()
+    assert pipeline_status["pending_enqueues"] == 1
+    assert len(managed) == 1
+
+    gate.set()
+    await _await_managed(managed)
+    assert pipeline_status["pending_enqueues"] == 0
+
+
+async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
+    """Scan endpoint must return ``scanning_skipped_pipeline_busy`` and NOT
+    schedule a background task while the pipeline is busy."""
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await scan_endpoint(managed)
+
+    assert response.status == "scanning_skipped_pipeline_busy"
+    # No managed background task should have been started.
+    assert len(managed) == 0
+    # And ``scanning`` is left unchanged at False (we didn't acquire it).
+    assert pipeline_status.get("scanning") is False
+    # Zero side effects: a refused scan publishes NO manual retry intent —
+    # the sticky request is committed only AFTER the reservation is granted.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
+
+
+async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
+    """Scan endpoint must reject overlapping scans by checking the
+    ``scanning`` flag, not just ``busy``."""
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await scan_endpoint(managed)
+
+    assert response.status == "scanning_skipped_pipeline_busy"
+    assert len(managed) == 0
+
+
+async def test_scan_endpoint_acquires_and_releases_scanning_flag(tmp_path, monkeypatch):
+    """The scan endpoint must atomically set ``scanning=True`` and
+    ``run_scanning_process`` must clear it in finally — even when the body
+    raises — so successive scans aren't permanently blocked.
+    """
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await scan_endpoint(managed)
+
+    # Endpoint acquired the flag synchronously and handed off to a managed task
+    # (``scanning_started`` is only returned after the atomic scanning=True write
+    # and a confirmed start-barrier takeover).
+    assert response.status == "scanning_started"
+
+    # Drain the managed task; run_scanning_process's finally must clear the flag.
+    await _await_managed(managed)
+    assert pipeline_status["scanning"] is False
+    assert rag.process_calls == 1  # the child actually ran the scan
+
+
+async def test_scan_endpoint_returns_skipped_when_enqueue_pending(tmp_path):
+    """The preflight-to-background race: an upload/insert endpoint may
+    have passed the idle check, reserved a pending-enqueue slot, and
+    returned success — but its bg task has not yet written to
+    doc_status.  A scan that arrives in this window must refuse;
+    starting it would race scan's doc_status reads against the bg
+    task's still-pending writes.
+    """
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    # The "scan-test" workspace is shared across tests; reset all guarded
+    # flags so we start from a clean idle state.
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+    # Simulate a reservation made by /upload that has not yet released.
+    pipeline_status["pending_enqueues"] = 1
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await scan_endpoint(managed)
+
+    assert response.status == "scanning_skipped_pipeline_busy"
+    # No managed task started; scanning flag untouched.
+    assert len(managed) == 0
+    assert pipeline_status.get("scanning") is False
+    # Reservation count is preserved — only the owning bg task may release it.
+    assert pipeline_status["pending_enqueues"] == 1
+
+
+async def test_reserve_enqueue_slot_blocks_concurrent_scan_until_release(tmp_path):
+    """End-to-end on the reservation primitive: reserving a slot makes
+    the scan endpoint refuse; releasing it lets the next scan in.  This
+    is the contract the upload/text endpoints rely on to close the
+    preflight-to-background race.
+    """
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    # Reserve a slot — mirrors what /upload, /text and /texts do
+    # synchronously before scheduling their bg tasks.
+    enq_token = "enq-blocks-scan"
+    reserved = await _document_routes._reserve_enqueue_slot(rag, enq_token)
+    assert reserved is True
+    assert pipeline_status["pending_enqueues"] == 1
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    blocked = await scan_endpoint(managed)
+    assert blocked.status == "scanning_skipped_pipeline_busy"
+    assert len(managed) == 0
+
+    # Release: bg task wrapper would do this in finally.
+    await _document_routes._release_enqueue_slot(rag, enq_token)
+    assert pipeline_status["pending_enqueues"] == 0
+
+    managed2: set = set()
+    allowed = await scan_endpoint(managed2)
+    assert allowed.status == "scanning_started"
+    # Drain the now-allowed scan so it doesn't leak into the shared workspace.
+    await _await_managed(managed2)
+    assert pipeline_status["scanning"] is False
+
+
+async def test_release_enqueue_slot_decrements_per_call(tmp_path):
+    """Two-reservation cohort: each release is a pure decrement.  Drain
+    coordination is no longer needed because the busy guard on enqueue
+    has been removed — concurrent enqueues are permitted while the
+    pipeline is busy and the running loop drains them via the ingress
+    mailbox.
+    """
+    import importlib
+
+    rag = _ScanRag({})
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["scanning_exclusive"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    # Two concurrent reservations from /upload + /text — both pass the
+    # idle preflight because scanning_exclusive=F at reservation time
+    # (busy and the bare ``scanning`` flag are no longer gates;
+    # concurrent enqueue with the processing loop and scan's
+    # processing phase is explicitly allowed).
+    assert await _document_routes._reserve_enqueue_slot(rag, "enq-a") is True
+    assert await _document_routes._reserve_enqueue_slot(rag, "enq-b") is True
+    assert pipeline_status["pending_enqueues"] == 2
+
+    # Each release removes its own token; count mirrors the set size. No drain
+    # coordination required — each bg task triggers process_enqueue independently
+    # and the running loop's quiescence decision collapses duplicates.
+    await _document_routes._release_enqueue_slot(rag, "enq-a")
+    assert pipeline_status["pending_enqueues"] == 1
+
+    await _document_routes._release_enqueue_slot(rag, "enq-b")
+    assert pipeline_status["pending_enqueues"] == 0
+
+
+async def test_enqueue_endpoint_releases_token_on_acquire_cancellation(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 Codex P2): a cancellation delivered while
+    ``_reserve_enqueue_slot`` is exiting its lock — the token is already in
+    ``pending_enqueue_tokens`` but the endpoint has not yet recorded the handoff
+    — must not leak the slot. The endpoint's finally releases the pre-generated
+    token, so ``pending_enqueues`` returns to 0.
+    """
+    import asyncio
+    import importlib
+
+    class _Rag:
+        workspace = "enq-cancel-test"
+
+    rag = _Rag()
+    doc_manager = DocumentManager(str(tmp_path))
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    async def _reserve_then_cancel(rag_arg, token):
+        # Real reserve adds the token under the lock; here the coroutine is then
+        # cancelled at the lock exit before returning to the endpoint.
+        lock = shared_storage.get_namespace_lock(
+            "pipeline_status", workspace=rag_arg.workspace
+        )
+        async with lock:
+            tokens = dict(pipeline_status.get("pending_enqueue_tokens", {}))
+            tokens[token] = {"pid": 0, "process_start_id": None}
+            pipeline_status.update(
+                {"pending_enqueue_tokens": tokens, "pending_enqueues": len(tokens)}
+            )
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_document_routes, "_reserve_enqueue_slot", _reserve_then_cancel)
+
+    router = create_document_routes(rag, doc_manager)
+    text_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "insert_text"
+    ][-1]
+
+    with pytest.raises(asyncio.CancelledError):
+        await text_endpoint(
+            _document_routes.InsertTextRequest(text="hello", file_source="a.md"),
+            set(),
+        )
+
+    # The finally released the pre-generated token (old code, which set the
+    # reserved flag only after the await, would leak it here).
+    assert pipeline_status.get("pending_enqueues", 0) == 0
+    assert pipeline_status.get("pending_enqueue_tokens", {}) == {}
+
+
+async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408): a cancellation delivered after the scan endpoint
+    reserves ``scanning``/``scanning_exclusive`` but before the managed task
+    commits (pre-commit cancellation of start_committed_background_task) must
+    not leak the reservation — and must leave NO sticky manual retry request
+    behind (a refused/cancelled scan has zero side effects). The endpoint's
+    finally releases the owner token so both flags return to False.
+    """
+    import asyncio
+    import importlib
+
+    workspace = f"scan-cancel-test-{uuid4().hex}"
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    async def _cancel_before_takeover(*args, **kwargs):
+        # Simulate a cancellation delivered after scanning was reserved but
+        # before the managed task committed (request cancelled at the start
+        # barrier). The endpoint's finally must still release the slot.
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        shared_storage, "start_committed_background_task", _cancel_before_takeover
+    )
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    with pytest.raises(asyncio.CancelledError):
+        await scan_endpoint(set())
+
+    # The endpoint's finally released the reservation (reserved but not handed
+    # off), so no future scan/upload is blocked.
+    assert pipeline_status.get("scanning") is False
+    assert pipeline_status.get("scanning_exclusive") is False
+    assert pipeline_status.get("scanning_owner") is None
+    # Pre-commit teardown published nothing: the mailbox has no manual entry.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
+
+
+async def test_clear_endpoint_releases_destructive_busy_on_cancellation_during_setup(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 Codex P2): a cancellation delivered after clear
+    reserves the destructive slot but before/while it writes job status (the
+    ``pipeline_status_lock`` __aenter__ await) must not leak the reservation.
+    The acquire + job-status setup now live inside the try/finally, so the
+    owner-checked release frees busy/destructive_busy; the pre-fix layout put
+    the job-status write outside the try and left the workspace permanently
+    busy.
+    """
+    import asyncio
+    import importlib
+
+    workspace = f"clear-cancel-test-{uuid4().hex}"
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    class _CancelNow:
+        @staticmethod
+        def now():
+            # Cancellation delivered while writing job status, inside the
+            # status-init lock (which the fix moved inside the endpoint's try).
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_document_routes, "datetime", _CancelNow)
+
+    router = create_document_routes(rag, doc_manager)
+    clear_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "clear_documents"
+    ][-1]
+
+    with pytest.raises(asyncio.CancelledError):
+        await clear_endpoint()
+
+    # The finally released the destructive slot (old code, with job-status
+    # setup outside the try/finally, would leak busy + destructive_busy here).
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+    assert pipeline_status.get("busy_owner") is None
+
+
+async def test_clear_releases_when_acquire_cancelled_at_lock_exit(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): a cancellation delivered while
+    ``_acquire_destructive_busy`` is exiting its own lock — busy /
+    destructive_busy / busy_owner already written but the endpoint has not yet
+    received ``acquired`` — must not leak the slot. The acquire now runs inside
+    the endpoint's try/finally, so the owner-checked release frees it. The
+    pre-fix layout put the acquire before the try and wedged the workspace."""
+    import asyncio
+    import importlib
+
+    workspace = f"clear-acq-cancel-{uuid4().hex}"
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    async def _acquire_then_cancel(rag_arg, token, *, kind=None, operation_record=None):
+        # Real acquire stamps the flags + owner under the lock; here the
+        # coroutine is then cancelled at the lock exit before returning.
+        lock = shared_storage.get_namespace_lock(
+            "pipeline_status", workspace=rag_arg.workspace
+        )
+        ps = await shared_storage.get_namespace_data(
+            "pipeline_status", workspace=rag_arg.workspace
+        )
+        async with lock:
+            ps.update({"busy": True, "destructive_busy": True, "busy_owner": token})
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        _document_routes, "_acquire_destructive_busy", _acquire_then_cancel
+    )
+
+    router = create_document_routes(rag, doc_manager)
+    clear_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "clear_documents"
+    ][-1]
+
+    with pytest.raises(asyncio.CancelledError):
+        await clear_endpoint()
+
+    # Released by the endpoint's finally (old code leaked busy here).
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+    assert pipeline_status.get("busy_owner") is None
+
+
+async def test_scan_task_releases_when_cancelled_before_release_try(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): ``run_scanning_process`` already holds the
+    scanning reservation when it starts, but if it is cancelled during the
+    initial ``get_namespace_data`` fetch — before its release try/finally — the
+    scanning flags must still be released. The fetch now lives inside the
+    release try and the finally releases via a fresh-fetch helper. The pre-fix
+    layout fetched in a separate try and leaked scanning."""
+    import asyncio
+    import importlib
+
+    workspace = f"scan-fetch-cancel-{uuid4().hex}"
+    scanning_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    # Simulate the endpoint's synchronous reservation.
+    pipeline_status.update(
+        {"scanning": True, "scanning_exclusive": True, "scanning_owner": scanning_token}
+    )
+
+    real_get = shared_storage.get_namespace_data
+    calls = {"n": 0}
+
+    async def _get_ns_cancel_first(name, workspace=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Cancel the very first fetch (the scan body's), before the release
+            # try was entered in the pre-fix layout.
+            raise asyncio.CancelledError()
+        return await real_get(name, workspace=workspace)
+
+    monkeypatch.setattr(shared_storage, "get_namespace_data", _get_ns_cancel_first)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_scanning_process(rag, doc_manager, "track-scan", scanning_token)
+
+    # The finally released scanning via the fresh-fetch helper (old code, whose
+    # release try never ran when the fetch was cancelled, would leak here).
+    assert pipeline_status.get("scanning") is False
+    assert pipeline_status.get("scanning_exclusive") is False
+    assert pipeline_status.get("scanning_owner") is None
+
+
+async def test_delete_task_releases_when_cancelled_before_release_try(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): ``background_delete_documents`` already
+    holds the destructive reservation when it starts, but if it is cancelled
+    during the initial ``get_namespace_data`` fetch — before its release
+    try/finally — busy/destructive_busy must still be released. The fetch now
+    lives inside the release try and the finally re-fetches by token. The
+    pre-fix layout fetched before the try and leaked the slot."""
+    import asyncio
+    import importlib
+
+    workspace = f"delete-fetch-cancel-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    # Simulate the delete endpoint's synchronous reservation.
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+
+    real_get = shared_storage.get_namespace_data
+    calls = {"n": 0}
+
+    async def _get_ns_cancel_first(name, workspace=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise asyncio.CancelledError()
+        return await real_get(name, workspace=workspace)
+
+    monkeypatch.setattr(shared_storage, "get_namespace_data", _get_ns_cancel_first)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _document_routes.background_delete_documents(
+            rag, doc_manager, ["doc-x"], token=destructive_token
+        )
+
+    # The finally re-fetched by token and released (old code, which fetched
+    # before the try, would leak busy + destructive_busy here).
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+    assert pipeline_status.get("busy_owner") is None
+
+
+async def test_delete_release_drives_processing_on_mailbox_work(tmp_path):
+    """The post-delete queue drive keys off the ingress ``has_work`` probe
+    inside the owner-checked release: work that landed in the mailbox while
+    the delete held the destructive slot (e.g. a busy-refused process request
+    arming auto-rescan) triggers exactly one drive; an empty mailbox releases
+    without driving."""
+    import importlib
+
+    workspace = f"delete-drive-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+    ingress = await shared_storage.get_pipeline_ingress(workspace)
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete_and_signal(doc_id, delete_llm_cache=False):
+        # A busy-refused process request lands while we hold the slot.
+        ingress.request_auto_rescan()
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_and_signal
+
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # mailbox work → exactly one drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Empty mailbox → release without driving.
+    ingress.consume_auto_rescan()
+
+    async def _adelete_quiet(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_quiet
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 1  # unchanged: nothing pending, no spurious drive
+    assert pipeline_status.get("busy") is False
+
+
+async def test_delete_release_fails_toward_drive_on_ingress_failures(
+    tmp_path, monkeypatch
+):
+    """Both delete-exit failure arms fail TOWARD the post-delete drive: an
+    ingress resolve failure and a ``has_work`` probe failure each still
+    release the destructive slot and fire exactly one busy-gated drive —
+    never a silent defer of work that arrived during the delete, never a
+    wedged slot."""
+    import importlib
+
+    workspace = f"delete-drive-fail-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete
+
+    # Arm 1: the resolve itself fails → delete_exit_ingress=None → drive.
+    async def _broken_resolve(workspace=None):
+        raise RuntimeError("manager connection lost")
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _broken_resolve)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # exactly one drive, no loop
+    assert pipeline_status.get("busy") is False  # release still ran
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Arm 2: the resolve succeeds but the in-lock has_work probe fails.
+    class _ProbeBroken:
+        def has_work(self):
+            raise RuntimeError("probe transport down")
+
+    async def _resolve_probe_broken(workspace=None):
+        return _ProbeBroken()
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _resolve_probe_broken)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 2  # exactly one more drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+
+
+async def test_release_destructive_helper_survives_fetch_cancellation(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): ``_release_destructive_busy`` used to await
+    ``get_namespace_data`` OUTSIDE the run_to_completion-protected release, so a
+    cancellation during the fetch skipped the release and leaked the slot. The
+    helper now runs the fetch + owner-check inside ``release_owned_reservation``,
+    so the destructive slot is freed even when the caller is cancelled mid-fetch
+    (the deferred cancellation is re-raised only after the release completes)."""
+    import asyncio
+    import importlib
+
+    workspace = f"rel-destr-cancel-{uuid4().hex}"
+    token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": token}
+    )
+
+    real_get = shared_storage.get_namespace_data
+    entered = asyncio.Event()
+
+    async def _slow_get(name, workspace=None):
+        # Suspend the fetch so we can deliver a cancellation while it is in
+        # flight; it then completes on its own (run_to_completion shields it).
+        entered.set()
+        await asyncio.sleep(0.05)
+        return await real_get(name, workspace=workspace)
+
+    monkeypatch.setattr(shared_storage, "get_namespace_data", _slow_get)
+
+    task = asyncio.create_task(_document_routes._release_destructive_busy(rag, token))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Released despite the cancellation during the fetch (the pre-fix helper,
+    # with the fetch outside run_to_completion, would leak here).
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+    assert pipeline_status.get("busy_owner") is None
+
+
+async def test_release_scanning_helper_survives_fetch_cancellation(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): ``_release_scanning_reservation`` must
+    release the scanning slot even when cancelled during its namespace fetch —
+    the fetch now runs inside ``release_owned_reservation`` (run_to_completion),
+    covering shutdown cancellations of ``run_scanning_process``."""
+    import asyncio
+    import importlib
+
+    workspace = f"rel-scan-cancel-{uuid4().hex}"
+    token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status.update(
+        {"scanning": True, "scanning_exclusive": True, "scanning_owner": token}
+    )
+
+    real_get = shared_storage.get_namespace_data
+    entered = asyncio.Event()
+
+    async def _slow_get(name, workspace=None):
+        entered.set()
+        await asyncio.sleep(0.05)
+        return await real_get(name, workspace=workspace)
+
+    monkeypatch.setattr(shared_storage, "get_namespace_data", _slow_get)
+
+    task = asyncio.create_task(
+        _document_routes._release_scanning_reservation(rag, token)
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert pipeline_status.get("scanning") is False
+    assert pipeline_status.get("scanning_exclusive") is False
+    assert pipeline_status.get("scanning_owner") is None
+
+
+async def test_release_enqueue_helper_survives_fetch_cancellation(
+    tmp_path, monkeypatch
+):
+    """Regression (#3408 review P2): ``_release_enqueue_slot`` must remove its
+    token from ``pending_enqueue_tokens`` even when cancelled during its
+    namespace fetch — the fetch now runs inside
+    ``release_token_set_reservation`` (run_to_completion)."""
+    import asyncio
+    import importlib
+
+    workspace = f"rel-enq-cancel-{uuid4().hex}"
+    token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status.update(
+        {
+            "pending_enqueue_tokens": {token: {"pid": 0, "process_start_id": None}},
+            "pending_enqueues": 1,
+        }
+    )
+
+    real_get = shared_storage.get_namespace_data
+    entered = asyncio.Event()
+
+    async def _slow_get(name, workspace=None):
+        entered.set()
+        await asyncio.sleep(0.05)
+        return await real_get(name, workspace=workspace)
+
+    monkeypatch.setattr(shared_storage, "get_namespace_data", _slow_get)
+
+    task = asyncio.create_task(_document_routes._release_enqueue_slot(rag, token))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert pipeline_status.get("pending_enqueues", 0) == 0
+    assert pipeline_status.get("pending_enqueue_tokens", {}) == {}
+
+
+async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
+    tmp_path, monkeypatch
+):
+    """The scenario the original race report described, end-to-end:
+    two upload requests arrive while the pipeline is busy.  Under the
+    new contract neither is rejected; both reserve slots, both schedule
+    bg tasks, and pending_enqueues stays at 2 until each bg task
+    releases.  No reservation can be killed by the busy guard because
+    that guard has been removed from apipeline_enqueue_documents.
+    """
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+    pipeline_status["busy"] = True
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+
+    # Gate both managed children so their enqueue slots stay reserved together.
+    import asyncio
+
+    gate = asyncio.Event()
+
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+        await gate.wait()
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
+
+    managed: set = set()
+
+    upload_a = _document_routes.UploadFile(filename="a.docx", file=BytesIO(b"a bytes"))
+    response_a = await upload_endpoint(managed, upload_a)
+    assert response_a.status == "success"
+    assert pipeline_status["pending_enqueues"] == 1
+
+    upload_b = _document_routes.UploadFile(filename="b.docx", file=BytesIO(b"b bytes"))
+    response_b = await upload_endpoint(managed, upload_b)
+    assert response_b.status == "success"
+    # Both reservations coexist while the gated managed tasks run.
+    assert pipeline_status["pending_enqueues"] == 2
+    # Both files were written to disk; both managed tasks tracked.
+    assert (tmp_path / "a.docx").exists()
+    assert (tmp_path / "b.docx").exists()
+    assert len(managed) == 2
+
+    # Let both finish; each child's finally releases its slot.
+    gate.set()
+    await _await_managed(managed)
+    assert pipeline_status["pending_enqueues"] == 0
+
+
+async def test_reserve_enqueue_slot_allows_busy_and_scan_processing_phase(tmp_path):
+    """Reservation only blocks on ``scanning_exclusive`` (scan's
+    classification phase) and ``destructive_busy``.  Plain ``busy=True``
+    (processing loop) and ``scanning=True`` with
+    ``scanning_exclusive=False`` (scan in its processing phase) are
+    BOTH permitted — that's what enables "upload while pipeline is
+    working".
+    """
+    import importlib
+
+    rag = _ScanRag({})
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["scanning_exclusive"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    # busy=True alone does NOT block.
+    pipeline_status["busy"] = True
+    assert await _document_routes._reserve_enqueue_slot(rag, "enq") is True
+    await _document_routes._release_enqueue_slot(rag, "enq")
+    pipeline_status["busy"] = False
+
+    # scanning=True (scan processing phase) does NOT block — this is
+    # the user-reported case: upload during scan-driven processing
+    # must succeed.
+    pipeline_status["scanning"] = True
+    assert await _document_routes._reserve_enqueue_slot(rag, "enq") is True
+    await _document_routes._release_enqueue_slot(rag, "enq")
+    pipeline_status["scanning"] = False
+
+    # scanning_exclusive=True (scan classification phase) STILL rejects.
+    pipeline_status["scanning"] = True
+    pipeline_status["scanning_exclusive"] = True
+    with pytest.raises(_document_routes.HTTPException) as exc:
+        await _document_routes._reserve_enqueue_slot(rag, "enq")
+    assert exc.value.status_code == 409
+    assert "classifying" in exc.value.detail.lower()
+    assert pipeline_status["pending_enqueues"] == 0
+
+
+async def test_reserve_enqueue_slot_rejects_destructive_busy(tmp_path):
+    """``destructive_busy`` (set by /documents/clear and per-doc delete)
+    must reject reservation: those jobs DROP storages and remove input
+    files, so any concurrent enqueue would write to a storage being
+    torn down and silently lose the document after the client saw 200.
+    """
+    import importlib
+
+    rag = _ScanRag({})
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["scanning_exclusive"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    # destructive_busy=True (clear / delete in flight) → 409.
+    pipeline_status["busy"] = True
+    pipeline_status["destructive_busy"] = True
+    with pytest.raises(_document_routes.HTTPException) as exc:
+        await _document_routes._reserve_enqueue_slot(rag, "enq")
+    assert exc.value.status_code == 409
+    assert "clearing or deleting" in exc.value.detail.lower()
+    assert pipeline_status["pending_enqueues"] == 0
+
+    # Cleared once the destructive job finishes.
+    pipeline_status["destructive_busy"] = False
+    pipeline_status["busy"] = False
+    assert await _document_routes._reserve_enqueue_slot(rag, "enq") is True
+    await _document_routes._release_enqueue_slot(rag, "enq")
+
+
+async def test_clear_documents_sets_and_clears_destructive_busy(tmp_path):
+    """``/documents/clear`` must set ``destructive_busy=True`` while it is
+    dropping storages (so concurrent uploads get 409, not silent loss)
+    and clear the flag on completion so the pipeline returns to idle.
+    """
+    import importlib
+
+    workspace = f"clear-test-{uuid4().hex}"
+    observed = {"destructive_busy": None}
+
+    class _DropSpy:
+        """Mid-drop probe: snapshots ``destructive_busy`` when the clear
+        endpoint calls our ``drop()``.  Concurrent reservations during
+        this window MUST see destructive_busy=True.
+        """
+
+        def __init__(self, ws):
+            self.namespace = "spy"
+            self.workspace = ws
+
+        async def drop(self):
+            shared_storage_inner = importlib.import_module("lightrag.kg.shared_storage")
+            ns = await shared_storage_inner.get_namespace_data(
+                "pipeline_status", workspace=self.workspace
+            )
+            observed["destructive_busy"] = ns.get("destructive_busy")
+            return None
+
+    spy = _DropSpy(workspace)
+
+    class _ClearRag:
+        def __init__(self):
+            self.workspace = workspace
+            # Eleven storage attributes the clear endpoint iterates over.
+            # Reusing the same spy is fine — each gets ``.drop()`` called
+            # in turn, all observe the same destructive_busy flag.
+            self.text_chunks = spy
+            self.full_docs = spy
+            self.full_entities = spy
+            self.full_relations = spy
+            self.entity_chunks = spy
+            self.relation_chunks = spy
+            self.entities_vdb = spy
+            self.relationships_vdb = spy
+            self.chunks_vdb = spy
+            self.chunk_entity_relation_graph = spy
+            self.doc_status = spy
+
+        async def aclear_cache(self, modes=None):
+            return None
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ClearRag()
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    router = create_document_routes(rag, doc_manager)
+    clear_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "clear_documents"
+    ][-1]
+
+    response = await clear_endpoint()
+    assert response.status == "success"
+    # destructive_busy was True for the duration of the storage drop.
+    assert observed["destructive_busy"] is True
+    # And cleared back to False after completion.
+    assert pipeline_status.get("destructive_busy") is False
+    assert pipeline_status.get("busy") is False
+
+
+async def test_clear_documents_refuses_when_scanning_or_pending_enqueues(tmp_path):
+    """``/documents/clear`` must refuse atomically when ANY exclusive
+    or in-flight writer is active — not just ``busy``.  Previously
+    only ``busy`` was checked, so clear could begin dropping storages
+    while a /scan task was running or while an upload bg task had
+    reserved a slot but not yet written its doc to doc_status.
+    """
+    import importlib
+
+    workspace = f"clear-refuse-test-{uuid4().hex}"
+
+    class _StubRag:
+        def __init__(self):
+            self.workspace = workspace
+
+    rag = _StubRag()
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    router = create_document_routes(rag, doc_manager)
+    clear_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "clear_documents"
+    ][-1]
+
+    # Case 1: scanning=True must refuse.
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = True
+    pipeline_status["pending_enqueues"] = 0
+    response = await clear_endpoint()
+    assert response.status == "busy"
+    # Critical: no flag mutation occurred; scanning is still owned.
+    assert pipeline_status["scanning"] is True
+    assert pipeline_status.get("destructive_busy", False) is False
+
+    # Case 2: pending_enqueues>0 must refuse.
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 1
+    response = await clear_endpoint()
+    assert response.status == "busy"
+    assert pipeline_status["pending_enqueues"] == 1
+    assert pipeline_status.get("destructive_busy", False) is False
+
+    # Case 3: busy=True (e.g. processing loop or another destructive
+    # job) must refuse — preserves existing behaviour.
+    pipeline_status["pending_enqueues"] = 0
+    pipeline_status["busy"] = True
+    response = await clear_endpoint()
+    assert response.status == "busy"
+    assert pipeline_status.get("destructive_busy", False) is False
+
+
+async def test_delete_document_reserves_destructive_busy_synchronously(tmp_path):
+    """``/documents/delete_document`` must reserve the destructive slot
+    synchronously BEFORE returning ``deletion_started``.  Otherwise
+    a /scan or /upload arriving between the response and the bg task
+    starting could race the destructive job.
+
+    Acceptance criteria: after the endpoint returns success,
+    pipeline_status reflects ``busy=True`` and ``destructive_busy=True``
+    even though the bg task hasn't run yet.  Refusal cases for
+    scanning / pending_enqueues / busy must short-circuit and return
+    ``status="busy"`` without scheduling.
+    """
+    import importlib
+
+    rag = _DeleteRag(DeletionResult(status="success", message="ok", doc_id="doc-1"))
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+
+    router = create_document_routes(rag, doc_manager)
+    delete_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "delete_document"
+    ][-1]
+
+    # Build the request payload using the model class on the module.
+    DeleteDocRequest = _document_routes.DeleteDocRequest
+
+    # Case 1: reservation acquired synchronously, managed task started.
+    import asyncio
+
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+    # Gate the child inside its delete loop so it parks BEFORE its finally,
+    # keeping the synchronously-acquired slot held while we assert.
+    gate = asyncio.Event()
+    _orig_delete = rag.adelete_by_doc_id
+
+    async def _gated_delete(doc_id, delete_llm_cache=False):
+        await gate.wait()
+        return await _orig_delete(doc_id, delete_llm_cache=delete_llm_cache)
+
+    rag.adelete_by_doc_id = _gated_delete
+
+    managed: set = set()
+    response = await delete_endpoint(
+        DeleteDocRequest(doc_ids=["doc-1"]),
+        managed,
+    )
+    assert response.status == "deletion_started"
+    # Synchronously reserved BEFORE returning (set by _acquire_destructive_busy
+    # in the endpoint, released only by the child's finally — still gated here).
+    assert pipeline_status["busy"] is True
+    assert pipeline_status["destructive_busy"] is True
+    assert len(managed) == 1
+    # Let the child finish; background_delete_documents releases in its finally.
+    gate.set()
+    await _await_managed(managed)
+    assert pipeline_status["busy"] is False
+    assert pipeline_status["destructive_busy"] is False
+    rag.adelete_by_doc_id = _orig_delete
+    # Reset for next case.
+    pipeline_status["busy"] = False
+    pipeline_status["destructive_busy"] = False
+
+    # Case 2: scanning=True must refuse without scheduling.
+    pipeline_status["scanning"] = True
+    managed = set()
+    response = await delete_endpoint(
+        DeleteDocRequest(doc_ids=["doc-1"]),
+        managed,
+    )
+    assert response.status == "busy"
+    assert len(managed) == 0
+    assert pipeline_status.get("destructive_busy", False) is False
+    pipeline_status["scanning"] = False
+
+    # Case 3: pending_enqueues>0 must refuse without scheduling.
+    pipeline_status["pending_enqueues"] = 1
+    managed = set()
+    response = await delete_endpoint(
+        DeleteDocRequest(doc_ids=["doc-1"]),
+        managed,
+    )
+    assert response.status == "busy"
+    assert len(managed) == 0
+    assert pipeline_status["pending_enqueues"] == 1
+    assert pipeline_status.get("destructive_busy", False) is False
+    pipeline_status["pending_enqueues"] = 0
+
+
+async def test_scan_managed_task_released_on_shutdown_drain(tmp_path):
+    """PR-1b: the scan reservation is held by a MANAGED asyncio task (start
+    barrier confirmed takeover before the endpoint returned), so a shutdown that
+    drains the managed set cancels the child and its finally releases scanning —
+    closing the Starlette 'callback dropped after response body sent' leak."""
+    import asyncio
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    # Park run_scanning_process mid-flight (scanning still True) so the drain,
+    # not natural completion, is what releases it.
+    gate = asyncio.Event()
+
+    async def _gated_process():
+        await gate.wait()
+
+    rag.apipeline_process_enqueue_documents = _gated_process
+
+    router = create_document_routes(rag, doc_manager)
+    scan_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "scan_for_new_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await scan_endpoint(managed)
+    assert response.status == "scanning_started"
+    # A live managed task holds the reservation (not a deferred callback).
+    assert len(managed) == 1
+    assert pipeline_status["scanning"] is True
+
+    # Shutdown drain: cancel + join, child finally releases (owner-checked,
+    # cancellation-resistant) even though it was parked at the gate.
+    pending = await shared_storage.drain_reserved_background_tasks(managed)
+    assert pending is None
+    assert pipeline_status["scanning"] is False
+    assert pipeline_status["scanning_exclusive"] is False
+    assert pipeline_status.get("scanning_owner") is None
+
+
+async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypatch):
+    """PR-1b: the enqueue slot is held by a managed task; a shutdown drain
+    cancels it and its finally releases the slot (pending_enqueues back to 0)."""
+    import asyncio
+    import importlib
+
+    monkeypatch.setattr(
+        _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
+    )
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DuplicateUploadRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    gate = asyncio.Event()
+
+    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+        await gate.wait()
+
+    monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
+
+    router = create_document_routes(rag, doc_manager)
+    upload_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "upload_to_input_dir"
+    ][-1]
+    upload_file = _document_routes.UploadFile(
+        filename="drain.docx", file=BytesIO(b"bytes")
+    )
+
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+    assert response.status == "success"
+    assert pipeline_status["pending_enqueues"] == 1
+    assert len(managed) == 1
+
+    pending = await shared_storage.drain_reserved_background_tasks(managed)
+    assert pending is None
+    assert pipeline_status["pending_enqueues"] == 0
+    assert pipeline_status.get("pending_enqueue_tokens", {}) == {}
+
+
+async def test_delete_managed_task_released_on_shutdown_drain(tmp_path):
+    """PR-1b: the destructive slot is held by a managed task; a shutdown drain
+    cancels it and background_delete_documents' finally releases busy +
+    destructive_busy."""
+    import asyncio
+    import importlib
+
+    rag = _DeleteRag(DeletionResult(status="success", message="ok", doc_id="doc-1"))
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=rag.workspace
+    )
+    pipeline_status["busy"] = False
+    pipeline_status["scanning"] = False
+    pipeline_status["pending_enqueues"] = 0
+
+    gate = asyncio.Event()
+
+    async def _gated_delete(doc_id, delete_llm_cache=False):
+        await gate.wait()
+
+    rag.adelete_by_doc_id = _gated_delete
+
+    router = create_document_routes(rag, doc_manager)
+    delete_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "delete_document"
+    ][-1]
+
+    managed: set = set()
+    response = await delete_endpoint(
+        _document_routes.DeleteDocRequest(doc_ids=["doc-1"]),
+        managed,
+    )
+    assert response.status == "deletion_started"
+    assert pipeline_status["busy"] is True
+    assert pipeline_status["destructive_busy"] is True
+    assert len(managed) == 1
+
+    pending = await shared_storage.drain_reserved_background_tasks(managed)
+    assert pending is None
+    assert pipeline_status["busy"] is False
+    assert pipeline_status["destructive_busy"] is False
+    assert pipeline_status.get("busy_owner") is None
+
+
+async def test_reprocess_starts_managed_task(tmp_path):
+    """PR-1b: /reprocess_failed runs apipeline_process_enqueue_documents as a
+    MANAGED task (tracked for shutdown drain) rather than a Starlette callback.
+    It holds no reservation of its own — the backstop is a no-op."""
+    import asyncio
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ScanRag({})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    gate = asyncio.Event()
+
+    async def _gated_process():
+        await gate.wait()
+        rag.process_calls += 1
+
+    rag.apipeline_process_enqueue_documents = _gated_process
+
+    router = create_document_routes(rag, doc_manager)
+    reprocess_endpoint = [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "reprocess_failed_documents"
+    ][-1]
+
+    managed: set = set()
+    response = await reprocess_endpoint(managed)
+    assert response.status == "reprocessing_started"
+    # The pipeline pass is a live managed task (start barrier confirmed takeover).
+    assert len(managed) == 1
+
+    gate.set()
+    await _await_managed(managed)
+    assert rag.process_calls == 1
+
+
+def test_delete_file_variants_removes_canonical_hint_variants(tmp_path):
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    files_to_delete = [
+        tmp_path / "report.docx",
+        tmp_path / "report.[native].docx",
+        parsed_dir / "report.[mineru].docx",
+        parsed_dir / "report.[native]_001.docx",
+        parsed_dir / "report_001.docx",
+    ]
+    for path in files_to_delete:
+        path.write_bytes(b"delete me")
+    unrelated_files = [
+        tmp_path / "report_001.docx",
+        tmp_path / "report_2024.docx",
+        parsed_dir / "other.[native].docx",
+    ]
+    for path in unrelated_files:
+        path.write_bytes(b"keep me")
+    artifact_dirs = [
+        parsed_dir / "report.docx.parsed",
+        parsed_dir / "report.docx.parsed_001",
+    ]
+    for artifact_dir in artifact_dirs:
+        artifact_dir.mkdir()
+        (artifact_dir / "report.blocks.jsonl").write_text("{}", encoding="utf-8")
+    unrelated_artifact_dir = parsed_dir / "other.docx.parsed"
+    unrelated_artifact_dir.mkdir()
+    (unrelated_artifact_dir / "other.blocks.jsonl").write_text("{}", encoding="utf-8")
+
+    deleted_files, errors = _document_routes.delete_file_variants_by_file_path(
+        tmp_path,
+        "report.docx",
+    )
+
+    assert errors == []
+    assert set(deleted_files) == {
+        "report.docx",
+        "report.[native].docx",
+        str(Path(PARSED_DIR_NAME) / "report.[mineru].docx"),
+        str(Path(PARSED_DIR_NAME) / "report.[native]_001.docx"),
+        str(Path(PARSED_DIR_NAME) / "report_001.docx"),
+        str(Path(PARSED_DIR_NAME) / "report.docx.parsed"),
+        str(Path(PARSED_DIR_NAME) / "report.docx.parsed_001"),
+    }
+    assert all(not path.exists() for path in files_to_delete)
+    assert all(path.exists() for path in unrelated_files)
+    assert all(not artifact_dir.exists() for artifact_dir in artifact_dirs)
+    assert unrelated_artifact_dir.is_dir()
+
+
+async def test_background_delete_removes_parser_hint_file_variants(tmp_path):
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    source_file = tmp_path / "paper.[native].docx"
+    source_file.write_bytes(b"source")
+    parsed_variant = parsed_dir / "paper.[mineru]_001.docx"
+    parsed_variant.write_bytes(b"parsed")
+    unrelated_file = tmp_path / "other.[native].docx"
+    unrelated_file.write_bytes(b"keep")
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _DeleteRag(
+        DeletionResult(
+            status="success",
+            doc_id="doc-paper",
+            message="deleted",
+            file_path="paper.docx",
+        )
+    )
+    shared_storage.initialize_share_data()
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    await _document_routes.background_delete_documents(
+        rag,
+        doc_manager,
+        ["doc-paper"],
+        delete_file=True,
+        delete_llm_cache=True,
+    )
+
+    assert rag.deleted_doc_ids == [("doc-paper", True)]
+    assert not source_file.exists()
+    assert not parsed_variant.exists()
+    assert unrelated_file.exists()
+
+
+async def test_docx_archive_failure_is_best_effort(tmp_path, monkeypatch):
+    file_path = tmp_path / "archive-failure.docx"
+    file_path.write_bytes(b"docx bytes")
+
+    async def _raise_archive_failure(*args, **kwargs):
+        raise OSError("simulated archive failure")
+
+    from lightrag.utils_pipeline import (
+        archive_docx_source_after_full_docs_sync,
+    )
+    import lightrag.utils_pipeline as _utils_pipeline
+
+    monkeypatch.setattr(
+        _utils_pipeline, "move_file_to_parsed_dir", _raise_archive_failure
+    )
+
+    archived_path = await archive_docx_source_after_full_docs_sync(str(file_path))
+
+    assert archived_path is None
+    assert file_path.exists()
+
+
+async def test_parse_native_archives_docx_after_full_docs_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("INPUT_DIR", str(tmp_path))
+    source_path = tmp_path / "parsed-after-sync.docx"
+    source_path.write_bytes(b"docx bytes")
+    rag = _ParseRag(tmp_path / "work", source_path)
+
+    def _fake_extract(file_path, drawing_context=None, **kwargs):
+        # extract_docx_blocks returns a list of block dicts; a single text
+        # block is enough to exercise the archive + full_docs side-effects
+        # tested below — the adapter will turn it into one .blocks.jsonl
+        # content row.
+        return [
+            {
+                "uuid": "p1",
+                "uuid_end": "p1",
+                "heading": "",
+                "content": "parsed",
+                "type": "text",
+                "parent_headings": [],
+                "level": 0,
+                "table_chunk_role": "none",
+            }
+        ]
+
+    monkeypatch.setattr(
+        "lightrag.parser.docx.parse_document.extract_docx_blocks",
+        _fake_extract,
+    )
+
+    result = await _parse_via_registry(
+        rag,
+        "native",
+        "doc-test",
+        str(source_path),
+        {"parse_format": FULL_DOCS_FORMAT_PENDING_PARSE, "content": ""},
+    )
+
+    # parse_native now returns LIGHTRAG-format parsed_data with merged_text
+    # (not the {{LRdoc}} marker — that's only in the persisted full_docs row).
+    assert result["content"]
+    assert result["parse_format"] == "lightrag"
+    assert result["blocks_path"]
+    assert rag.full_docs.events == ["upsert", "index_done"]
+    assert not source_path.exists()
+    assert (tmp_path / PARSED_DIR_NAME / source_path.name).exists()
+    parsed_artifact_dir = tmp_path / PARSED_DIR_NAME / f"{source_path.name}.parsed"
+    assert parsed_artifact_dir.is_dir()
+    assert (parsed_artifact_dir / "parsed-after-sync.blocks.jsonl").is_file()
+    assert rag.full_docs.data["doc-test"]["parse_engine"] == "native"
+    assert rag.full_docs.data["doc-test"]["parse_format"] == "lightrag"
+    # Per docs/FileProcessingConfiguration-zh.md, content uses the {{LRdoc}}
+    # marker plus a leading-text summary derived from merged blocks.
+    assert rag.full_docs.data["doc-test"]["content"].startswith("{{LRdoc}}")
+
+
+def test_parsed_artifact_dir_uses_unique_suffix_when_path_is_file(
+    tmp_path, monkeypatch
+):
+    from lightrag.utils_pipeline import parsed_artifact_dir_for
+
+    monkeypatch.setenv("INPUT_DIR", str(tmp_path))
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+    (parsed_dir / "demo.docx.parsed").write_text("legacy file", encoding="utf-8")
+
+    artifact_dir = parsed_artifact_dir_for("demo.docx")
+
+    assert artifact_dir == parsed_dir / "demo.docx.parsed_001"
+
+
+def test_parsed_artifact_dir_reuses_existing_parsed_parent(tmp_path, monkeypatch):
+    from lightrag.utils_pipeline import parsed_artifact_dir_for
+
+    monkeypatch.setenv("INPUT_DIR", str(tmp_path))
+    parsed_dir = tmp_path / PARSED_DIR_NAME
+    parsed_dir.mkdir()
+
+    artifact_dir = parsed_artifact_dir_for("demo.docx")
+
+    assert artifact_dir == parsed_dir / "demo.docx.parsed"
+
+
+async def test_parse_native_docx_content_list_failure_raises_without_fallback(
+    tmp_path, monkeypatch
+):
+    source_path = tmp_path / "content-list-failure.docx"
+    source_path.write_bytes(b"docx bytes")
+    rag = _ParseRag(tmp_path / "work", source_path)
+
+    def _raise_parser(file_path, drawing_context=None, **kwargs):
+        raise RuntimeError("content list boom")
+
+    monkeypatch.setattr(
+        "lightrag.parser.docx.parse_document.extract_docx_blocks",
+        _raise_parser,
+    )
+
+    with pytest.raises(RuntimeError, match="content list boom"):
+        await _parse_via_registry(
+            rag,
+            "native",
+            "doc-test",
+            str(source_path),
+            {"parse_format": FULL_DOCS_FORMAT_PENDING_PARSE, "content": ""},
+        )
+
+    assert source_path.exists()
+    assert rag.full_docs.events == []
+
+
+async def test_parse_native_docx_empty_content_list_result_raises_without_fallback(
+    tmp_path, monkeypatch
+):
+    source_path = tmp_path / "empty-content-list.docx"
+    source_path.write_bytes(b"docx bytes")
+    rag = _ParseRag(tmp_path / "work", source_path)
+
+    monkeypatch.setattr(
+        "lightrag.parser.docx.parse_document.extract_docx_blocks",
+        lambda *args, **kwargs: [],
+    )
+
+    with pytest.raises(ValueError, match="empty content"):
+        await _parse_via_registry(
+            rag,
+            "native",
+            "doc-test",
+            str(source_path),
+            {"parse_format": FULL_DOCS_FORMAT_PENDING_PARSE, "content": ""},
+        )
+
+    assert source_path.exists()
+    assert rag.full_docs.events == []
+
+
+def test_lightrag_document_reprocess_uses_full_docs_without_reparse():
+    engine = resolve_stored_document_parser_engine(
+        "report.[mineru].docx",
+        {
+            "parse_format": FULL_DOCS_FORMAT_LIGHTRAG,
+            "sidecar_location": "file:///tmp/report.docx.parsed/",
+            "parse_engine": "mineru",
+        },
+    )
+
+    # All lightrag rows route to the internal reuse handler (reuse the stored
+    # sidecar without re-parsing) regardless of the originating engine.
+    assert engine == "reuse"
+
+
+def test_default_allowlist_equals_local_engine_suffixes(tmp_path, monkeypatch):
+    """With no external endpoints and no routing rules, the registry-derived
+    allowlist must equal the local engines' (legacy ∪ native) suffixes —
+    i.e. exactly the historical hardcoded upload allowlist."""
+    from lightrag.parser import registry
+
+    for var in (
+        "MINERU_LOCAL_ENDPOINT",
+        "MINERU_API_TOKEN",
+        "DOCLING_ENDPOINT",
+        "LIGHTRAG_PARSER",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    dm = DocumentManager(str(tmp_path))
+    local = {f".{s}" for s in registry.suffix_capabilities("legacy")} | {
+        f".{s}" for s in registry.suffix_capabilities("native")
+    }
+    assert set(dm.supported_extensions) == local
+    # External-only suffixes stay out while their endpoints are unset.
+    assert ".png" not in dm.supported_extensions
+    assert ".doc" not in dm.supported_extensions
+
+
+def test_unroutable_suffix_needs_rule_or_hint(tmp_path, monkeypatch):
+    """An endpoint-configured engine's suffix is accepted only when routing
+    actually reaches that engine: a bare filename needs a LIGHTRAG_PARSER
+    rule; a per-file hint works without one. Otherwise the file would pass
+    upload only to fail the parse worker's legacy suffix gate."""
+    monkeypatch.delenv("DOCLING_ENDPOINT", raising=False)
+    monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
+    monkeypatch.setenv("MINERU_API_MODE", "local")
+    monkeypatch.setenv("MINERU_LOCAL_ENDPOINT", "http://fake-mineru")
+
+    dm = DocumentManager(str(tmp_path))
+    # Capable (endpoint up) but unroutable: bare png defaults to legacy.
+    assert ".png" not in dm.supported_extensions
+    assert not dm.is_supported_file("scan.png")
+    # A per-file hint routes this specific name to mineru.
+    assert dm.is_supported_file("scan.[mineru].png")
+    # A routing rule makes the bare suffix routable (and advertised).
+    monkeypatch.setenv("LIGHTRAG_PARSER", "png:mineru")
+    assert ".png" in dm.supported_extensions
+    assert dm.is_supported_file("scan.png")
+    # docling-only suffixes stay out (endpoint unset), rule or not.
+    assert ".xhtml" not in dm.supported_extensions
+
+
+def test_third_party_engine_suffixes_join_allowlist_and_scan(tmp_path, monkeypatch):
+    """A registered third-party engine's suffixes become uploadable and
+    scannable once routable (rule for bare names, hint for individual
+    files), and revert on unregister."""
+    from lightrag.parser import registry
+
+    monkeypatch.delenv("LIGHTRAG_PARSER", raising=False)
+    dm = DocumentManager(str(tmp_path))
+
+    # Before registration: .foo rejected by upload and invisible to scan.
+    assert not dm.is_supported_file("sample.foo")
+    (dm.input_dir / "sample.foo").write_text("x", encoding="utf-8")
+    (dm.input_dir / "hinted.[fooengine].foo").write_text("x", encoding="utf-8")
+    assert not [p for p in dm.iter_new_files() if p.suffix == ".foo"]
+
+    registry.register_parser(
+        registry.ParserSpec(
+            engine_name="fooengine",
+            impl="x:Y",
+            suffixes=frozenset({"foo"}),
+            queue_group="fooengine",
+            concurrency=1,
+        )
+    )
+    try:
+        # Registered but bare .foo is still unroutable (defaults to legacy).
+        assert not dm.is_supported_file("sample.foo")
+        # The hinted file routes to fooengine: uploadable AND discoverable
+        # by scan (glob covers the capability surface, filter is per-name).
+        assert dm.is_supported_file("hinted.[fooengine].foo")
+        scanned = {p.name for p in dm.iter_new_files()}
+        assert "hinted.[fooengine].foo" in scanned
+        assert "sample.foo" not in scanned
+        # A routing rule makes the bare suffix routable.
+        monkeypatch.setenv("LIGHTRAG_PARSER", "foo:fooengine")
+        assert ".foo" in dm.supported_extensions
+        assert dm.is_supported_file("sample.foo")
+        assert "sample.foo" in {p.name for p in dm.iter_new_files()}
+    finally:
+        registry._REGISTRY.pop("fooengine", None)
+    assert not dm.is_supported_file("sample.foo")
+
+
+class _DropStorage:
+    """Minimal storage stub whose drop() returns a preset result dict."""
+
+    def __init__(self, drop_result, namespace="ns", workspace="clear-test"):
+        self._drop_result = drop_result
+        self.namespace = namespace
+        self.workspace = workspace
+
+    async def drop(self):
+        return self._drop_result
+
+
+class _ClearRag:
+    """Mock LightRAG exposing the storages that clear_documents drops."""
+
+    def __init__(self, chunks_drop_result):
+        self.workspace = "clear-test"
+        ok = {"status": "success", "message": "data dropped"}
+        self.text_chunks = _DropStorage(ok, "text_chunks")
+        self.full_docs = _DropStorage(ok, "full_docs")
+        self.full_entities = _DropStorage(ok, "full_entities")
+        self.full_relations = _DropStorage(ok, "full_relations")
+        self.entity_chunks = _DropStorage(ok, "entity_chunks")
+        self.relation_chunks = _DropStorage(ok, "relation_chunks")
+        self.entities_vdb = _DropStorage(ok, "entities")
+        self.relationships_vdb = _DropStorage(ok, "relationships")
+        # The storage under test: drop() result is configurable.
+        self.chunks_vdb = _DropStorage(chunks_drop_result, "chunks")
+        self.chunk_entity_relation_graph = _DropStorage(ok, "graph")
+        self.doc_status = _DropStorage(ok, "doc_status")
+
+
+def _clear_endpoint(router):
+    return [
+        route.endpoint
+        for route in router.routes
+        if getattr(route, "name", "") == "clear_documents"
+    ][-1]
+
+
+async def test_clear_documents_honors_drop_error_status(tmp_path):
+    """A storage whose drop() returns {"status": "error"} (without raising) must
+    NOT be counted as a success: the clear is reported as partial_success so the
+    caller knows it is incomplete and can retry, instead of a misleading success.
+    """
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ClearRag(
+        chunks_drop_result={
+            "status": "error",
+            "message": "legacy tagging undetermined",
+        }
+    )
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    router = create_document_routes(rag, doc_manager)
+    response = await _clear_endpoint(router)()
+
+    assert response.status == "partial_success"
+
+
+async def test_clear_documents_succeeds_when_all_drops_succeed(tmp_path):
+    """Baseline: when every storage drop() returns success the clear reports
+    success."""
+    import importlib
+
+    doc_manager = DocumentManager(str(tmp_path))
+    rag = _ClearRag(chunks_drop_result={"status": "success", "message": "data dropped"})
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
+
+    router = create_document_routes(rag, doc_manager)
+    response = await _clear_endpoint(router)()
+
+    assert response.status == "success"

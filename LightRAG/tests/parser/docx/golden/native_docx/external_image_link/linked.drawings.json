@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "drawings": {
+    "im-1111aaaa2222bbbb1111aaaa2222bbbb-0001": {
+      "id": "im-1111aaaa2222bbbb1111aaaa2222bbbb-0001",
+      "blockid": "269c91a69ce1d034db0f22c10bd17429",
+      "heading": "Linked",
+      "parent_headings": [],
+      "format": "png",
+      "path": "",
+      "src": "https://example.com/diagrams/architecture.png",
+      "caption": "",
+      "footnotes": []
+    },
+    "im-1111aaaa2222bbbb1111aaaa2222bbbb-0002": {
+      "id": "im-1111aaaa2222bbbb1111aaaa2222bbbb-0002",
+      "blockid": "269c91a69ce1d034db0f22c10bd17429",
+      "heading": "Linked",
+      "parent_headings": [],
+      "format": "gif",
+      "path": "",
+      "src": "../images/legacy.gif",
+      "caption": "",
+      "footnotes": []
+    }
+  }
+}
