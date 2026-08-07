@@ -149,6 +149,7 @@ activemq-data/
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -220,3 +221,9 @@ __marimo__/
 /.quarto/
 **/*.quarto_ipynb
 .DS_Store
+
+# MAGI local workspace artifacts
+**/ragstore/
+/mgc-test/
+*.sqlite3-wal
+*.sqlite3-shm

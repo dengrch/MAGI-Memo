@@ -138,15 +138,15 @@ service 或模型网关统一处理退避、抖动、限流和 provider fallback
 在仓库根目录运行：
 
 ```bash
-LightRAG/.venv/bin/python test/lightrag_core_test.py
+.venv/bin/python scripts/legacy_live_smoke.py
 ```
 
 测试每次会清空并重建 `magi_memo_core_test`，不会清理 `magi_memo_dev`。
 
 产物：
 
-- `test/artifacts/core_test_results.json`：机器可读的逐项结果和耗时
-- `test/artifacts/core_graph_export.md`：Core 导出接口生成的图谱快照
-- `test/artifacts/rag_storage/`：独立测试 workspace 的本地存储
+- `mgc-test/artifacts/live-core-test/core_test_results.json`：机器可读的逐项结果和耗时
+- `mgc-test/artifacts/live-core-test/core_graph_export.md`：Core 导出接口生成的图谱快照
+- `mgc-test/artifacts/live-core-test/ragstore/`：独立测试 workspace 的本地存储
 
 完整复测累计接口耗时约 1303.51 秒，即 21 分 43.51 秒。
