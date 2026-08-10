@@ -3,12 +3,20 @@ import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { queryText, queryTextStream } from '@/api/lightrag'
-import { errorMessage } from '@/lib/utils'
+import { cn, errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useDebounce } from '@/hooks/useDebounce'
 import QuerySettings from '@/components/retrieval/QuerySettings'
 import { ChatMessage, MessageWithError } from '@/components/retrieval/ChatMessage'
-import { ChevronDownIcon, EraserIcon, SendIcon, CopyIcon, SquareIcon } from 'lucide-react'
+import {
+  ChevronDownIcon,
+  CopyIcon,
+  EraserIcon,
+  SendIcon,
+  SlidersHorizontalIcon,
+  SquareIcon,
+  XIcon
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -147,6 +155,7 @@ export default function RetrievalView() {
   })
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   // Current retrieval pipeline step (e.g. "extracting_keywords") — shown to
   // the user while the query is in flight so they see live progress.
   const [queryProgress, setQueryProgress] = useState<string | null>(null)
@@ -968,12 +977,12 @@ export default function RetrievalView() {
   }, [t])
 
   return (
-    <div className="flex size-full gap-2 px-2 pb-12 overflow-hidden">
-      <div className="flex grow flex-col gap-4">
+    <div className="magi-retrieval flex size-full gap-3 overflow-hidden p-4 max-md:p-2">
+      <div className="flex min-w-0 grow flex-col gap-3">
         <div className="relative grow">
           <div
             ref={messagesContainerRef}
-            className="bg-primary-foreground/60 absolute inset-0 flex flex-col overflow-auto rounded-lg border p-2"
+            className="magi-chat-surface absolute inset-0 flex flex-col overflow-auto rounded-lg border p-3"
           >
             <div className="flex min-h-0 flex-1 flex-col gap-2">
               {messages.length === 0 ? (
@@ -1048,7 +1057,7 @@ export default function RetrievalView() {
 
         <form
           onSubmit={handleSubmit}
-          className="flex shrink-0 items-center gap-2"
+          className="magi-chat-composer flex shrink-0 items-center gap-2 rounded-lg border p-2"
           autoComplete="on"
           method="post"
           action="#"
@@ -1062,9 +1071,23 @@ export default function RetrievalView() {
             onClick={clearMessages}
             disabled={isLoading}
             size="sm"
+            className="shrink-0 max-sm:size-8 max-sm:px-0"
+            aria-label={t('retrievePanel.retrieval.clear')}
+            tooltip={t('retrievePanel.retrieval.clear')}
           >
             <EraserIcon />
-            {t('retrievePanel.retrieval.clear')}
+            <span className="max-sm:hidden">{t('retrievePanel.retrieval.clear')}</span>
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="shrink-0 md:hidden"
+            aria-label={t('retrievePanel.querySettings.parametersTitle')}
+            tooltip={t('retrievePanel.querySettings.parametersTitle')}
+            onClick={() => setSettingsOpen(true)}
+          >
+            <SlidersHorizontalIcon />
           </Button>
           <div className="flex-1 relative">
             <label htmlFor="query-input" className="sr-only">
@@ -1117,19 +1140,61 @@ export default function RetrievalView() {
             )}
           </div>
           {isLoading ? (
-            <Button type="button" variant="destructive" onClick={handleStop} disabled={stopDisabled} size="sm">
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleStop}
+              disabled={stopDisabled}
+              size="sm"
+              className="shrink-0 max-sm:size-8 max-sm:px-0"
+              aria-label={t('retrievePanel.retrieval.stop')}
+              tooltip={t('retrievePanel.retrieval.stop')}
+            >
               <SquareIcon />
-              {t('retrievePanel.retrieval.stop')}
+              <span className="max-sm:hidden">{t('retrievePanel.retrieval.stop')}</span>
             </Button>
           ) : (
-            <Button type="submit" variant="default" size="sm">
+            <Button
+              type="submit"
+              variant="default"
+              size="sm"
+              className="shrink-0 max-sm:size-8 max-sm:px-0"
+              aria-label={t('retrievePanel.retrieval.send')}
+              tooltip={t('retrievePanel.retrieval.send')}
+            >
               <SendIcon />
-              {t('retrievePanel.retrieval.send')}
+              <span className="max-sm:hidden">{t('retrievePanel.retrieval.send')}</span>
             </Button>
           )}
         </form>
       </div>
-      <QuerySettings />
+      {settingsOpen && (
+        <button
+          type="button"
+          className="fixed inset-0 z-40 bg-black/70 backdrop-blur-sm md:hidden"
+          aria-label={t('common.cancel')}
+          onClick={() => setSettingsOpen(false)}
+        />
+      )}
+      <div
+        className={cn(
+          'shrink-0 max-md:fixed max-md:inset-y-0 max-md:right-0 max-md:z-50 max-md:w-[min(340px,calc(100vw-32px))] max-md:p-2 max-md:transition-transform',
+          settingsOpen ? 'max-md:translate-x-0' : 'max-md:pointer-events-none max-md:translate-x-full'
+        )}
+      >
+        <QuerySettings className="h-full max-md:w-full" />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="absolute top-4 right-4 md:hidden"
+          aria-label={t('common.cancel')}
+          tooltip={t('common.cancel')}
+          onClick={() => setSettingsOpen(false)}
+        >
+          <XIcon />
+        </Button>
+      </div>
     </div>
   )
 }

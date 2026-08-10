@@ -179,7 +179,7 @@ magi-rebuild-vdb = "magi_core.tools.rebuild_vdb:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["magi_core*", "interface*"]
+include = ["magi_core*", "magi_runtime*", "interface*"]
 exclude = ["data*", "tests*", "scripts*", "examples*", "dickens*", "reproduce*", "output_complete*", "rag_storage*", "inputs*"]
 
 [tool.setuptools]

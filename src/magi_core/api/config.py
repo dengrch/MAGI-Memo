@@ -341,9 +341,20 @@ def parse_args() -> argparse.Namespace:
 
     # Directory configuration
     parser.add_argument(
+        "--workspace-home",
+        default=get_env_value("WORKSPACE_HOME", None),
+        help=(
+            "Root directory containing the persistent MAGI workspace registry "
+            "(default: parent of WORKING_DIR for legacy configurations)"
+        ),
+    )
+    parser.add_argument(
         "--working-dir",
         default=get_env_value("WORKING_DIR", "./mgc-test/ragstore"),
-        help="Working directory for RAG storage (default: from env or ./mgc-test/ragstore)",
+        help=(
+            "Legacy bootstrap RAG directory; runtime workspaces are resolved "
+            "from WORKSPACE_HOME"
+        ),
     )
     parser.add_argument(
         "--input-dir",
@@ -449,7 +460,10 @@ def parse_args() -> argparse.Namespace:
         "--workspace",
         type=str,
         default=get_env_value("WORKSPACE", ""),
-        help="Default workspace for all storage",
+        help=(
+            "Bootstrap workspace id used only when WORKSPACE_HOME has no "
+            "registry; later selections are persisted by the Runtime"
+        ),
     )
 
     # Path prefix configuration
@@ -561,6 +575,8 @@ def parse_args() -> argparse.Namespace:
     # convert relative path to absolute path
     args.working_dir = os.path.abspath(args.working_dir)
     args.input_dir = os.path.abspath(args.input_dir)
+    if args.workspace_home:
+        args.workspace_home = os.path.abspath(args.workspace_home)
 
     # Inject storage configuration from environment variables
     args.kv_storage = get_env_value(

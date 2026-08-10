@@ -383,9 +383,6 @@ async def _handle_entity_relation_summary(
     if not description_list:
         return "", False
 
-    if global_config.get("magi_preserve_atom_order", False):
-        return sanitize_text_for_encoding(separator.join(description_list)), False
-
     # If only one description, return it directly (no need for LLM call)
     # Still sanitize: descriptions read back from existing graph nodes (or
     # injected by non-extraction producers) may carry XML-illegal control
@@ -584,6 +581,31 @@ async def _summarize_descriptions(
     # would later break GraphML (XML) serialization on write. Strip them
     # at the source, symmetric with how extracted descriptions are cleaned.
     summary = sanitize_text_for_encoding(summary)
+
+    # MAGI Atom descriptions carry source tags such as ``[atom-...]``.  The
+    # summary is the materialized graph description, so silently losing or
+    # inventing one of those tags would break its data lineage.  The prompt is
+    # the primary mechanism; this guard keeps the unsummarized Atom list when a
+    # provider nevertheless returns an untraceable summary.  Legacy LightRAG
+    # descriptions contain no Atom tags and retain their original behavior.
+    lineage_pattern = re.compile(r"\[atom-[A-Za-z0-9_-]+\]")
+    source_lineage = {
+        tag
+        for description in description_list
+        for tag in lineage_pattern.findall(description)
+    }
+    if source_lineage:
+        summary_lineage = set(lineage_pattern.findall(summary))
+        if summary_lineage != source_lineage:
+            logger.warning(
+                "Summary lineage mismatch for %s %s: expected %d Atom tags, got %d; "
+                "keeping the original Atom descriptions",
+                description_type,
+                description_name,
+                len(source_lineage),
+                len(summary_lineage),
+            )
+            summary = sanitize_text_for_encoding(GRAPH_FIELD_SEP.join(description_list))
 
     # Check summary token length against embedding limit
     embedding_token_limit = global_config.get("embedding_token_limit")

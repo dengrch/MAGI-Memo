@@ -252,10 +252,10 @@ const GraphViewer = () => {
 
   // Always render SigmaContainer but control its visibility with CSS
   return (
-    <div className="relative h-full w-full overflow-hidden">
+    <div className="magi-graph-surface relative h-full w-full overflow-hidden">
       <SigmaContainer
         settings={memoizedSigmaSettings}
-        className="!bg-background !size-full overflow-hidden"
+        className="!size-full !bg-transparent overflow-hidden"
         ref={sigmaRef}
       >
         <GraphControl />

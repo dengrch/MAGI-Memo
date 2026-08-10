@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from magi_core.backend.engine import EngineBackend
 from magi_core.backend.neo4j import Neo4jBackend
 from magi_core.backend.sqlite import SQLiteBackend
-from magi_core.memory import Episode, EpisodeStatus
+from magi_core.memory import Episode, EpisodeStatus, ExtractedMemory
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,3 +122,60 @@ class BackendBundle:
             mode=mode,
             query_options=query_options,
         )
+
+    async def ingest_extracted(
+        self, memories: Sequence[ExtractedMemory]
+    ) -> IndexResult:
+        self._require_initialized()
+        pending: list[ExtractedMemory] = []
+        skipped = 0
+        for memory in memories:
+            record = await self.sqlite.put_episode(memory.episode)
+            if record["status"] == EpisodeStatus.INDEXED.value:
+                skipped += 1
+            else:
+                pending.append(memory)
+        if not pending:
+            return IndexResult(
+                episode_ids=tuple(item.episode.id for item in memories),
+                indexed_count=0,
+                skipped_count=skipped,
+                track_id=None,
+            )
+        try:
+            track_id = await self.engine.ingest_extracted(pending)
+        except Exception as exc:
+            for memory in pending:
+                await self.sqlite.mark_episode(
+                    memory.episode.id,
+                    EpisodeStatus.FAILED,
+                    error=str(exc),
+                )
+            raise
+        for memory in pending:
+            await self.sqlite.mark_episode(
+                memory.episode.id,
+                EpisodeStatus.INDEXED,
+                track_id=track_id,
+            )
+        return IndexResult(
+            episode_ids=tuple(item.episode.id for item in memories),
+            indexed_count=len(pending),
+            skipped_count=skipped,
+            track_id=track_id,
+        )
+
+    async def status(self) -> dict[str, Any]:
+        self._require_initialized()
+        engine_status, memory_status = await asyncio.gather(
+            self.engine.status(), self.sqlite.memory_overview()
+        )
+        return {
+            "initialized": self._initialized,
+            "engine": engine_status,
+            "memory": memory_status,
+            "neo4j": {
+                "available": self.neo4j._initialized,
+                "backend": type(self.neo4j.raw).__name__,
+            },
+        }

@@ -9,74 +9,96 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --background: hsl(0 0% 100%);
-  --foreground: hsl(240 10% 3.9%);
-  --card: hsl(0 0% 100%);
-  --card-foreground: hsl(240 10% 3.9%);
-  --popover: hsl(0 0% 100%);
-  --popover-foreground: hsl(240 10% 3.9%);
-  --primary: hsl(240 5.9% 10%);
-  --primary-foreground: hsl(0 0% 98%);
-  --secondary: hsl(240 4.8% 95.9%);
-  --secondary-foreground: hsl(240 5.9% 10%);
-  --muted: hsl(240 4.8% 95.9%);
-  --muted-foreground: hsl(240 3.8% 46.1%);
-  --accent: hsl(240 4.8% 95.9%);
-  --accent-foreground: hsl(240 5.9% 10%);
-  --destructive: hsl(0 84.2% 60.2%);
-  --destructive-foreground: hsl(0 0% 98%);
-  --border: hsl(240 5.9% 90%);
-  --input: hsl(240 5.9% 90%);
-  --ring: hsl(240 10% 3.9%);
-  --chart-1: hsl(12 76% 61%);
-  --chart-2: hsl(173 58% 39%);
-  --chart-3: hsl(197 37% 24%);
-  --chart-4: hsl(43 74% 66%);
-  --chart-5: hsl(27 87% 67%);
-  --radius: 0.6rem;
-  --sidebar-background: hsl(0 0% 98%);
-  --sidebar-foreground: hsl(240 5.3% 26.1%);
-  --sidebar-primary: hsl(240 5.9% 10%);
-  --sidebar-primary-foreground: hsl(0 0% 98%);
-  --sidebar-accent: hsl(240 4.8% 95.9%);
-  --sidebar-accent-foreground: hsl(240 5.9% 10%);
-  --sidebar-border: hsl(220 13% 91%);
-  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+  color-scheme: light;
+  --background: #f7f8f8;
+  --foreground: #202124;
+  --card: #ffffff;
+  --card-foreground: #202124;
+  --popover: #ffffff;
+  --popover-foreground: #202124;
+  --primary: #5e6ad2;
+  --primary-foreground: #ffffff;
+  --secondary: #f0f1f2;
+  --secondary-foreground: #35373b;
+  --muted: #f0f1f2;
+  --muted-foreground: #6f737a;
+  --accent: rgba(71, 75, 83, 0.08);
+  --accent-foreground: #202124;
+  --destructive: #d14343;
+  --destructive-foreground: #ffffff;
+  --border: rgba(23, 25, 28, 0.1);
+  --input: rgba(23, 25, 28, 0.14);
+  --ring: #7170ff;
+  --chart-1: #5e6ad2;
+  --chart-2: #27a644;
+  --chart-3: #7a7fad;
+  --chart-4: #8a8f98;
+  --chart-5: #62666d;
+  --radius: 0.5rem;
+  --sidebar-background: #f1f2f3;
+  --sidebar-foreground: #35373b;
+  --sidebar-primary: #5e6ad2;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(71, 75, 83, 0.08);
+  --sidebar-accent-foreground: #202124;
+  --sidebar-border: rgba(23, 25, 28, 0.08);
+  --sidebar-ring: #7170ff;
+  --magi-canvas: #f7f8f8;
+  --magi-panel: #f1f2f3;
+  --magi-surface: #ffffff;
+  --magi-surface-hover: #f5f6f7;
+  --magi-accent: #5e6ad2;
+  --magi-accent-bright: #7170ff;
+  --magi-accent-soft: rgba(94, 106, 210, 0.1);
+  --magi-subtle-border: rgba(23, 25, 28, 0.07);
+  --magi-standard-border: rgba(23, 25, 28, 0.11);
+  --magi-shadow: 0 1px 2px rgba(15, 16, 17, 0.04), 0 10px 30px rgba(15, 16, 17, 0.05);
 }
 
 .dark {
-  --background: hsl(240 10% 3.9%);
-  --foreground: hsl(0 0% 98%);
-  --card: hsl(240 10% 3.9%);
-  --card-foreground: hsl(0 0% 98%);
-  --popover: hsl(240 10% 3.9%);
-  --popover-foreground: hsl(0 0% 98%);
-  --primary: hsl(0 0% 98%);
-  --primary-foreground: hsl(240 5.9% 10%);
-  --secondary: hsl(240 3.7% 15.9%);
-  --secondary-foreground: hsl(0 0% 98%);
-  --muted: hsl(240 3.7% 15.9%);
-  --muted-foreground: hsl(240 5% 64.9%);
-  --accent: hsl(240 3.7% 15.9%);
-  --accent-foreground: hsl(0 0% 98%);
-  --destructive: hsl(0 62.8% 30.6%);
-  --destructive-foreground: hsl(0 0% 98%);
-  --border: hsl(240 3.7% 15.9%);
-  --input: hsl(240 3.7% 15.9%);
-  --ring: hsl(240 4.9% 83.9%);
-  --chart-1: hsl(220 70% 50%);
-  --chart-2: hsl(160 60% 45%);
-  --chart-3: hsl(30 80% 55%);
-  --chart-4: hsl(280 65% 60%);
-  --chart-5: hsl(340 75% 55%);
-  --sidebar-background: hsl(240 5.9% 10%);
-  --sidebar-foreground: hsl(240 4.8% 95.9%);
-  --sidebar-primary: hsl(224.3 76.3% 48%);
-  --sidebar-primary-foreground: hsl(0 0% 100%);
-  --sidebar-accent: hsl(240 3.7% 15.9%);
-  --sidebar-accent-foreground: hsl(240 4.8% 95.9%);
-  --sidebar-border: hsl(240 3.7% 15.9%);
-  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+  color-scheme: dark;
+  --background: #08090a;
+  --foreground: #f7f8f8;
+  --card: #0f1011;
+  --card-foreground: #f7f8f8;
+  --popover: #191a1b;
+  --popover-foreground: #f7f8f8;
+  --primary: #5e6ad2;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(255, 255, 255, 0.04);
+  --secondary-foreground: #d0d6e0;
+  --muted: rgba(255, 255, 255, 0.045);
+  --muted-foreground: #8a8f98;
+  --accent: rgba(255, 255, 255, 0.055);
+  --accent-foreground: #f7f8f8;
+  --destructive: #c94f52;
+  --destructive-foreground: #ffffff;
+  --border: rgba(255, 255, 255, 0.075);
+  --input: rgba(255, 255, 255, 0.1);
+  --ring: #7170ff;
+  --chart-1: #7170ff;
+  --chart-2: #27a644;
+  --chart-3: #7a7fad;
+  --chart-4: #d0d6e0;
+  --chart-5: #62666d;
+  --sidebar-background: #0f1011;
+  --sidebar-foreground: #d0d6e0;
+  --sidebar-primary: #7170ff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(255, 255, 255, 0.055);
+  --sidebar-accent-foreground: #f7f8f8;
+  --sidebar-border: rgba(255, 255, 255, 0.055);
+  --sidebar-ring: #7170ff;
+  --magi-canvas: #08090a;
+  --magi-panel: #0f1011;
+  --magi-surface: #131415;
+  --magi-surface-hover: #191a1b;
+  --magi-accent: #5e6ad2;
+  --magi-accent-bright: #828fff;
+  --magi-accent-soft: rgba(113, 112, 255, 0.13);
+  --magi-subtle-border: rgba(255, 255, 255, 0.05);
+  --magi-standard-border: rgba(255, 255, 255, 0.08);
+  --magi-shadow: 0 0 0 1px rgba(0, 0, 0, 0.2), 0 18px 45px rgba(0, 0, 0, 0.24);
 }
 
 @theme inline {
@@ -125,32 +147,243 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    background: var(--magi-canvas);
+    font-feature-settings: 'cv01', 'ss03';
+  }
   body {
     @apply bg-background text-foreground;
+    min-width: 320px;
+    margin: 0;
+    overflow: hidden;
+    font-family: 'Inter Variable', Inter, 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    text-rendering: optimizeLegibility;
+  }
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+  code,
+  pre,
+  kbd {
+    font-family: 'Berkeley Mono', ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   }
 }
 
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: hsl(0 0% 80%);
-  border-radius: 5px;
+  background-color: rgba(98, 102, 109, 0.42);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
 }
 
 ::-webkit-scrollbar-track {
-  background-color: hsl(0 0% 95%);
+  background-color: transparent;
 }
 
 .dark {
   ::-webkit-scrollbar-thumb {
-    background-color: hsl(0 0% 90%);
+    background-color: rgba(138, 143, 152, 0.34);
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
 
   ::-webkit-scrollbar-track {
-    background-color: hsl(0 0% 0%);
+    background-color: transparent;
+  }
+}
+
+/* MAGI workspace shell — Linear-inspired luminance hierarchy. */
+.magi-app-shell {
+  background:
+    radial-gradient(circle at 76% -20%, rgba(113, 112, 255, 0.08), transparent 36rem),
+    var(--magi-canvas);
+}
+
+.magi-system-header {
+  background: color-mix(in srgb, var(--magi-panel) 94%, transparent);
+  border-color: var(--magi-subtle-border);
+  box-shadow: inset -1px 0 rgba(0, 0, 0, 0.08);
+  backdrop-filter: blur(18px) saturate(120%);
+}
+
+.magi-brand-mark {
+  color: #f7f8f8;
+  background: linear-gradient(145deg, #7170ff, #535db9);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.2), 0 5px 14px rgba(64, 70, 164, 0.24);
+}
+
+.magi-nav-label {
+  color: #62666d;
+  letter-spacing: 0.075em;
+}
+
+.magi-nav-item {
+  position: relative;
+  font-weight: 510;
+}
+
+.magi-nav-item.is-active {
+  background: var(--magi-accent-soft);
+  color: var(--foreground);
+  box-shadow: inset 0 0 0 1px rgba(113, 112, 255, 0.09);
+}
+
+.magi-nav-item.is-active::before {
+  position: absolute;
+  left: -0.75rem;
+  width: 2px;
+  height: 16px;
+  content: '';
+  border-radius: 0 2px 2px 0;
+  background: var(--magi-accent-bright);
+  box-shadow: 0 0 12px rgba(113, 112, 255, 0.45);
+}
+
+.magi-sidebar-footer {
+  border-color: var(--magi-subtle-border);
+}
+
+.magi-tabs-navigation {
+  scrollbar-width: none;
+}
+
+.magi-tabs-navigation::-webkit-scrollbar {
+  display: none;
+}
+
+.magi-workspace {
+  background: transparent;
+}
+
+.magi-loader {
+  color: var(--magi-accent-bright);
+  border-color: rgba(113, 112, 255, 0.18);
+  border-top-color: currentColor;
+}
+
+.magi-memory-intro {
+  position: relative;
+  overflow: hidden;
+  border-color: var(--magi-standard-border);
+  background:
+    radial-gradient(circle at 88% 15%, rgba(113, 112, 255, 0.14), transparent 19rem),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012));
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.magi-memory-intro h1 {
+  font-weight: 510;
+  letter-spacing: -0.035em;
+}
+
+.magi-stat-card {
+  border-color: var(--magi-subtle-border);
+  background: color-mix(in srgb, var(--magi-surface) 76%, transparent);
+  transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
+}
+
+.magi-stat-card:hover {
+  border-color: var(--magi-standard-border);
+  background: var(--magi-surface-hover);
+  transform: translateY(-1px);
+}
+
+.magi-memory-toolbar {
+  border-color: var(--magi-subtle-border);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.018);
+}
+
+.magi-retrieval {
+  background:
+    linear-gradient(var(--magi-subtle-border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--magi-subtle-border) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: -1px -1px;
+}
+
+.magi-chat-surface {
+  border-color: var(--magi-standard-border);
+  background: color-mix(in srgb, var(--magi-panel) 94%, transparent);
+  box-shadow: inset 0 0 32px rgba(0, 0, 0, 0.06);
+}
+
+.magi-chat-composer {
+  border-color: var(--magi-standard-border);
+  background: color-mix(in srgb, var(--magi-panel) 94%, transparent);
+  box-shadow: var(--magi-shadow);
+}
+
+.magi-graph-surface {
+  background:
+    radial-gradient(circle at 50% 45%, rgba(113, 112, 255, 0.055), transparent 30rem),
+    var(--magi-canvas);
+}
+
+.magi-login-shell {
+  background:
+    radial-gradient(circle at 18% 18%, rgba(113, 112, 255, 0.15), transparent 30rem),
+    radial-gradient(circle at 82% 85%, rgba(94, 106, 210, 0.08), transparent 28rem),
+    var(--magi-canvas);
+}
+
+.magi-login-shell::before {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: '';
+  opacity: 0.28;
+  background-image: linear-gradient(var(--magi-subtle-border) 1px, transparent 1px), linear-gradient(90deg, var(--magi-subtle-border) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, black, transparent 80%);
+}
+
+.magi-login-card {
+  position: relative;
+  border-color: var(--magi-standard-border);
+  background: color-mix(in srgb, var(--magi-panel) 92%, transparent);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12), 0 28px 80px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(20px);
+}
+
+.magi-login-story {
+  border-color: var(--magi-subtle-border);
+  background: linear-gradient(145deg, rgba(113, 112, 255, 0.075), rgba(255, 255, 255, 0.01) 60%);
+}
+
+.magi-login-feature {
+  border-color: var(--magi-subtle-border);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.magi-app-shell [data-slot='dialog-content'],
+.magi-app-shell [role='dialog'] {
+  box-shadow: var(--magi-shadow);
+}
+
+@media (max-width: 767px) {
+  .magi-system-header {
+    box-shadow: inset 0 -1px rgba(0, 0, 0, 0.08);
+  }
+
+  .magi-sidebar-footer {
+    flex: 0 0 auto;
+  }
+
+  .magi-nav-item.is-active::before {
+    inset: auto 25% -0.45rem;
+    width: 50%;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
   }
 }
 

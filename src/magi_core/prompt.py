@@ -503,9 +503,7 @@ only:
 """
 
 # Compatibility key for extensions that still inspect the former prompt name.
-PROMPTS["magi_atom_deduplication_prompt"] = PROMPTS[
-    "magi_atom_resolution_prompt"
-]
+PROMPTS["magi_atom_deduplication_prompt"] = PROMPTS["magi_atom_resolution_prompt"]
 
 PROMPTS["summarize_entity_descriptions"] = """---Role---
 You are a Knowledge Graph Specialist, proficient in data curation and synthesis.
@@ -529,6 +527,14 @@ Your task is to synthesize a list of descriptions of a given entity or relation 
 8. Language: The entire output must be written in {language}. Proper nouns (e.g., personal names, place names, organization names) may in their original language if proper translation is not available.
   - The entire output must be written in {language}.
   - Proper nouns (e.g., personal names, place names, organization names) should be retained in their original language if a proper, widely accepted translation is not available or would cause ambiguity.
+9. Data Lineage:
+  - Some descriptions begin with one or more Atom lineage tags in the exact form `[atom-...]`. These tags identify the source memory records and are citations, not prose.
+  - When Atom lineage tags are present, every factual sentence or independently meaningful factual clause in the summary must retain the exact tag or tags of the source descriptions that support it.
+  - Place the supporting tags immediately after the supported statement. When several Atoms jointly support a statement, include all of their tags.
+  - Preserve every input Atom lineage tag at least once in the output. Never invent, alter, abbreviate, translate, or discard an Atom lineage tag.
+  - Temporal and validity annotations such as `[status=...]`, `valid_at`, and `invalid_at` are part of the fact semantics. Preserve their meaning when reconciling current, historical, pending, or conflicting facts.
+  - These lineage requirements apply to intermediate summaries as well as the final summary, so that map-reduce summarization never loses provenance.
+  - If no Atom lineage tags are present in the input, do not create any.
 
 ---Input---
 {description_type} Name: {description_name}

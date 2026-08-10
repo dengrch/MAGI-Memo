@@ -53,7 +53,7 @@ const PropertiesView = () => {
     return <></>
   }
   return (
-    <div className="bg-background/80 max-w-xs rounded-lg border-2 p-2 text-xs backdrop-blur-lg">
+    <div className="bg-background/90 max-w-xs rounded-lg border p-2 text-xs shadow-lg backdrop-blur-lg">
       {currentType == 'node' ? (
         <NodePropertiesView node={currentElement as any} pipelineBusy={pipelineBusy} />
       ) : (
@@ -238,12 +238,12 @@ const PropertyRow = ({
   // For non-editable fields, use the regular Text component
   return (
     <div className="flex items-center gap-2">
-      <span className="text-primary/60 tracking-wide whitespace-nowrap">
+      <span className="text-muted-foreground tracking-wide whitespace-nowrap">
         {getPropertyNameTranslation(name)}
         {name === 'source_id' && truncate && <sup className="text-red-500">†</sup>}
       </span>:
       <Text
-        className="hover:bg-primary/20 rounded p-1 overflow-hidden text-ellipsis"
+        className="hover:bg-accent rounded p-1 overflow-hidden text-ellipsis"
         tooltipClassName="max-w-96 -translate-x-13"
         text={formattedValue}
         tooltip={formattedTooltip}
@@ -268,7 +268,7 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
   return (
     <div className="flex flex-col gap-2">
       <div className="flex justify-between items-center">
-        <h3 className="text-md pl-1 font-bold tracking-wide text-blue-700">{t('graphPanel.propertiesView.node.title')}</h3>
+        <h3 className="text-md text-foreground pl-1 font-medium tracking-wide">{t('graphPanel.propertiesView.node.title')}</h3>
         <div className="flex gap-3">
           {pipelineBusy && (
             <Button
@@ -304,7 +304,7 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
           </Button>
         </div>
       </div>
-      <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
+      <div className="bg-muted/40 max-h-96 overflow-auto rounded p-1">
         <PropertyRow name={t('graphPanel.propertiesView.node.id')} value={String(node.id)} />
         <PropertyRow
           name={t('graphPanel.propertiesView.node.labels')}
@@ -315,8 +315,8 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
         />
         <PropertyRow name={t('graphPanel.propertiesView.node.degree')} value={node.degree} />
       </div>
-      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">{t('graphPanel.propertiesView.node.properties')}</h3>
-      <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
+      <h3 className="text-md text-foreground pl-1 font-medium tracking-wide">{t('graphPanel.propertiesView.node.properties')}</h3>
+      <div className="bg-muted/40 max-h-96 overflow-auto rounded p-1">
         {Object.keys(node.properties)
           .sort()
           .map((name) => {
@@ -338,10 +338,10 @@ const NodePropertiesView = ({ node, pipelineBusy }: { node: NodeType; pipelineBu
       </div>
       {node.relationships.length > 0 && (
         <>
-          <h3 className="text-md pl-1 font-bold tracking-wide text-emerald-700">
+          <h3 className="text-md text-foreground pl-1 font-medium tracking-wide">
             {t('graphPanel.propertiesView.node.relationships')}
           </h3>
-          <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
+          <div className="bg-muted/40 max-h-96 overflow-auto rounded p-1">
             {node.relationships.map(({ type, id, label }) => {
               return (
                 <PropertyRow
@@ -366,7 +366,7 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
   return (
     <div className="flex flex-col gap-2">
       <div className="flex justify-between items-center">
-        <h3 className="text-md pl-1 font-bold tracking-wide text-violet-700">{t('graphPanel.propertiesView.edge.title')}</h3>
+        <h3 className="text-md text-foreground pl-1 font-medium tracking-wide">{t('graphPanel.propertiesView.edge.title')}</h3>
         {pipelineBusy && (
           <Button
             type="button"
@@ -382,7 +382,7 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
           </Button>
         )}
       </div>
-      <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
+      <div className="bg-muted/40 max-h-96 overflow-auto rounded p-1">
         <PropertyRow name={t('graphPanel.propertiesView.edge.id')} value={edge.id} />
         {edge.type && <PropertyRow name={t('graphPanel.propertiesView.edge.type')} value={edge.type} />}
         <PropertyRow
@@ -400,8 +400,8 @@ const EdgePropertiesView = ({ edge, pipelineBusy }: { edge: EdgeType; pipelineBu
           }}
         />
       </div>
-      <h3 className="text-md pl-1 font-bold tracking-wide text-amber-700">{t('graphPanel.propertiesView.edge.properties')}</h3>
-      <div className="bg-primary/5 max-h-96 overflow-auto rounded p-1">
+      <h3 className="text-md text-foreground pl-1 font-medium tracking-wide">{t('graphPanel.propertiesView.edge.properties')}</h3>
+      <div className="bg-muted/40 max-h-96 overflow-auto rounded p-1">
         {Object.keys(edge.properties)
           .sort()
           .map((name) => {

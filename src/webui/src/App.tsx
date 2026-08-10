@@ -169,30 +169,24 @@ function App() {
       <TabVisibilityProvider>
         {initializing ? (
           // Loading state while initializing with simplified header
-          <div className="flex h-screen w-screen flex-col">
+          <div className="magi-app-shell flex h-screen w-screen max-md:flex-col">
             {/* Simplified header during initialization - matches SiteHeader structure */}
-            <header className="magi-system-header sticky top-0 z-50 flex h-14 w-full border-b px-4 backdrop-blur">
-              <div className="min-w-[200px] w-auto flex items-center">
+            <header className="magi-system-header flex h-full w-[240px] shrink-0 flex-col border-r p-3 max-md:h-14 max-md:w-full max-md:flex-row max-md:border-r-0 max-md:border-b">
+              <div className="flex min-h-11 items-center px-2">
                 <a href={webuiPrefix} className="flex items-center gap-2">
-                  <MagiCoreMark className="size-7" />
-                  <span className="font-semibold md:inline-block">{SiteInfo.name}</span>
+                  <span className="magi-brand-mark flex size-7 items-center justify-center rounded-lg">
+                    <MagiCoreMark className="size-5" />
+                  </span>
+                  <span className="text-sm font-medium">{SiteInfo.name}</span>
                 </a>
               </div>
-
-              {/* Empty middle section to maintain layout */}
-              <div className="flex h-10 flex-1 items-center justify-center">
-              </div>
-
-              {/* Empty right section to maintain layout */}
-              <nav className="w-[200px] flex items-center justify-end">
-              </nav>
             </header>
 
             {/* Loading indicator in content area */}
-            <div className="flex flex-1 items-center justify-center">
+            <div className="flex min-w-0 flex-1 items-center justify-center max-md:pt-14">
               <div className="text-center">
-                <div className="mb-2 h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto"></div>
-                <p>Initializing...</p>
+                <div className="magi-loader mx-auto mb-3 size-6 animate-spin rounded-full border-2 border-t-transparent"></div>
+                <p className="text-muted-foreground text-sm">Initializing workspace…</p>
               </div>
             </div>
           </div>
@@ -201,11 +195,11 @@ function App() {
           <main className="magi-app-shell flex h-screen w-screen overflow-hidden">
             <Tabs
               defaultValue={currentTab}
-              className="!m-0 flex grow flex-col !p-0 overflow-hidden"
+              className="!m-0 flex min-w-0 grow !p-0 overflow-hidden max-md:flex-col"
               onValueChange={handleTabChange}
             >
               <SiteHeader />
-              <div className="relative grow">
+              <div className="magi-workspace relative min-w-0 grow overflow-hidden">
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <MemoryWorkspace />
                 </TabsContent>

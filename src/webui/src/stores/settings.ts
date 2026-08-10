@@ -84,7 +84,7 @@ interface SettingsState {
 const useSettingsStoreBase = create<SettingsState>()(
   persist(
     (set) => ({
-      theme: 'system',
+      theme: 'dark',
       language: 'en',
       showPropertyPanel: true,
       showNodeSearchBar: true,

@@ -2,7 +2,7 @@
 MAGI Core FastAPI server.
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, Response
 from fastapi.openapi.docs import (
@@ -21,6 +21,7 @@ import time
 import uuid
 import uvicorn
 import pipmaster as pm
+from datetime import datetime
 from typing import Any
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -45,9 +46,16 @@ from .config import (
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
 )
 from magi_core.utils import get_env_value
-from magi_core import MagiCore, ROLES, RoleLLMConfig, __version__ as core_version
-from magi_core.backend.sqlite import SQLiteBackend
-from magi_core.memory.adapter import MagiKnowledgeAdapter
+from magi_core import LightRAG, MagiCore, ROLES, RoleLLMConfig, __version__ as core_version
+from interface import (
+    Episode,
+    EpisodeKind,
+    ExtractedAtom,
+    ExtractedEntity,
+    ExtractedMemory,
+    ExtractedRelation,
+    MagiAPI,
+)
 from magi_core.api import __api_version__
 from magi_core.utils import EmbeddingFunc
 from magi_core.constants import (
@@ -84,8 +92,10 @@ from magi_core.kg.shared_storage import (
 from magi_core import pipeline_metrics
 from magi_core.utils_pipeline import describe_doc_status_capabilities
 from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
 from magi_core.api.auth import auth_handler
 from magi_core.api.login_rate_limit import LoginRateLimiter
+from magi_core.api.runtime_logs import read_recent_log_entries
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each magi_core instance
@@ -98,6 +108,60 @@ webui_description = os.getenv("WEBUI_DESCRIPTION")
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
+
+
+class _RuntimeProxy:
+    """Resolve the active workspace component on every attribute access."""
+
+    def __init__(self, resolver):
+        object.__setattr__(self, "_resolver", resolver)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_resolver")(), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_resolver")(), name, value)
+
+
+class WorkspaceCreateRequest(BaseModel):
+    workspace_id: str | None = Field(default=None, min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=200)
+
+
+class ExtractedAtomRequest(BaseModel):
+    content: str = Field(min_length=1)
+    valid_at: datetime | None = None
+    invalid_at: datetime | None = None
+    temporal_text: str | None = None
+    temporal_precision: str | None = None
+    predicate: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    importance: float | None = Field(default=None, ge=0, le=1)
+
+
+class ExtractedEntityRequest(BaseModel):
+    name: str = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
+    entity_type: str | None = None
+    atoms: list[ExtractedAtomRequest] = Field(min_length=1)
+
+
+class ExtractedRelationRequest(BaseModel):
+    source: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    keywords: list[str] = Field(default_factory=list)
+    atoms: list[ExtractedAtomRequest] = Field(min_length=1)
+
+
+class ExtractedIngestRequest(BaseModel):
+    episode_id: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+    kind: EpisodeKind = EpisodeKind.CONVERSATION
+    reference_at: datetime | None = None
+    source_uri: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    entities: list[ExtractedEntityRequest] = Field(min_length=1)
+    relations: list[ExtractedRelationRequest] = Field(default_factory=list)
 
 
 def _inject_swagger_theme(html: str, theme: str) -> str:
@@ -1340,23 +1404,31 @@ def create_app(args):
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
     # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    doc_manager_holder = {
+        "value": DocumentManager(args.input_dir, workspace=args.workspace)
+    }
+    doc_manager = _RuntimeProxy(lambda: doc_manager_holder["value"])
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
         # Store background tasks
         app.state.background_tasks = set()
-        app.state.magi_memory_db = memory_db
 
         try:
-            await memory_db.initialize()
-            # Initialize database connections
-            # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
-            await rag.initialize_storages()
-
-            # Data migration regardless of storage implementation
-            await rag.check_and_migrate_data()
+            await core_api.init()
+            active_workspace = core_api.runtime.active_workspace_id
+            if active_workspace is None:
+                raise RuntimeError("MAGI Runtime started without an active workspace")
+            active_record = core_api.runtime.workspace_manager.get(active_workspace)
+            active_input_dir = active_record.path / "inputs"
+            active_input_dir.mkdir(parents=True, exist_ok=True)
+            doc_manager_holder["value"] = DocumentManager(
+                str(active_input_dir),
+                workspace=active_workspace,
+            )
+            app.state.magi_memory_db = memory_db
+            app.state.magi_core_api = core_api
 
             # Admission control needs a doc_status backend that can count
             # strictly (LR2 §9.1). Probe once here so an unsupported backend
@@ -1392,10 +1464,7 @@ def create_app(args):
             )
 
             # Clean up database connections
-            try:
-                await rag.finalize_storages()
-            finally:
-                await memory_db.finalize()
+            await core_api.finalize()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -2228,11 +2297,12 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = MagiCore(
-            working_dir=args.working_dir,
-            workspace=args.workspace,
+    def build_workspace_engine(working_dir: Path, workspace: str) -> MagiCore:
+        """Build the Core instance owned by the active Runtime workspace."""
+
+        instance = LightRAG(
+            working_dir=str(working_dir),
+            workspace=workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -2292,28 +2362,58 @@ def create_app(args):
                 for spec in ROLES
             },
         )
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}")
-        raise
+        _log_role_provider_options(instance)
+        instance.register_role_llm_builder(
+            lambda role, meta: (
+                create_role_llm_func(role, meta),
+                create_role_llm_model_kwargs(role, meta),
+            )
+        )
+        return instance
 
-    _log_role_provider_options(rag)
+    configured_workspace_home = getattr(args, "workspace_home", None)
+    workspace_home = (
+        Path(configured_workspace_home).expanduser().resolve()
+        if configured_workspace_home
+        else Path(args.working_dir).expanduser().resolve().parent
+    )
+    bootstrap_workspace = str(args.workspace or "default")
+    initial_engine_holder: dict[str, Any] = {}
 
-    rag.register_role_llm_builder(
-        lambda role, meta: (
-            create_role_llm_func(role, meta),
-            create_role_llm_model_kwargs(role, meta),
+    def runtime_engine_factory(working_dir: Path, workspace: str) -> MagiCore:
+        initial_engine = initial_engine_holder.get("engine")
+        if initial_engine is not None:
+            initial_working_dir = initial_engine_holder["working_dir"]
+            initial_workspace = initial_engine_holder["workspace"]
+            if working_dir == initial_working_dir and workspace == initial_workspace:
+                initial_engine_holder.clear()
+                return initial_engine
+        return build_workspace_engine(working_dir, workspace)
+
+    core_api = MagiAPI.build(
+        workspace_home=workspace_home,
+        workspace_id=bootstrap_workspace,
+        core_factory=runtime_engine_factory,
+    )
+    workspace_manager = core_api.runtime.workspace_manager
+    workspace_manager.initialize()
+    initial_workspace = workspace_manager.active_workspace_id
+    initial_layout = workspace_manager.layout(initial_workspace)
+    initial_working_dir = initial_layout.ragstore
+    initial_engine = build_workspace_engine(initial_working_dir, initial_workspace)
+    initial_engine_holder.update(
+        engine=initial_engine,
+        working_dir=initial_working_dir,
+        workspace=initial_workspace,
+    )
+    rag = _RuntimeProxy(
+        lambda: (
+            core_api.runtime.backend.engine.raw
+            if core_api.runtime.backend is not None
+            else initial_engine
         )
     )
-
-    # The WebUI keeps the retained document/pipeline routes, while MAGI's
-    # ingestion adapter maps each parsed document to an Episode before the
-    # single extraction call. SQLite lives beside the retained RAG stores.
-    memory_db = SQLiteBackend(
-        Path(args.working_dir) / "magi-memory.db",
-        str(args.workspace or "default"),
-    )
-    memory_adapter = MagiKnowledgeAdapter(memory_db)
-    rag.register_knowledge_ingestion_adapter(memory_adapter)
+    memory_db = _RuntimeProxy(lambda: core_api.runtime.backend.sqlite)
 
     # Add routes
     # root_path is set on the app for reverse proxy support;
@@ -2322,6 +2422,176 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
     app.include_router(create_memory_routes(memory_db, api_key))
+
+    workspace_auth = get_combined_auth_dependency(api_key)
+
+    @app.get(
+        "/workspaces",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def list_runtime_workspaces():
+        active = core_api.runtime.active_workspace_id
+        return {
+            "active_workspace_id": active,
+            "workspace_home": str(core_api.runtime.workspace_manager.home),
+            "items": [
+                {
+                    "id": item.id,
+                    "name": item.label or item.id,
+                    "active": item.id == active,
+                }
+                for item in core_api.list_workspaces()
+            ],
+        }
+
+    @app.post(
+        "/workspaces",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def create_runtime_workspace(request: WorkspaceCreateRequest):
+        try:
+            item = core_api.create_workspace(
+                request.name,
+                workspace_id=request.workspace_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"id": item.id, "name": item.label or item.id, "active": False}
+
+    @app.post(
+        "/workspaces/{workspace_id}/activate",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def activate_runtime_workspace(workspace_id: str):
+        if "LIGHTRAG_GUNICORN_MODE" in os.environ:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Live workspace switching is available only in the "
+                    "single-process server; restart all workers with the target "
+                    "workspace in multi-worker mode"
+                ),
+            )
+        if getattr(app.state, "background_tasks", set()):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot switch workspace while background tasks are active",
+            )
+        current = core_api.runtime.active_workspace_id
+        if current is not None:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=current
+            )
+            snapshot = pipeline_status.copy()
+            if any(
+                snapshot.get(key)
+                for key in (
+                    "busy",
+                    "scanning",
+                    "destructive_busy",
+                    "pending_enqueues",
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot switch workspace while its pipeline is active",
+                )
+        try:
+            await core_api.switch_workspace(workspace_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record = core_api.runtime.workspace_manager.get(workspace_id)
+        input_dir = record.path / "inputs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        doc_manager_holder["value"] = DocumentManager(
+            str(input_dir), workspace=workspace_id
+        )
+        return {"active_workspace_id": workspace_id, "status": "ready"}
+
+    @app.get(
+        "/runtime/status",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def get_runtime_status():
+        return await core_api.status()
+
+    @app.get(
+        "/runtime/logs",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def get_runtime_logs(
+        limit: int = Query(default=6, ge=1, le=50),
+        include_access: bool = False,
+    ):
+        log_dir = Path(os.getenv("LOG_DIR", os.getcwd())).expanduser().resolve()
+        entries = read_recent_log_entries(
+            log_dir / DEFAULT_LOG_FILENAME,
+            limit=limit,
+            include_access=include_access,
+        )
+        return {
+            "workspace_id": core_api.runtime.active_workspace_id,
+            "items": entries,
+        }
+
+    @app.post(
+        "/memory/ingest/extracted",
+        tags=["memory"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def ingest_extracted_memory(request: ExtractedIngestRequest):
+        def atom(row: ExtractedAtomRequest) -> ExtractedAtom:
+            return ExtractedAtom(**row.model_dump())
+
+        try:
+            memory = ExtractedMemory.create(
+                episode=Episode(
+                    id=request.episode_id,
+                    content=request.content,
+                    kind=request.kind,
+                    reference_at=request.reference_at,
+                    source_uri=request.source_uri,
+                    metadata=request.metadata,
+                ),
+                entities=[
+                    ExtractedEntity(
+                        name=row.name,
+                        aliases=tuple(row.aliases),
+                        entity_type=row.entity_type,
+                        atoms=tuple(atom(item) for item in row.atoms),
+                    )
+                    for row in request.entities
+                ],
+                relations=[
+                    ExtractedRelation(
+                        source=row.source,
+                        target=row.target,
+                        keywords=tuple(row.keywords),
+                        atoms=tuple(atom(item) for item in row.atoms),
+                    )
+                    for row in request.relations
+                ],
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        handle = await core_api.open(owner="http:extracted-ingest")
+        try:
+            result = await handle.ingest_extracted(memory)
+        finally:
+            await handle.close()
+        return {
+            "episode_ids": list(result.episode_ids),
+            "indexed_count": result.indexed_count,
+            "skipped_count": result.skipped_count,
+            "track_id": result.track_id,
+        }
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
@@ -2551,9 +2821,11 @@ def create_app(args):
         """
         try:
             workspace = get_workspace_from_request(request)
-            default_workspace = get_default_workspace()
             if workspace is None:
-                workspace = default_workspace
+                workspace = (
+                    core_api.runtime.active_workspace_id or get_default_workspace()
+                )
+            default_workspace = workspace
             pipeline_status = await get_namespace_data(
                 "pipeline_status", workspace=workspace
             )

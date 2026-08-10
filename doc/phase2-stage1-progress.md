@@ -1,5 +1,8 @@
 # MAGI Memo 二期第一阶段进度报告
 
+> 历史阶段性文档：本文保留 2026-08-06 时点的进度快照。二期最终状态、验收结果和三期交接项
+> 请以 [`phase2-completion-and-phase3-handoff.md`](phase2-completion-and-phase3-handoff.md) 为准。
+
 日期：2026-08-06  
 状态：核心写入链路已贯通，尚未达到第一阶段完整验收条件
 
@@ -39,7 +42,7 @@ Atom 去重演化、Reflect 和双时间查询仍未完成。
   Atom 重新生成并保留写入顺序，时间状态会进入描述文本。
 - **删除适配**：单 Episode 删除前会备份 SQLite 数据，删除 Evidence/孤立 Atom 后会重算受影响
   owner 的图描述和向量；clear、SQLite 备份与恢复基础能力已经接入。
-- **接口生命周期**：`MagiCoreAPI` 已提供 `init → open → index/query/extension → close → finalize`，
+- **接口生命周期**：`MagiAPI` 已提供 `init → open → index/query/extension → close → finalize`，
   支持一个实例上的多个独立句柄。
 - **兼容使用**：原 LightRAG 查询模式、Neo4j 图谱页面、上传与队列仍可使用；WebUI 现阶段不再继续
   作为核心研发重点。

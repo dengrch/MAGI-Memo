@@ -603,6 +603,7 @@ class _PipelineMixin:
         parse_engine: str | list[str] | None = None,
         process_options: str | list[str] | None = None,
         chunk_options: dict | list[dict] | None = None,
+        extracted_knowledge: dict | list[dict] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
     ) -> str:
@@ -650,6 +651,10 @@ class _PipelineMixin:
                 result here; this function is intentionally chunker-
                 config agnostic.  See
                 ``docs/FileProcessingConfiguration-zh.md`` for the schema.
+            extracted_knowledge: optional caller-extracted MAGI memory payload.
+                When supplied, the durable document pipeline still persists and
+                chunks the Episode, but skips the first entity/relation extraction
+                LLM call and feeds this payload into the same strict commit seam.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
                 With ``MAX_PENDING_DOCUMENTS > 0`` the admission guard
@@ -779,6 +784,8 @@ class _PipelineMixin:
             process_options = [process_options] * len(input)
         if isinstance(chunk_options, dict):
             chunk_options = [chunk_options] * len(input)
+        if isinstance(extracted_knowledge, dict):
+            extracted_knowledge = [extracted_knowledge] * len(input)
         # If file_paths is provided, ensure it matches the number of documents
         if file_paths is not None:
             if isinstance(file_paths, str):
@@ -813,6 +820,10 @@ class _PipelineMixin:
         if chunk_options is not None and len(chunk_options) != len(input):
             raise ValueError(
                 "Number of chunk_options dicts must match the number of documents"
+            )
+        if extracted_knowledge is not None and len(extracted_knowledge) != len(input):
+            raise ValueError(
+                "Number of extracted memory payloads must match the number of documents"
             )
 
         def _parse_engine_at(index: int, doc_format: str) -> str | None:
@@ -985,6 +996,11 @@ class _PipelineMixin:
             # so the per-doc parameters are frozen even when ``F``
             # (default) is used.
             content_data["chunk_options"] = _chunk_options_at(index)
+            if extracted_knowledge is not None:
+                payload = extracted_knowledge[index]
+                if not isinstance(payload, dict):
+                    raise TypeError("each extracted memory payload must be an object")
+                content_data["magi_extracted_knowledge"] = payload
             contents[doc_id] = content_data
 
         # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
@@ -1369,6 +1385,10 @@ class _PipelineMixin:
                     full_docs_data[doc_id]["chunk_options"] = contents[doc_id][
                         "chunk_options"
                     ]
+                if contents[doc_id].get("magi_extracted_knowledge") is not None:
+                    full_docs_data[doc_id]["magi_extracted_knowledge"] = contents[
+                        doc_id
+                    ]["magi_extracted_knowledge"]
             await self.full_docs.upsert(full_docs_data)
             # Persist data to disk immediately
             await self.full_docs.index_done_callback()
@@ -5091,10 +5111,35 @@ class _PipelineMixin:
                 await asyncio.gather(*first_stage_tasks)
 
                 # Stage 2: entity/relation extraction (after text_chunks are
-                # saved).  When the user opted out via process_options '!',
-                # skip extraction entirely; chunks remain in the vector
-                # store so naive / mix retrieval still works.
-                if doc_process_opts.skip_kg:
+                # saved). Caller-extracted memory skips only the first LLM
+                # extraction call and rejoins the normal strict commit path.
+                extracted_payload = (content_data or {}).get(
+                    "magi_extracted_knowledge"
+                )
+                if extracted_payload is not None:
+                    if doc_process_opts.skip_kg:
+                        raise ValueError(
+                            "caller-extracted memory cannot be combined with "
+                            "process_options '!'"
+                        )
+                    if not chunks:
+                        raise ValueError(
+                            "caller-extracted memory requires a non-empty Episode chunk"
+                        )
+                    from magi_core.memory.extracted import (
+                        extracted_payload_to_chunk_results,
+                    )
+
+                    chunk_results = extracted_payload_to_chunk_results(
+                        extracted_payload,
+                        source_id=next(iter(chunks)),
+                        file_path=file_path,
+                    )
+                    extraction_meta["knowledge_source"] = "caller_extracted"
+                # When the user opted out via process_options '!', skip
+                # extraction entirely; chunks remain in the vector store so
+                # naive / mix retrieval still works.
+                elif doc_process_opts.skip_kg:
                     logger.info(
                         f"[skip_kg] process_options '!' set for d-id: {doc_id}; "
                         f"skipping entity/relation extraction"

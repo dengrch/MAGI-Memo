@@ -1,9 +1,9 @@
 # MAGI Memory Core：当前阶段使用方式
 
-当前阶段对外提供实例生命周期和三个主要业务操作：
+当前阶段对外提供 Runtime 生命周期和主要业务操作：
 
 ```text
-init → open → index/query → close → finalize
+init → open → ingest/search/status → close → finalize
 ```
 
 外部接口组合一个完整 `magi_core.MagiCore` 实例、一个随核心初始化的 Neo4j graph storage，以及位于同一 `ragstore`
@@ -17,7 +17,7 @@ init → open → index/query → close → finalize
 import asyncio
 
 from magi_core import MagiCore as MagiEngine
-from interface import MagiCoreAPI
+from interface import MagiAPI
 
 
 def build_engine(ragstore, workspace_id):
@@ -32,7 +32,7 @@ def build_engine(ragstore, workspace_id):
 
 
 async def main():
-    api = MagiCoreAPI.build(
+    api = MagiAPI.build(
         workspace="./workspaces/personal-memory",
         core_factory=build_engine,
     )
@@ -40,8 +40,8 @@ async def main():
     await api.init()
     handle = await api.open(owner="example-agent")
     try:
-        await handle.index_file("./episodes/today.txt")
-        answer = await handle.query("今天讨论了什么？", mode="mix")
+        await handle.ingest_file("./episodes/today.txt")
+        answer = await handle.search("今天讨论了什么？", mode="mix")
         print(answer)
     finally:
         await handle.close()
@@ -67,10 +67,10 @@ episode = Episode(
     source_uri="conversation://2026-08-05/001",
 )
 
-await handle.index(episode)
+await handle.ingest(episode)
 ```
 
-文件只是 Episode 输入载体。启用 `MagiCoreAPI` 时，同一次抽取调用会直接输出实体、关系及其 Atom 和双时间字段；
+文件只是 Episode 输入载体。启用 `MagiAPI` 时，同一次抽取调用会直接输出实体、关系及其 Atom 和双时间字段；
 之后由严格提交 adapter 完成候选召回、批量实体消歧和图投影。当前 Atom 去重策略关闭，Atom 及实体/关系描述均按提取顺序保留。
 
 ## 工作区产物
@@ -109,8 +109,10 @@ WORKSPACE=magi_memo_dev
 启动：
 
 ```bash
-./scripts/run-webui.sh
+./server
 ```
+
+`./scripts/run-webui.sh` 仍保留为兼容入口，并会转发到同一个 `server` 可执行文件。
 
 然后访问 `http://127.0.0.1:9621/webui/`。健康检查和 OpenAPI 文档分别位于
 `http://127.0.0.1:9621/health`、`http://127.0.0.1:9621/docs`。

@@ -16,7 +16,7 @@ export const PropertyName = ({ name }: PropertyNameProps) => {
   }
 
   return (
-    <span className="text-primary/60 tracking-wide whitespace-nowrap">
+    <span className="text-muted-foreground tracking-wide whitespace-nowrap">
       {getPropertyNameTranslation(name)}
     </span>
   )
@@ -44,7 +44,7 @@ interface PropertyValueProps {
 export const PropertyValue = ({ value, onClick, tooltip }: PropertyValueProps) => (
   <div className="flex items-center gap-1 overflow-hidden">
     <Text
-      className="hover:bg-primary/20 rounded p-1 overflow-hidden text-ellipsis whitespace-nowrap"
+      className="hover:bg-accent rounded p-1 overflow-hidden text-ellipsis whitespace-nowrap"
       tooltipClassName="max-w-80 -translate-x-15"
       text={value}
       tooltip={tooltip || (typeof value === 'string' ? value : JSON.stringify(value, null, 2))}

@@ -9,9 +9,10 @@ import { cn } from '@/lib/utils'
 
 interface AppSettingsProps {
   className?: string
+  side?: 'top' | 'right' | 'bottom' | 'left'
 }
 
-export default function AppSettings({ className }: AppSettingsProps) {
+export default function AppSettings({ className, side = 'bottom' }: AppSettingsProps) {
   const [opened, setOpened] = useState<boolean>(false)
   const { t } = useTranslation()
 
@@ -36,7 +37,7 @@ export default function AppSettings({ className }: AppSettingsProps) {
           <PaletteIcon className="h-5 w-5" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent side="bottom" align="end" className="w-56">
+      <PopoverContent side={side} align="end" className="w-56">
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
             <label className="text-sm font-medium">{t('settings.language')}</label>

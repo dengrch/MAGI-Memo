@@ -40,6 +40,10 @@ class KnowledgeIngestionAdapter(Protocol):
         """Persist and register the Episode before its extraction call."""
         ...
 
+    async def stage_episode(self, episode: Any) -> None:
+        """Persist a structured Episode supplied by a direct ingest caller."""
+        ...
+
     async def complete_episode(
         self, doc_id: str, *, track_id: str | None = None
     ) -> None:

@@ -98,6 +98,30 @@ export type MemoryPage<T> = {
   pages: number
 }
 
+export type RuntimeWorkspace = {
+  id: string
+  name: string
+  active: boolean
+}
+
+export type RuntimeWorkspaceList = {
+  active_workspace_id: string
+  workspace_home: string
+  items: RuntimeWorkspace[]
+}
+
+export type RuntimeLogEntry = {
+  timestamp: string
+  logger: string
+  level: string
+  message: string
+}
+
+export type RuntimeLogList = {
+  workspace_id: string | null
+  items: RuntimeLogEntry[]
+}
+
 export type LightragQueueStatus = {
   available: boolean
   queue_name?: string
@@ -1390,5 +1414,27 @@ export const getMemoryAtoms = async (params: {
 
 export const getMemoryAtom = async (atomId: string): Promise<MemoryAtom> => {
   const response = await axiosInstance.get(`/memory/atoms/${encodeURIComponent(atomId)}`)
+  return response.data
+}
+
+export const getRuntimeWorkspaces = async (): Promise<RuntimeWorkspaceList> => {
+  const response = await axiosInstance.get('/workspaces')
+  return response.data
+}
+
+export const activateRuntimeWorkspace = async (workspaceId: string): Promise<void> => {
+  await axiosInstance.post(`/workspaces/${encodeURIComponent(workspaceId)}/activate`)
+}
+
+export const createRuntimeWorkspace = async (input: {
+  workspace_id?: string
+  name: string
+}): Promise<RuntimeWorkspace> => {
+  const response = await axiosInstance.post('/workspaces', input)
+  return response.data
+}
+
+export const getRuntimeLogs = async (limit = 6): Promise<RuntimeLogList> => {
+  const response = await axiosInstance.get('/runtime/logs', { params: { limit } })
   return response.data
 }

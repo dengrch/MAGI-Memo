@@ -95,6 +95,10 @@ class MagiKnowledgeAdapter:
                 "source_uri": episode.source_uri,
             }
 
+    async def stage_episode(self, episode: Episode) -> None:
+        await self.sqlite.put_episode(episode)
+        self.register_episodes([episode])
+
     def get_extraction_context(self, doc_id: str | None) -> dict[str, Any]:
         return dict(self._episode_contexts.get(doc_id or "", {}))
 
@@ -158,11 +162,9 @@ class MagiKnowledgeAdapter:
         graph = rag.chunk_entity_relation_graph
         for owner_id in result["affected_owner_ids"]:
             atoms = await self.sqlite.list_owner_atoms(owner_id)
-            active_atoms = await self.sqlite.list_owner_atoms(
-                owner_id, active_only=True
-            )
+            current_atoms = [atom for atom in atoms if atom.expired_at is None]
             description = GRAPH_FIELD_SEP.join(
-                atom.presentation() for atom in active_atoms
+                atom.presentation() for atom in current_atoms
             )
             atom_ids = [atom.id for atom in atoms]
             if owner_id.startswith("entity-"):
@@ -929,7 +931,11 @@ class MagiKnowledgeAdapter:
         # than recursively merging an older summary with new facts.
         for canonical_name, entity_id in touched_nodes.items():
             template = projected_nodes[canonical_name][0]
-            atoms = await self.sqlite.list_owner_atoms(entity_id, active_only=True)
+            atoms = [
+                atom
+                for atom in await self.sqlite.list_owner_atoms(entity_id)
+                if atom.expired_at is None
+            ]
             projected_nodes[canonical_name] = [
                 {
                     **template,
@@ -941,7 +947,11 @@ class MagiKnowledgeAdapter:
             ]
         for pair, relation_id in touched_edges.items():
             template = projected_edges[pair][0]
-            atoms = await self.sqlite.list_owner_atoms(relation_id, active_only=True)
+            atoms = [
+                atom
+                for atom in await self.sqlite.list_owner_atoms(relation_id)
+                if atom.expired_at is None
+            ]
             projected_edges[pair] = [
                 {
                     **template,

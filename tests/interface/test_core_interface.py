@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from interface import APIState, Episode, MagiCoreAPI
+from interface import APIState, Episode, MagiAPI
 
 
 class Neo4JStorage:
@@ -73,7 +73,7 @@ class CoreInterfaceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "workspace-a"
                 rag = FakeLightRAG(root / "ragstore", "workspace-a")
-                core = MagiCoreAPI.from_lightrag(workspace=root, rag=rag)
+                core = MagiAPI.from_lightrag(workspace=root, rag=rag)
 
                 await core.init()
                 first_handle = await core.open(owner="agent-a")
@@ -109,7 +109,7 @@ class CoreInterfaceTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "workspace-failure"
                 rag = FailingLightRAG(root / "ragstore", "workspace-failure")
-                core = MagiCoreAPI.from_lightrag(workspace=root, rag=rag)
+                core = MagiAPI.from_lightrag(workspace=root, rag=rag)
 
                 with self.assertRaisesRegex(
                     RuntimeError, "storage initialization failed"
@@ -118,7 +118,7 @@ class CoreInterfaceTests(unittest.TestCase):
 
                 self.assertTrue(rag.finalized)
                 self.assertIsNone(rag.knowledge_adapter)
-                self.assertEqual(core.state, APIState.NEW)
+                self.assertEqual(core.state, APIState.FAILED)
 
         asyncio.run(scenario())
 
@@ -129,7 +129,7 @@ class CoreInterfaceTests(unittest.TestCase):
                 source = Path(temporary) / "episode.txt"
                 source.write_text("A file-backed episode.", encoding="utf-8")
                 rag = FakeLightRAG(root / "ragstore", "workspace-b")
-                core = MagiCoreAPI.from_lightrag(workspace=root, rag=rag)
+                core = MagiAPI.from_lightrag(workspace=root, rag=rag)
                 await core.init()
                 handle = await core.open(owner="file-agent")
 

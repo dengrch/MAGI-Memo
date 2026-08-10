@@ -28,7 +28,9 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
     def test_memory_workbench_views_are_paginated_and_evidence_aware(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:
-                backend = SQLiteBackend(Path(temporary) / "magi-memory.db", "workspace-a")
+                backend = SQLiteBackend(
+                    Path(temporary) / "magi-memory.db", "workspace-a"
+                )
                 await backend.initialize()
                 episode = Episode(id="episode-ui", content="Alice remembers MAGI.")
                 await backend.put_episode(episode)
@@ -123,6 +125,124 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_hard_delete_removes_orphan_projection_owners_and_restores_them(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                backend = SQLiteBackend(Path(temporary) / "memory.db", "workspace-a")
+                await backend.initialize()
+                episode = Episode(id="episode-delete", content="Alice knows Bob.")
+                await backend.put_episode(episode)
+
+                alice_id = stable_entity_id("workspace-a", "Alice")
+                bob_id = stable_entity_id("workspace-a", "Bob")
+                for entity_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                    await backend.put_entity(
+                        EntityRecord(
+                            id=entity_id,
+                            workspace_id="workspace-a",
+                            canonical_name=name,
+                        )
+                    )
+
+                relation_id = stable_relation_id("workspace-a", alice_id, bob_id)
+                await backend.put_relation(
+                    RelationRecord(
+                        id=relation_id,
+                        workspace_id="workspace-a",
+                        entity_a_id=alice_id,
+                        entity_b_id=bob_id,
+                        entity_a_name="Alice",
+                        entity_b_name="Bob",
+                    )
+                )
+                atoms = (
+                    AtomRecord(
+                        id="atom-alice",
+                        workspace_id="workspace-a",
+                        owner_id=alice_id,
+                        content="Alice exists.",
+                        valid_at=None,
+                    ),
+                    AtomRecord(
+                        id="atom-relation",
+                        workspace_id="workspace-a",
+                        owner_id=relation_id,
+                        content="Alice knows Bob.",
+                        subject_entity_id=alice_id,
+                        predicate="knows",
+                        object_entity_id=bob_id,
+                        valid_at=None,
+                    ),
+                )
+                for atom in atoms:
+                    await backend.put_atom(
+                        atom,
+                        AtomEvidence(atom_id=atom.id, episode_id=episode.id),
+                    )
+
+                before = await backend.memory_overview()
+                self.assertEqual(before["entities"], 2)
+                self.assertEqual(before["relations"], 1)
+
+                deletion = await backend.backup_and_delete_episode(episode.id)
+                after = await backend.memory_overview()
+                self.assertEqual(after["episodes"], 0)
+                self.assertEqual(after["atoms"], 0)
+                self.assertEqual(after["evidence"], 0)
+                self.assertEqual(after["entities"], 0)
+                self.assertEqual(after["relations"], 0)
+                self.assertEqual(await backend.search_entity_names("Alice"), [])
+
+                await backend.restore_episode_backup(deletion["backup_id"])
+                restored = await backend.memory_overview()
+                self.assertEqual(restored["episodes"], 1)
+                self.assertEqual(restored["atoms"], 2)
+                self.assertEqual(restored["entities"], 2)
+                self.assertEqual(restored["relations"], 1)
+                await backend.finalize()
+
+        asyncio.run(scenario())
+
+    def test_initialize_repairs_legacy_orphan_projection_owners(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "memory.db"
+                backend = SQLiteBackend(path, "workspace-a")
+                await backend.initialize()
+                alice_id = stable_entity_id("workspace-a", "Alice")
+                bob_id = stable_entity_id("workspace-a", "Bob")
+                for entity_id, name in ((alice_id, "Alice"), (bob_id, "Bob")):
+                    await backend.put_entity(
+                        EntityRecord(
+                            id=entity_id,
+                            workspace_id="workspace-a",
+                            canonical_name=name,
+                        )
+                    )
+                await backend.put_relation(
+                    RelationRecord(
+                        id=stable_relation_id("workspace-a", alice_id, bob_id),
+                        workspace_id="workspace-a",
+                        entity_a_id=alice_id,
+                        entity_b_id=bob_id,
+                        entity_a_name="Alice",
+                        entity_b_name="Bob",
+                    )
+                )
+                await backend.finalize()
+
+                reopened = SQLiteBackend(path, "workspace-a")
+                await reopened.initialize()
+                overview = await reopened.memory_overview()
+                self.assertEqual(overview["entities"], 0)
+                self.assertEqual(overview["relations"], 0)
+                self.assertEqual(await reopened.search_entity_names("Alice"), [])
+                await reopened.finalize()
+
+        asyncio.run(scenario())
+
     def test_domain_timestamps_are_fixed_and_normalized_to_utc(self) -> None:
         episode = Episode(id="episode-time", content="A fact.")
         first = episode.effective_reference_at
@@ -135,9 +255,7 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
             workspace_id="workspace-a",
             owner_id="entity-a",
             content="A timed fact.",
-            valid_at=datetime(
-                2026, 8, 5, 8, 0, tzinfo=timezone(timedelta(hours=8))
-            ),
+            valid_at=datetime(2026, 8, 5, 8, 0, tzinfo=timezone(timedelta(hours=8))),
         )
         self.assertEqual(
             atom.valid_at,
@@ -175,9 +293,7 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                         canonical_name="Bob",
                     )
                 )
-                relation_id = stable_relation_id(
-                    "workspace-a", entity_id, bob_id
-                )
+                relation_id = stable_relation_id("workspace-a", entity_id, bob_id)
                 relation = await backend.put_relation(
                     RelationRecord(
                         id=relation_id,
@@ -211,14 +327,14 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 self.assertTrue(inserted)
                 aggregate = await backend.get_atom_memory(stored.id)
                 self.assertEqual(aggregate.episode_ids, (episode.id,))
-                self.assertEqual(stored.temporal_status(reference), TemporalStatus.ACTIVE)
+                self.assertEqual(
+                    stored.temporal_status(reference), TemporalStatus.ACTIVE
+                )
                 self.assertIn("status=active", stored.presentation(reference))
 
                 old_fingerprint = stored.fingerprint
                 invalid_at = reference + timedelta(days=1)
-                await backend.set_atom_invalid_at(
-                    stored.id, invalid_at=invalid_at
-                )
+                await backend.set_atom_invalid_at(stored.id, invalid_at=invalid_at)
                 invalidated = await backend.get_atom(stored.id)
                 self.assertEqual(invalidated.invalid_at, invalid_at)
                 self.assertIsNone(
@@ -226,18 +342,14 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     (
-                        await backend.find_atom_by_fingerprint(
-                            invalidated.fingerprint
-                        )
+                        await backend.find_atom_by_fingerprint(invalidated.fingerprint)
                     ).id,
                     stored.id,
                 )
 
                 await backend.put_embedding(
                     object_kind="entity_name",
-                    object_id=stable_entity_name_embedding_id(
-                        entity_id, "Alice"
-                    ),
+                    object_id=stable_entity_name_embedding_id(entity_id, "Alice"),
                     owner_id=entity_id,
                     source_text="Alice",
                     vector=np.asarray([1.0, 0.0], dtype=np.float32),
@@ -245,9 +357,7 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 )
                 await backend.put_embedding(
                     object_kind="entity_name",
-                    object_id=stable_entity_name_embedding_id(
-                        entity_id, "A. Example"
-                    ),
+                    object_id=stable_entity_name_embedding_id(entity_id, "A. Example"),
                     owner_id=entity_id,
                     source_text="A. Example",
                     vector=np.asarray([0.0, 1.0], dtype=np.float32),
@@ -308,23 +418,15 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 staged = await backend.get_episode("episode-webui")
                 self.assertEqual(staged["status"], EpisodeStatus.PENDING.value)
                 self.assertEqual(
-                    adapter.get_extraction_context("episode-webui")[
-                        "reference_at"
-                    ],
+                    adapter.get_extraction_context("episode-webui")["reference_at"],
                     "2026-08-05T00:00:00+00:00",
                 )
 
-                await adapter.complete_episode(
-                    "episode-webui", track_id="track-webui"
-                )
+                await adapter.complete_episode("episode-webui", track_id="track-webui")
                 completed = await backend.get_episode("episode-webui")
-                self.assertEqual(
-                    completed["status"], EpisodeStatus.INDEXED.value
-                )
+                self.assertEqual(completed["status"], EpisodeStatus.INDEXED.value)
                 self.assertEqual(completed["track_id"], "track-webui")
-                await adapter.fail_episode(
-                    "episode-webui", error="forced failure"
-                )
+                await adapter.fail_episode("episode-webui", error="forced failure")
                 failed = await backend.get_episode("episode-webui")
                 self.assertEqual(failed["status"], EpisodeStatus.FAILED.value)
                 self.assertEqual(failed["error"], "forced failure")

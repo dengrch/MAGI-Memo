@@ -1655,6 +1655,53 @@ class MagiCore(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
 
         return track_id
 
+    async def aingest_extracted(
+        self,
+        memories: "Any",
+        *,
+        track_id: str | None = None,
+    ) -> str:
+        """Ingest caller-extracted memory through the durable document pipeline.
+
+        This skips only the entity/relation extraction LLM call.  The Episode is
+        still persisted and chunked, and the supplied Atoms continue through
+        MAGI entity resolution, Atom resolution, temporal evolution, graph/vector
+        projection, status tracking and hard-delete recovery.
+        """
+
+        from magi_core.memory import ExtractedMemory
+
+        normalized = [memories] if isinstance(memories, ExtractedMemory) else list(memories)
+        if not normalized:
+            raise ValueError("at least one extracted memory input is required")
+        if not all(isinstance(item, ExtractedMemory) for item in normalized):
+            raise TypeError("aingest_extracted expects ExtractedMemory values")
+        if track_id is None:
+            track_id = generate_track_id("ingest-extracted")
+
+        adapter = self._knowledge_ingestion_adapter
+        stage = getattr(adapter, "stage_episode", None)
+        if callable(stage):
+            for item in normalized:
+                await stage(item.episode)
+        else:
+            register = getattr(adapter, "register_episodes", None)
+            if callable(register):
+                register([item.episode for item in normalized])
+
+        await self.apipeline_enqueue_documents(
+            [item.episode.content for item in normalized],
+            ids=[item.episode.id for item in normalized],
+            file_paths=[
+                item.episode.source_uri or f"episode-{item.episode.id}.txt"
+                for item in normalized
+            ],
+            track_id=track_id,
+            extracted_knowledge=[item.to_payload() for item in normalized],
+        )
+        await self.apipeline_process_enqueue_documents()
+        return track_id
+
     # TODO: deprecated, use insert instead
     def insert_custom_chunks(
         self,

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SERVER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_PYTHON="$SERVER_ROOT/.venv/bin/python"
+
+if [ ! -x "$SERVER_PYTHON" ]; then
+    printf 'MAGI virtual environment is missing: %s\n' "$SERVER_PYTHON" >&2
+    printf 'Run: uv sync --frozen --extra api --extra offline-storage --extra offline-llm\n' >&2
+    exit 1
+fi
+
+mkdir -p \
+    "$SERVER_ROOT/mgc-test/inputs" \
+    "$SERVER_ROOT/mgc-test/ragstore" \
+    "$SERVER_ROOT/mgc-test/logs"
+
+cd "$SERVER_ROOT"
+exec "$SERVER_PYTHON" -m magi_core.api.lightrag_server "$@"

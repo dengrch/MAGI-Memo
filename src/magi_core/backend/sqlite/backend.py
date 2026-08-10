@@ -152,6 +152,70 @@ class SQLiteBackend:
                 "VALUES (?, ?)",
                 (3, _utc_now()),
             )
+            self._prune_orphan_projection_owners(connection)
+
+    def _prune_orphan_projection_owners(self, connection: sqlite3.Connection) -> None:
+        """Repair empty registry owners left by older hard-delete builds."""
+
+        connection.execute(
+            """
+            DELETE FROM relation_registry AS relation
+            WHERE relation.workspace_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM atoms
+                  WHERE atoms.workspace_id = relation.workspace_id
+                    AND atoms.owner_id = relation.relation_id
+              )
+            """,
+            (self.workspace_id,),
+        )
+        orphan_entity_ids = [
+            row["entity_id"]
+            for row in connection.execute(
+                """
+                SELECT entity.entity_id
+                FROM entity_registry AS entity
+                WHERE entity.workspace_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM atoms
+                      WHERE atoms.workspace_id = entity.workspace_id
+                        AND atoms.owner_id = entity.entity_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM relation_registry AS relation
+                      WHERE relation.workspace_id = entity.workspace_id
+                        AND (relation.entity_a_id = entity.entity_id
+                             OR relation.entity_b_id = entity.entity_id)
+                  )
+                """,
+                (self.workspace_id,),
+            ).fetchall()
+        ]
+        if not orphan_entity_ids:
+            return
+        placeholders = ",".join("?" for _ in orphan_entity_ids)
+        params = (self.workspace_id, *orphan_entity_ids)
+        connection.execute(
+            f"DELETE FROM memory_embeddings WHERE workspace_id = ? "
+            f"AND object_kind = 'entity_name' "
+            f"AND owner_id IN ({placeholders})",
+            params,
+        )
+        connection.execute(
+            f"DELETE FROM entity_name_fts WHERE workspace_id = ? "
+            f"AND entity_id IN ({placeholders})",
+            params,
+        )
+        connection.execute(
+            f"DELETE FROM entity_aliases WHERE workspace_id = ? "
+            f"AND entity_id IN ({placeholders})",
+            params,
+        )
+        connection.execute(
+            f"DELETE FROM entity_registry WHERE workspace_id = ? "
+            f"AND entity_id IN ({placeholders})",
+            params,
+        )
 
     @staticmethod
     def _ensure_column(
@@ -1396,6 +1460,98 @@ class SQLiteBackend:
                     (self.workspace_id, *orphan_atom_ids),
                 )
 
+            # Keep the owner projection metadata in lockstep with the surviving
+            # Atom record layer.  The graph may already have removed these
+            # owners, but the workbench counters deliberately read the SQLite
+            # registries, so leaving empty registry rows behind reports ghost
+            # entities and relations after a hard document deletion.
+            for owner_id in affected_owner_ids:
+                remaining_atom_ids = [
+                    row["atom_id"]
+                    for row in connection.execute(
+                        "SELECT atom_id FROM atoms "
+                        "WHERE workspace_id = ? AND owner_id = ? ORDER BY rowid",
+                        (self.workspace_id, owner_id),
+                    ).fetchall()
+                ]
+                table, id_column = (
+                    ("relation_registry", "relation_id")
+                    if owner_id.startswith("relation-")
+                    else ("entity_registry", "entity_id")
+                )
+                connection.execute(
+                    f"UPDATE {table} SET atom_ids_json = ? "
+                    f"WHERE workspace_id = ? AND {id_column} = ?",
+                    (
+                        json.dumps(remaining_atom_ids, ensure_ascii=False),
+                        self.workspace_id,
+                        owner_id,
+                    ),
+                )
+
+            # Relations without any surviving Atom no longer represent a
+            # memory owner.  Remove them before determining whether their
+            # endpoint entities are also orphaned.
+            orphan_relation_ids = [
+                relation_id
+                for relation_id in relation_ids
+                if connection.execute(
+                    "SELECT 1 FROM atoms WHERE workspace_id = ? "
+                    "AND owner_id = ? LIMIT 1",
+                    (self.workspace_id, relation_id),
+                ).fetchone()
+                is None
+            ]
+            if orphan_relation_ids:
+                placeholders = ",".join("?" for _ in orphan_relation_ids)
+                connection.execute(
+                    f"DELETE FROM relation_registry WHERE workspace_id = ? "
+                    f"AND relation_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_relation_ids),
+                )
+
+            # An entity is removable only when it owns no Atom and is no
+            # longer an endpoint of a surviving relation.  This preserves
+            # relation-only entities while eliminating empty projection owners.
+            orphan_entity_ids = []
+            for entity_id in entity_ids:
+                has_atoms = connection.execute(
+                    "SELECT 1 FROM atoms WHERE workspace_id = ? "
+                    "AND owner_id = ? LIMIT 1",
+                    (self.workspace_id, entity_id),
+                ).fetchone()
+                has_relations = connection.execute(
+                    "SELECT 1 FROM relation_registry WHERE workspace_id = ? "
+                    "AND (entity_a_id = ? OR entity_b_id = ?) LIMIT 1",
+                    (self.workspace_id, entity_id, entity_id),
+                ).fetchone()
+                if has_atoms is None and has_relations is None:
+                    orphan_entity_ids.append(entity_id)
+
+            if orphan_entity_ids:
+                placeholders = ",".join("?" for _ in orphan_entity_ids)
+                connection.execute(
+                    f"DELETE FROM memory_embeddings WHERE workspace_id = ? "
+                    f"AND object_kind = 'entity_name' "
+                    f"AND owner_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_entity_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM entity_name_fts WHERE workspace_id = ? "
+                    f"AND entity_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_entity_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM entity_aliases WHERE workspace_id = ? "
+                    f"AND entity_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_entity_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM entity_registry WHERE workspace_id = ? "
+                    f"AND entity_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_entity_ids),
+                )
+
             payload = {
                 "episode": dict(episode),
                 "entities": [dict(row) for row in entity_rows],
@@ -1419,6 +1575,11 @@ class SQLiteBackend:
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     _utc_now(),
                 ),
+            )
+            connection.execute(
+                "DELETE FROM projection_outbox "
+                "WHERE workspace_id = ? AND episode_id = ?",
+                (self.workspace_id, episode_id),
             )
             connection.execute(
                 "DELETE FROM episodes WHERE episode_id = ? AND workspace_id = ?",

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
-from magi_core.memory import Episode
+from magi_core.memory import Episode, ExtractedMemory
 from magi_core.workspace import WorkspaceLayout
 
 if TYPE_CHECKING:
@@ -95,6 +95,50 @@ class EngineBackend:
                 + "; ".join(failures)
             )
         return track_id
+
+    async def ingest_extracted(
+        self, memories: Sequence[ExtractedMemory]
+    ) -> str | None:
+        self._require_initialized()
+        if not memories:
+            return None
+        if self.memory_adapter is not None:
+            self.memory_adapter.register_episodes(
+                [memory.episode for memory in memories]
+            )
+        track_id = await self.raw.aingest_extracted(list(memories))
+        failures: list[str] = []
+        for memory in memories:
+            status_row = await self.raw.doc_status.get_by_id(memory.episode.id)
+            status = status_row.get("status") if status_row else None
+            status_value = getattr(status, "value", status)
+            if status_value != "processed":
+                error = (status_row or {}).get("error_msg") or status_value or "missing"
+                failures.append(f"{memory.episode.id}: {error}")
+        if failures:
+            raise RuntimeError(
+                "MAGI extracted-memory ingestion did not reach the processed "
+                "state: " + "; ".join(failures)
+            )
+        return track_id
+
+    async def status(self) -> dict[str, Any]:
+        self._require_initialized()
+        result: dict[str, Any] = {}
+        for key, method_name in (
+            ("documents", "get_processing_status"),
+            ("llm_queues", "get_llm_queue_status"),
+            ("embedding_queue", "get_embedding_queue_status"),
+            ("rerank_queue", "get_rerank_queue_status"),
+        ):
+            method = getattr(self.raw, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result[key] = await method()
+            except Exception as exc:
+                result[key] = {"error": str(exc)}
+        return result
 
     async def query(
         self,

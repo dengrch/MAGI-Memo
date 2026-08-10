@@ -62,7 +62,7 @@ function StatCard({
   detail: string
 }) {
   return (
-    <Card className="shadow-none">
+    <Card className="magi-stat-card shadow-none">
       <CardContent className="flex items-center gap-3 p-4">
         <div className="bg-muted text-muted-foreground rounded-md p-2.5">
           <Icon className="size-4" />
@@ -185,11 +185,11 @@ export default function MemoryWorkspace() {
 
   return (
     <div className="min-h-full bg-transparent">
-      <div className="mx-auto w-full max-w-[1600px] space-y-4 p-4 lg:p-6">
+      <div className="mx-auto w-full max-w-[1600px] space-y-4 p-4 lg:p-6 xl:p-8">
         <>
-          <section className="magi-memory-intro flex flex-col justify-between gap-4 rounded-lg border p-5 md:flex-row md:items-end">
+          <section className="magi-memory-intro flex flex-col justify-between gap-6 rounded-xl border p-6 md:flex-row md:items-end lg:p-8">
             <div>
-              <h1 className="text-2xl font-semibold tracking-tight">{copy.title}</h1>
+              <h1 className="text-[28px] font-medium tracking-tight">{copy.title}</h1>
               <p className="text-muted-foreground mt-1 max-w-3xl text-sm leading-6">{copy.subtitle}</p>
             </div>
             <div className="bg-muted/50 min-w-64 rounded-lg border px-4 py-3 text-sm">
@@ -208,7 +208,7 @@ export default function MemoryWorkspace() {
           </section>
         </>
 
-        <div className="flex flex-col gap-3 rounded-lg border bg-card p-2 md:flex-row md:items-center md:justify-between">
+        <div className="magi-memory-toolbar flex flex-col gap-3 rounded-lg border bg-card/70 p-2 md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap gap-2">
             {([
               ['episodes', copy.episodes, BookOpenIcon],

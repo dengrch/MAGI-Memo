@@ -39,7 +39,7 @@ const ResetButton = ({ onClick, title }: { onClick: () => void; title: string })
   </TooltipProvider>
 )
 
-export default function QuerySettings() {
+export default function QuerySettings({ className }: { className?: string }) {
   const { t } = useTranslation()
   const querySettings = useSettingsStore((state) => state.querySettings)
   const userPromptHistory = useSettingsStore((state) => state.userPromptHistory)
@@ -78,7 +78,7 @@ export default function QuerySettings() {
     querySettings.mode !== 'mix' && querySettings.mode !== 'bypass'
 
   return (
-    <Card className="flex shrink-0 flex-col w-[280px]">
+    <Card className={cn('flex w-[280px] shrink-0 flex-col', className)}>
       <CardHeader className="px-4 pt-4 pb-2">
         <CardTitle>{t('retrievePanel.querySettings.parametersTitle')}</CardTitle>
         <CardDescription className="sr-only">{t('retrievePanel.querySettings.parametersDescription')}</CardDescription>

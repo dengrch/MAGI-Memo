@@ -5,16 +5,23 @@
     :root { color: #111827; }
     @media (prefers-color-scheme: dark) { :root { color: #ffffff; } }
   </style>
-  <g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+  <g fill="currentColor">
     <!-- Top core (Balthasar) -->
     <path d="M16 7h32v10l-10 10H26L16 17z"/>
     <!-- Lower-left core (Casper) -->
     <path d="M18 35l8 8v14H2V35z"/>
     <!-- Lower-right core (Melchior) -->
     <path d="M46 35l-8 8v14h24V35z"/>
-    <!-- Three links forming the central hexagon -->
-    <path d="M38 27l8 8m-8 8H26m-8-8l8-8"/>
   </g>
+  <!-- Three links forming the central hexagon -->
+  <path
+    d="M38 27l8 8m-8 8H26m-8-8l8-8"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+  />
   <text
     x="32"
     y="35"

@@ -113,6 +113,69 @@ class FakeEngine:
 
 
 class MagiKnowledgeAdapterTests(unittest.TestCase):
+    def test_pending_relation_atom_is_kept_in_graph_projection(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                sqlite = SQLiteBackend(Path(temporary) / "memory.db", "workspace-a")
+                await sqlite.initialize()
+                engine = FakeEngine()
+                adapter = MagiKnowledgeAdapter(
+                    sqlite, decision_provider=IndependentDecisions()
+                )
+                episode = Episode(id="episode-future", content="Alice will meet Bob.")
+                await sqlite.put_episode(episode)
+                nodes = {
+                    name: [
+                        {
+                            "entity_name": name,
+                            "entity_type": "person",
+                            "description": f"{name} is a person.",
+                            "atom_payload": {},
+                            "source_id": "chunk-future",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                    for name in ("Alice", "Bob")
+                }
+                edges = {
+                    ("Alice", "Bob"): [
+                        {
+                            "src_id": "Alice",
+                            "tgt_id": "Bob",
+                            "description": "Alice will meet Bob.",
+                            "keywords": "meet",
+                            "weight": 1.0,
+                            "atom_payload": {"valid_at": "2099-01-01T00:00:00+00:00"},
+                            "source_id": "chunk-future",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                }
+                merge = AsyncMock()
+                with patch(
+                    "magi_core.memory.adapter.merge_nodes_and_edges",
+                    new=merge,
+                ):
+                    await adapter.commit(
+                        [(nodes, edges)],
+                        KnowledgeCommitContext(
+                            rag=engine,
+                            doc_id=episode.id,
+                            file_path="episode.txt",
+                        ),
+                    )
+
+                projected_edges = merge.await_args.kwargs["chunk_results"][0][1]
+                relation_rows = projected_edges[("Alice", "Bob")]
+                self.assertEqual(len(relation_rows), 1)
+                self.assertIn("Alice will meet Bob.", relation_rows[0]["description"])
+                self.assertIn("status=pending", relation_rows[0]["description"])
+                await sqlite.finalize()
+
+        asyncio.run(scenario())
+
     def test_episode_entities_use_one_resolution_call_and_alias_vectors(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 
@@ -364,3 +364,163 @@ class AtomResolutionRequest:
     atom: AtomRecord
     candidates: tuple[CandidateMatch, ...]
     owner_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedAtom:
+    """One caller-extracted Atom ready for strict MAGI commit."""
+
+    content: str
+    valid_at: datetime | None = None
+    invalid_at: datetime | None = None
+    temporal_text: str | None = None
+    temporal_precision: str | None = None
+    predicate: str | None = None
+    confidence: float | None = None
+    importance: float | None = None
+
+    def __post_init__(self) -> None:
+        if not normalize_atom_text(self.content):
+            raise ValueError("extracted Atom content must not be empty")
+        object.__setattr__(self, "valid_at", ensure_utc(self.valid_at))
+        object.__setattr__(self, "invalid_at", ensure_utc(self.invalid_at))
+        if (
+            self.valid_at is not None
+            and self.invalid_at is not None
+            and self.invalid_at < self.valid_at
+        ):
+            raise ValueError("invalid_at must not be earlier than valid_at")
+        for field_name in ("confidence", "importance"):
+            value = getattr(self, field_name)
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be between 0 and 1")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "valid_at": self.valid_at.isoformat() if self.valid_at else None,
+            "invalid_at": self.invalid_at.isoformat() if self.invalid_at else None,
+            "temporal_text": self.temporal_text,
+            "temporal_precision": self.temporal_precision,
+            "predicate": self.predicate,
+            "confidence": self.confidence,
+            "importance": self.importance,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedEntity:
+    """One extracted entity and the Atoms owned by it."""
+
+    name: str
+    atoms: tuple[ExtractedAtom, ...]
+    aliases: tuple[str, ...] = ()
+    entity_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("extracted entity name must not be empty")
+        if not self.atoms:
+            raise ValueError("each extracted entity must own at least one Atom")
+        object.__setattr__(
+            self,
+            "aliases",
+            tuple(
+                dict.fromkeys(
+                    alias.strip()
+                    for alias in self.aliases
+                    if alias.strip() and normalize_name(alias) != normalize_name(self.name)
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedRelation:
+    """One extracted semantic relation and the Atoms owned by it."""
+
+    source: str
+    target: str
+    atoms: tuple[ExtractedAtom, ...]
+    keywords: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.source.strip() or not self.target.strip():
+            raise ValueError("relation endpoints must not be empty")
+        if normalize_name(self.source) == normalize_name(self.target):
+            raise ValueError("self relations are not supported by MAGI projection")
+        if not self.atoms:
+            raise ValueError("each extracted relation must own at least one Atom")
+        object.__setattr__(
+            self,
+            "keywords",
+            tuple(dict.fromkeys(item.strip() for item in self.keywords if item.strip())),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedMemory:
+    """An Episode plus knowledge already extracted by an outer Agent.
+
+    The Episode remains the evidence authority.  This object skips only the
+    first extraction LLM call; entity resolution, Atom resolution, temporal
+    evolution, projection and durable document bookkeeping remain unchanged.
+    """
+
+    episode: Episode
+    entities: tuple[ExtractedEntity, ...]
+    relations: tuple[ExtractedRelation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.entities:
+            raise ValueError("extracted memory must contain at least one entity")
+        by_name: dict[str, ExtractedEntity] = {}
+        for entity in self.entities:
+            key = normalize_name(entity.name)
+            if key in by_name:
+                raise ValueError(f"duplicate extracted entity name {entity.name!r}")
+            by_name[key] = entity
+        for relation in self.relations:
+            missing = [
+                name
+                for name in (relation.source, relation.target)
+                if normalize_name(name) not in by_name
+            ]
+            if missing:
+                raise ValueError(
+                    "every relation endpoint must have an extracted entity "
+                    f"container; missing {missing!r}"
+                )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        episode: Episode,
+        entities: Sequence[ExtractedEntity],
+        relations: Sequence[ExtractedRelation] = (),
+    ) -> "ExtractedMemory":
+        return cls(episode, tuple(entities), tuple(relations))
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "magi.extracted-memory.v1",
+            "entities": [
+                {
+                    "name": entity.name,
+                    "aliases": list(entity.aliases),
+                    "entity_type": entity.entity_type,
+                    "atoms": [atom.to_payload() for atom in entity.atoms],
+                }
+                for entity in self.entities
+            ],
+            "relations": [
+                {
+                    "source": relation.source,
+                    "target": relation.target,
+                    "keywords": list(relation.keywords),
+                    "atoms": [atom.to_payload() for atom in relation.atoms],
+                }
+                for relation in self.relations
+            ],
+        }
