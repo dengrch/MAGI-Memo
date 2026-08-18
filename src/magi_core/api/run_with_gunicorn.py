@@ -66,6 +66,7 @@ def main():
     from magi_core.kg.shared_storage import initialize_share_data
     from magi_core.constants import (
         DEFAULT_WOKERS,
+        DEFAULT_SERVER_PORT,
         DEFAULT_TIMEOUT,
     )
 
@@ -207,8 +208,8 @@ def main():
             )
             port = (
                 global_args.port
-                if global_args.port != 9621
-                else get_env_value("PORT", 9621, int)
+                if global_args.port != DEFAULT_SERVER_PORT
+                else get_env_value("PORT", DEFAULT_SERVER_PORT, int)
             )
             gunicorn_config.bind = f"{host}:{port}"
 

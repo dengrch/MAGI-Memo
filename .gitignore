@@ -15,6 +15,12 @@ downloads/
 eggs/
 .eggs/
 lib/
+# `lib/` above targets generated distribution folders. Keep the WebUI path
+# source used by the root-mount contract visible to Git.
+!/src/webui/src/lib/
+/src/webui/src/lib/*
+!/src/webui/src/lib/pathPrefix.ts
+!/src/webui/src/lib/pathPrefix.test.ts
 lib64/
 parts/
 sdist/
@@ -227,3 +233,7 @@ __marimo__/
 /mgc-test/
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Retired local Sage research sandboxes
+/sages/pi/
+/sages/pi-adapters/

@@ -7,7 +7,7 @@ interface ImportMetaEnv {
   readonly VITE_API_PROXY: string
   /** Comma-separated list of paths the dev server forwards to the backend. */
   readonly VITE_API_ENDPOINTS: string
-  /** Backend origin the dev server forwards to (e.g. `http://localhost:9621`). */
+  /** Backend origin the dev server forwards to (e.g. `http://localhost:3491`). */
   readonly VITE_BACKEND_URL: string
 
   /* ───────────── dev-time multi-site simulation ─────────────
@@ -17,8 +17,8 @@ interface ImportMetaEnv {
    * production — without a rebuild. Read by `vite.config.ts` and injected
    * into `index.html` as `window.__LIGHTRAG_CONFIG__`, mirroring what the
    * FastAPI server does at request time in production. The matching
-   * `webuiPrefix` is derived as `${VITE_DEV_API_PREFIX}/webui/` (the WebUI
-   * mount path is fixed at /webui server-side).
+   * `webuiPrefix` is derived as `${VITE_DEV_API_PREFIX}/` (the WebUI is
+   * mounted at the site root server-side).
    *
    * Empty / unset → no prefix; the dev server behaves the same as today.
    *

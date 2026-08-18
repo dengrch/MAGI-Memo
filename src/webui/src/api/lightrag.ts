@@ -102,6 +102,15 @@ export type RuntimeWorkspace = {
   id: string
   name: string
   active: boolean
+  deletable: boolean
+}
+
+export type RuntimeWorkspaceDeletion = {
+  deleted_workspace_id: string
+  active_workspace_id: string
+  deleted_episode_count: number
+  dropped_storage_count: number
+  status: string
 }
 
 export type RuntimeWorkspaceList = {
@@ -1431,6 +1440,13 @@ export const createRuntimeWorkspace = async (input: {
   name: string
 }): Promise<RuntimeWorkspace> => {
   const response = await axiosInstance.post('/workspaces', input)
+  return response.data
+}
+
+export const deleteRuntimeWorkspace = async (
+  workspaceId: string
+): Promise<RuntimeWorkspaceDeletion> => {
+  const response = await axiosInstance.delete(`/workspaces/${encodeURIComponent(workspaceId)}`)
   return response.data
 }
 

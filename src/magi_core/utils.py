@@ -412,6 +412,7 @@ class LightragPathFilter(logging.Filter):
             "/health",
             "/webui/",
             "/documents/pipeline_status",
+            "/runtime/logs",
         ]
         # self.filtered_paths = ["/health", "/webui/"]
 
@@ -428,11 +429,16 @@ class LightragPathFilter(logging.Filter):
             path = record.args[2]
             status = record.args[4]
 
+            # Uvicorn includes the query string in the access-log path.  The
+            # WebUI polls ``/runtime/logs?limit=...`` frequently, so compare
+            # the route path rather than the full request target.
+            route_path = str(path).partition("?")[0]
+
             # Filter out successful GET/POST requests to filtered paths
             if (
                 (method == "GET" or method == "POST")
                 and (status == 200 or status == 304)
-                and path in self.filtered_paths
+                and route_path in self.filtered_paths
             ):
                 return False
 

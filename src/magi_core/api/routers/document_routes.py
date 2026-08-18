@@ -1304,6 +1304,8 @@ class DocumentManager:
         self,
         input_dir: str,
         workspace: str = "",  # New parameter for workspace isolation
+        *,
+        input_dir_is_workspace_root: bool = False,
     ):
         # Reject path traversal before using workspace in the upload path
         validate_workspace(workspace)
@@ -1312,9 +1314,12 @@ class DocumentManager:
         self.workspace = workspace
         self.indexed_files = set()
 
-        # Create workspace-specific input directory
-        # If workspace is provided, create a subdirectory for data isolation
-        if workspace:
+        # ``input_dir`` historically named a shared base directory and the
+        # workspace id was appended here.  Runtime-managed workspaces already
+        # pass their isolated ``<workspace-root>/inputs`` directory, so
+        # appending the id again would save uploads one level below the path
+        # used by the parser.
+        if workspace and not input_dir_is_workspace_root:
             self.input_dir = self.base_input_dir / workspace
         else:
             self.input_dir = self.base_input_dir
@@ -5568,114 +5573,44 @@ def create_document_routes(
                     f"evicted under capacity pressure: {job_clear_error}"
                 )
 
-            # Use drop method to clear all data
+            # Reuse the same workspace-scoped teardown primitive as full
+            # workspace deletion.  Every storage ``drop`` is scoped by the
+            # current workspace; shared Neo4j/DB/vector services stay alive and
+            # data belonging to other workspaces is untouched.
             try:
-                clear_memory = getattr(rag, "_clear_knowledge_memory", None)
-                backup_ids = await clear_memory() if callable(clear_memory) else []
-                if backup_ids:
+                from magi_core.workspace_cleanup import clear_workspace_data
+
+                cleanup = await clear_workspace_data(
+                    rag,
+                    reinitialize_doc_status=True
+                )
+                if cleanup.episode_backup_ids:
                     append_pipeline_history(
                         pipeline_status,
-                        f"Backed up {len(backup_ids)} MAGI Episodes before clear",
+                        "Backed up "
+                        f"{len(cleanup.episode_backup_ids)} MAGI Episodes before clear",
                     )
-            except Exception as memory_clear_error:
+            except Exception as cleanup_error:
                 logger.error(
-                    "Failed to back up and clear MAGI memory: %s",
-                    memory_clear_error,
+                    "Failed to clear workspace data: %s",
+                    cleanup_error,
                 )
-                raise internal_server_error(memory_clear_error)
+                raise internal_server_error(cleanup_error)
 
-            drop_tasks = []
-            storages = [
-                rag.text_chunks,
-                rag.full_docs,
-                rag.full_entities,
-                rag.full_relations,
-                rag.entity_chunks,
-                rag.relation_chunks,
-                rag.entities_vdb,
-                rag.relationships_vdb,
-                rag.chunks_vdb,
-                rag.chunk_entity_relation_graph,
-                rag.doc_status,
-            ]
-
-            # Log storage drop start
+            errors = list(cleanup.errors)
+            storage_success_count = len(cleanup.dropped_storages)
+            storage_error_count = len(cleanup.errors)
+            for error_msg in cleanup.errors:
+                logger.error("Workspace storage drop failed: %s", error_msg)
             append_pipeline_history(
-                pipeline_status, "Starting to drop storage components"
+                pipeline_status,
+                (
+                    f"Dropped {storage_success_count} workspace storage components"
+                    if not cleanup.errors
+                    else f"Dropped {storage_success_count} workspace storage components "
+                    f"with {storage_error_count} errors"
+                ),
             )
-
-            for storage in storages:
-                if storage is not None:
-                    drop_tasks.append(storage.drop())
-
-            # Wait for all drop tasks to complete
-            drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
-
-            # Check for errors and log results
-            errors = []
-            storage_success_count = 0
-            storage_error_count = 0
-
-            for i, result in enumerate(drop_results):
-                storage_name = storages[i].__class__.__name__
-                if isinstance(result, Exception):
-                    error_msg = f"Error dropping {storage_name}: {str(result)}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    storage_error_count += 1
-                elif isinstance(result, dict) and result.get("status") != "success":
-                    # drop() reports a non-raising failure as {"status": "error"}
-                    # (e.g. a backend that could not safely clear a kept legacy
-                    # store). Honor it so the clear is not counted as successful
-                    # while stale data remains and could be re-migrated/resurface.
-                    error_msg = (
-                        f"Error dropping {storage_name}: "
-                        f"{result.get('message', 'unknown error')}"
-                    )
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    storage_error_count += 1
-                else:
-                    namespace = storages[i].namespace
-                    workspace = storages[i].workspace
-                    logger.info(
-                        f"Successfully dropped {storage_name}: {workspace}/{namespace}"
-                    )
-                    storage_success_count += 1
-
-            # Log storage drop results
-            if storage_error_count > 0:
-                append_pipeline_history(
-                    pipeline_status,
-                    f"Dropped {storage_success_count} storage components with {storage_error_count} errors",
-                )
-            else:
-                append_pipeline_history(
-                    pipeline_status,
-                    f"Successfully dropped all {storage_success_count} storage components",
-                )
-
-            # Some backends (OpenSearch) drop the doc_status index as a whole
-            # physical container rather than just its rows, and gate every
-            # subsequent STRICT read behind a readiness flag that only a
-            # write path clears back to healthy. /documents/scan's very first
-            # doc_status touch is a strict READ (the custom-chunk rollback,
-            # then the exclusive FAILED->PENDING reset) — neither is a write,
-            # so nothing would ever re-create the dropped index before the
-            # first scan tries to read it, permanently wedging every scan on
-            # this workspace until the process restarts. re-run the public,
-            # idempotent initialize() right away so the backend is exactly as
-            # ready as it was right after server startup; a backend without
-            # this gap (Postgres/Mongo/Redis/JSON row-level drop) just no-ops.
-            if rag.doc_status is not None:
-                try:
-                    await rag.doc_status.initialize()
-                except Exception as reinit_error:
-                    logger.error(
-                        f"/documents/clear: failed to re-initialize doc_status "
-                        f"after drop; the next /documents/scan may fail until "
-                        f"a write recreates it: {reinit_error}"
-                    )
 
             # If all storage operations failed, return error status and don't proceed with file deletion
             if storage_success_count == 0 and storage_error_count > 0:

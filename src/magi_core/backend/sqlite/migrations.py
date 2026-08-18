@@ -1,6 +1,6 @@
 """SQLite schema migrations for the local memory record store."""
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -178,4 +178,16 @@ CREATE INDEX IF NOT EXISTS idx_memory_deletion_backups_episode
     ON memory_deletion_backups(workspace_id, episode_id, created_at);
 """
 
-MIGRATIONS = ((1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3))
+MIGRATION_4 = """
+CREATE INDEX IF NOT EXISTS idx_projection_outbox_owner
+    ON projection_outbox(workspace_id, owner_id);
+CREATE INDEX IF NOT EXISTS idx_projection_outbox_retry
+    ON projection_outbox(workspace_id, status, next_attempt_at, updated_at);
+"""
+
+MIGRATIONS = (
+    (1, MIGRATION_1),
+    (2, MIGRATION_2),
+    (3, MIGRATION_3),
+    (4, MIGRATION_4),
+)

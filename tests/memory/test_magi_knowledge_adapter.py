@@ -17,8 +17,10 @@ from magi_core.memory import (
     AtomDecision,
     AtomEvidence,
     AtomRecord,
+    EntityRecord,
     EntityResolution,
     Episode,
+    stable_relation_id,
 )
 from magi_core.memory.adapter import MagiKnowledgeAdapter
 
@@ -113,6 +115,121 @@ class FakeEngine:
 
 
 class MagiKnowledgeAdapterTests(unittest.TestCase):
+    def test_resolved_owner_does_not_collapse_distinct_atom_ids(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                sqlite = SQLiteBackend(
+                    Path(temporary) / "memory.sqlite3", "workspace-a"
+                )
+                await sqlite.initialize()
+                engine = FakeEngine()
+                adapter = MagiKnowledgeAdapter(
+                    sqlite, decision_provider=IndependentDecisions()
+                )
+                episode = Episode(
+                    id="episode-merged-owners",
+                    content="Alice and Alicia discussed Bob and Robert.",
+                )
+                await sqlite.put_episode(episode)
+                adapter.register_episodes([episode])
+
+                alice = await sqlite.put_entity(
+                    EntityRecord(
+                        id="entity-alice",
+                        workspace_id="workspace-a",
+                        canonical_name="Alice",
+                        aliases=("Alicia",),
+                    )
+                )
+                bob = await sqlite.put_entity(
+                    EntityRecord(
+                        id="entity-bob",
+                        workspace_id="workspace-a",
+                        canonical_name="Bob",
+                        aliases=("Robert",),
+                    )
+                )
+                resolved = {
+                    "Alice": alice,
+                    "Alicia": alice,
+                    "Bob": bob,
+                    "Robert": bob,
+                }
+                nodes = {
+                    name: [
+                        {
+                            "entity_name": name,
+                            "entity_type": "person",
+                            "description": f"Fact about {name}.",
+                            "atom_payload": {},
+                            "source_id": "chunk-shared",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                    for name in resolved
+                }
+                edges = {
+                    ("Alice", "Bob"): [
+                        {
+                            "src_id": "Alice",
+                            "tgt_id": "Bob",
+                            "description": "Alice discussed Bob.",
+                            "keywords": "discussed",
+                            "weight": 1.0,
+                            "atom_payload": {},
+                            "source_id": "chunk-shared",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ],
+                    ("Alicia", "Robert"): [
+                        {
+                            "src_id": "Alicia",
+                            "tgt_id": "Robert",
+                            "description": "Alicia interviewed Robert.",
+                            "keywords": "interviewed",
+                            "weight": 1.0,
+                            "atom_payload": {},
+                            "source_id": "chunk-shared",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ],
+                }
+
+                with (
+                    patch.object(
+                        adapter,
+                        "_resolve_entities",
+                        new=AsyncMock(return_value=(resolved, {})),
+                    ),
+                    patch(
+                        "magi_core.memory.adapter.merge_nodes_and_edges",
+                        new=AsyncMock(),
+                    ),
+                ):
+                    await adapter.commit(
+                        [(nodes, edges)],
+                        KnowledgeCommitContext(
+                            rag=engine,
+                            doc_id=episode.id,
+                            file_path="episode.txt",
+                        ),
+                    )
+
+                alice_atoms = await sqlite.list_owner_atoms(alice.id)
+                bob_atoms = await sqlite.list_owner_atoms(bob.id)
+                relation_id = stable_relation_id("workspace-a", alice.id, bob.id)
+                relation_atoms = await sqlite.list_owner_atoms(relation_id)
+                self.assertEqual(len(alice_atoms), 2)
+                self.assertEqual(len(bob_atoms), 2)
+                self.assertEqual(len(relation_atoms), 2)
+                self.assertEqual(len({atom.id for atom in relation_atoms}), 2)
+                await sqlite.finalize()
+
+        asyncio.run(scenario())
+
     def test_pending_relation_atom_is_kept_in_graph_projection(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:

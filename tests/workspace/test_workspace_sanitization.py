@@ -14,7 +14,7 @@ References: GitHub Issue #2698
 """
 
 import re
-import os
+from pathlib import Path
 import pytest
 
 # Mark all tests as offline (no external dependencies)
@@ -23,14 +23,10 @@ pytestmark = pytest.mark.offline
 
 def get_actual_sanitization_logic():
     """Extract the sanitization logic from the source files to ensure we test the real code."""
-    base_path = os.path.dirname(
-        os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        )
-    )
+    base_path = Path(__file__).resolve().parents[2]
     files = [
-        os.path.join(base_path, "src/magi_core/kg/memgraph_impl.py"),
-        os.path.join(base_path, "src/magi_core/kg/neo4j_impl.py"),
+        base_path / "src/magi_core/kg/memgraph_impl.py",
+        base_path / "src/magi_core/kg/neo4j_impl.py",
     ]
 
     logics = []

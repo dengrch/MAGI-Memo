@@ -9,13 +9,15 @@ import {
   LogOutIcon,
   MessagesSquareIcon,
   PlusIcon,
-  Share2Icon
+  Share2Icon,
+  Trash2Icon
 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import {
   activateRuntimeWorkspace,
   createRuntimeWorkspace,
+  deleteRuntimeWorkspace,
   getRuntimeLogs,
   getRuntimeWorkspaces,
   RuntimeLogEntry,
@@ -283,6 +285,7 @@ interface WorkspaceSwitcherProps {
   switching: boolean
   onSwitch: (workspaceId: string) => Promise<void>
   onCreated: (workspace: RuntimeWorkspace) => Promise<void>
+  onDeleteRequest: (workspace: RuntimeWorkspace) => void
 }
 
 function WorkspaceSwitcher({
@@ -290,7 +293,8 @@ function WorkspaceSwitcher({
   activeWorkspaceId,
   switching,
   onSwitch,
-  onCreated
+  onCreated,
+  onDeleteRequest
 }: WorkspaceSwitcherProps) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
@@ -406,33 +410,51 @@ function WorkspaceSwitcher({
               {workspaces.map((workspace) => {
                 const active = workspace.id === activeWorkspaceId
                 return (
-                  <button
-                    type="button"
+                  <div
                     key={workspace.id}
-                    disabled={switching}
-                    onClick={() => {
-                      if (!active) void onSwitch(workspace.id)
-                    }}
                     className={cn(
                       'hover:bg-accent flex h-10 w-full items-center gap-2 rounded-md px-2 text-left transition-colors',
                       active && 'bg-accent/70'
                     )}
                   >
-                    <span className="bg-primary/12 text-primary flex size-6 shrink-0 items-center justify-center rounded text-[11px] font-semibold">
-                      {workspaceInitial(workspace)}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm">
-                        {workspace.name || workspace.id}
+                    <button
+                      type="button"
+                      disabled={switching}
+                      onClick={() => {
+                        if (!active) void onSwitch(workspace.id)
+                      }}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left disabled:opacity-60"
+                    >
+                      <span className="bg-primary/12 text-primary flex size-6 shrink-0 items-center justify-center rounded text-[11px] font-semibold">
+                        {workspaceInitial(workspace)}
                       </span>
-                      {workspace.name && workspace.name !== workspace.id && (
-                        <span className="text-muted-foreground block truncate font-mono text-[10px]">
-                          {workspace.id}
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm">
+                          {workspace.name || workspace.id}
                         </span>
-                      )}
-                    </span>
-                    {active && <CheckIcon className="text-primary size-3.5" />}
-                  </button>
+                        {workspace.name && workspace.name !== workspace.id && (
+                          <span className="text-muted-foreground block truncate font-mono text-[10px]">
+                            {workspace.id}
+                          </span>
+                        )}
+                      </span>
+                      {active && <CheckIcon className="text-primary size-3.5" />}
+                    </button>
+                    {workspace.deletable && (
+                      <button
+                        type="button"
+                        disabled={switching}
+                        onClick={() => {
+                          setOpen(false)
+                          onDeleteRequest(workspace)
+                        }}
+                        className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive flex size-7 shrink-0 items-center justify-center rounded"
+                        aria-label={t('header.deleteWorkspace', { name: workspace.name })}
+                      >
+                        <Trash2Icon className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
                 )
               })}
             </div>
@@ -461,6 +483,9 @@ export default function SiteHeader() {
   const [workspaces, setWorkspaces] = useState<RuntimeWorkspace[]>([])
   const [activeWorkspace, setActiveWorkspace] = useState('')
   const [switchingWorkspace, setSwitchingWorkspace] = useState(false)
+  const [workspaceToDelete, setWorkspaceToDelete] = useState<RuntimeWorkspace | null>(null)
+  const [deleteConfirmation, setDeleteConfirmation] = useState('')
+  const [deletingWorkspace, setDeletingWorkspace] = useState(false)
 
   useEffect(() => {
     getRuntimeWorkspaces()
@@ -488,6 +513,18 @@ export default function SiteHeader() {
   const handleWorkspaceCreated = async (workspace: RuntimeWorkspace) => {
     setWorkspaces((current) => [...current, workspace])
     await handleWorkspaceChange(workspace.id)
+  }
+
+  const handleWorkspaceDelete = async () => {
+    if (!workspaceToDelete || deleteConfirmation !== workspaceToDelete.name) return
+    setDeletingWorkspace(true)
+    try {
+      await deleteRuntimeWorkspace(workspaceToDelete.id)
+      window.location.reload()
+    } catch (reason) {
+      toast.error(t('header.workspaceDeleteFailed', { error: errorMessage(reason) }))
+      setDeletingWorkspace(false)
+    }
   }
 
   const versionDisplay = coreVersion && apiVersion ? `${coreVersion}/${apiVersion}` : null
@@ -532,6 +569,10 @@ export default function SiteHeader() {
             switching={switchingWorkspace}
             onSwitch={handleWorkspaceChange}
             onCreated={handleWorkspaceCreated}
+            onDeleteRequest={(workspace) => {
+              setWorkspaceToDelete(workspace)
+              setDeleteConfirmation('')
+            }}
           />
         </div>
         <TabsNavigation />
@@ -572,6 +613,56 @@ export default function SiteHeader() {
           )}
         </div>
       </nav>
+      <Dialog
+        open={workspaceToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingWorkspace) {
+            setWorkspaceToDelete(null)
+            setDeleteConfirmation('')
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('header.deleteWorkspaceTitle')}</DialogTitle>
+            <DialogDescription>
+              {t('header.deleteWorkspaceDescription', { name: workspaceToDelete?.name })}
+            </DialogDescription>
+          </DialogHeader>
+          <label className="space-y-1.5">
+            <span className="text-muted-foreground text-xs">
+              {t('header.deleteWorkspaceConfirm', { name: workspaceToDelete?.name })}
+            </span>
+            <input
+              autoFocus
+              value={deleteConfirmation}
+              disabled={deletingWorkspace}
+              onChange={(event) => setDeleteConfirmation(event.target.value)}
+              className="border-input bg-background focus:border-destructive/60 h-9 w-full rounded-md border px-2.5 text-sm outline-none"
+            />
+          </label>
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              disabled={deletingWorkspace}
+              onClick={() => setWorkspaceToDelete(null)}
+            >
+              {t('common.cancel')}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={
+                deletingWorkspace ||
+                !workspaceToDelete ||
+                deleteConfirmation !== workspaceToDelete.name
+              }
+              onClick={() => void handleWorkspaceDelete()}
+            >
+              {deletingWorkspace ? t('header.deletingWorkspace') : t('header.deleteWorkspaceAction')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </aside>
   )
 }

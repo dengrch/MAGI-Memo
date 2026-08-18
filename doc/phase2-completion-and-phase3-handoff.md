@@ -1,6 +1,6 @@
 # MAGI Memo 二期工程验收与三期交接报告
 
-日期：2026-08-10  
+日期：2026-08-11
 文档状态：二期最终汇总，替代各阶段进度文档中的历史结论
 
 ## 1. 验收结论
@@ -11,13 +11,10 @@ MAGI Memo 二期已经达到 **功能完成、可以进入三期工程** 的状�
 能力的基础上，建立了以 Episode、Atom、Evidence、双时间和实体消歧为中心的记忆系统；同时完成
 公开 API、Runtime、单实例多句柄和多 Workspace 隔离。
 
-但如果“完成”要求达到可以长期无人值守运行的生产可靠性标准，目前只能判定为
-**有条件完成**，还有两项应在三期正式接入 Agent 前优先收尾：
-
-1. `projection_outbox` 只有数据表和状态统计，尚未实现写入、幂等重放和 reconcile worker；
-   SQLite 已提交而 Neo4j/VDB 投影失败时，仍可能产生跨存储不一致。
-2. 真实 Neo4j 回归中，`search_labels()` 在全文索引暂时返回空结果时不会进入 `CONTAINS`
-   fallback，导致一项测试失败。它不阻断 Atom 写入，但会影响图谱标签搜索的稳定性。
+2026-08-11 的可靠性收尾已经补全 owner 级 `projection_outbox`、幂等重投、指数退避后台 worker、
+启动 reconcile、删除投影和版本栅栏；真实 Neo4j 标签搜索的空结果 fallback 也已修复。因此二期可以
+从“有条件完成”提升为 **正式功能封板**。这里的可靠性定义是以 SQLite 为事实源的最终一致投影，
+不是 SQLite 与 Neo4j 之间不可实现的分布式强事务。
 
 双时间 query-time 过滤、跨存储一键恢复、Reflect 聚类与 `global.md`、Agent 主动图谱探索和
 更新，均是已经明确延期的能力，不应误判为本轮遗漏。
@@ -44,11 +41,11 @@ flowchart TD
 
 三层分工已经稳定：
 
-| 层 | 责任 | 不负责 |
-|---|---|---|
-| `interface` | 稳定公开契约、调用者句柄、ingest/search/status/extension | 直接创建或销毁底层存储 |
-| `magi_runtime` | 实例生命周期、句柄并发、Workspace 切换、Backend 组装 | 记忆语义与图谱合并 |
-| `magi_core` | 抽取、消歧、Atom 裁决、持久化、图投影和检索 | 上层 Agent 会话生命周期 |
+| 层               | 责任                                                     | 不负责                  |
+| ---------------- | -------------------------------------------------------- | ----------------------- |
+| `interface`    | 稳定公开契约、调用者句柄、ingest/search/status/extension | 直接创建或销毁底层存储  |
+| `magi_runtime` | 实例生命周期、句柄并发、Workspace 切换、Backend 组装     | 记忆语义与图谱合并      |
+| `magi_core`    | 抽取、消歧、Atom 裁决、持久化、图投影和检索              | 上层 Agent 会话生命周期 |
 
 这层边界使后续 Agent 只依赖 `MagiAPI`，不会持有 SQLite、Neo4j 或 LightRAG 的资源对象。
 
@@ -95,11 +92,11 @@ Atom 1 ─── N AtomEvidence N ─── 1 Episode
 
 Atom 同时保存两套时间：
 
-| 字段 | 含义 | 写入/更新时机 |
-|---|---|---|
-| `valid_at` | 事实开始在现实世界中成立的时间 | 模型从文本推断；缺省使用 Episode 参考时间 |
-| `invalid_at` | 事实从现实世界中不再成立的时间 | 文本明确给出，或时间继任/显式取代时写入 |
-| `created_at` | 记录进入 MAGI 的系统时间 | 首次持久化 Atom 时写入 |
+| 字段           | 含义                           | 写入/更新时机                                   |
+| -------------- | ------------------------------ | ----------------------------------------------- |
+| `valid_at`   | 事实开始在现实世界中成立的时间 | 模型从文本推断；缺省使用 Episode 参考时间       |
+| `invalid_at` | 事实从现实世界中不再成立的时间 | 文本明确给出，或时间继任/显式取代时写入         |
+| `created_at` | 记录进入 MAGI 的系统时间       | 首次持久化 Atom 时写入                          |
 | `expired_at` | 记录不再参与当前物化的系统时间 | Refinement、Temporal Successor 或显式取代时写入 |
 
 `invalid_at` 表示“该陈述的有效区间结束”，并不自动证明反命题成立。给模型的 Atom 表示会同时携带
@@ -169,13 +166,13 @@ Atom 候选严格按 owner 隔离，Entity Atom 不会和 Relation Atom 混比�
 
 ### 4.5 五类 Atom 操作
 
-| 决策 | 持久化行为 | 时间行为 | 演化记录 |
-|---|---|---|---|
-| `DUPLICATE` | 复用目标 Atom，只增加 Evidence | 保持目标时间 | 不建立新 Atom 演化 |
-| `INDEPENDENT` | 插入新 Atom | 使用新 Atom 时间 | 无 |
-| `REFINEMENT` | 插入更精确的新 Atom | 旧 Atom 写 `expired_at`，不臆造 `invalid_at` | 新 → 旧 |
-| `TEMPORAL_SUCCESSOR` | 插入后续状态 | 旧 Atom 写转折点 `invalid_at` 和 `expired_at` | 新 → 旧 |
-| `CONTRADICTION` | 默认并存；仅显式 `supersedes_target` 才取代 | 显式取代时更新旧 Atom 两类结束时间 | 新 → 旧 |
+| 决策                   | 持久化行为                                   | 时间行为                                         | 演化记录           |
+| ---------------------- | -------------------------------------------- | ------------------------------------------------ | ------------------ |
+| `DUPLICATE`          | 复用目标 Atom，只增加 Evidence               | 保持目标时间                                     | 不建立新 Atom 演化 |
+| `INDEPENDENT`        | 插入新 Atom                                  | 使用新 Atom 时间                                 | 无                 |
+| `REFINEMENT`         | 插入更精确的新 Atom                          | 旧 Atom 写`expired_at`，不臆造 `invalid_at`  | 新 → 旧           |
+| `TEMPORAL_SUCCESSOR` | 插入后续状态                                 | 旧 Atom 写转折点`invalid_at` 和 `expired_at` | 新 → 旧           |
+| `CONTRADICTION`      | 默认并存；仅显式`supersedes_target` 才取代 | 显式取代时更新旧 Atom 两类结束时间               | 新 → 旧           |
 
 演化关系保存在 `atom_evolution`，包含 source/target Atom ID、决策、置信度和原因；因此五分类不是
 Atom 表上的一个固定字段。一次 Atom 可以在不同演化记录中扮演不同角色，详情可通过
@@ -195,7 +192,7 @@ Atom 表上的一个固定字段。一次 Atom 可以在不同演化记录中扮
 - `memory_embeddings`；
 - `workspace_settings`；
 - `memory_deletion_backups`；
-- `projection_outbox`（目前只有 schema 和统计）。
+- `projection_outbox`（owner 脏标记、版本、重试状态、错误和删除定位快照）。
 
 embedding 以 BLOB 持久化在 SQLite，由 NumPy 做轻量相似度检索。当前数据规模和单机个人记忆系统
 目标下，这比再引入独立向量服务更易部署；未来数据规模增大时可以在保持接口不变的前提下替换。
@@ -240,9 +237,14 @@ MAGI 的区别是 summary 输入来自 Atom presentation，而非自由堆叠的
 `restore_episode_backup()`，但它只是记录层恢复原语，还没有形成恢复 SQLite 后自动重投影
 Neo4j/VDB 的公开端到端命令。
 
-当前最大的一致性风险是：SQLite 与 Neo4j/VDB 不共享事务。`projection_outbox` 原本用于把“待投影”
-变成可恢复事件，但目前提交路径没有写 outbox，也没有 retry/reconcile worker。三期 Agent 产生持续
-写入前，应优先完成该机制。
+SQLite 与 Neo4j/VDB 不共享事务，因此系统采用 transactional outbox 保证最终一致：Atom、Evidence、
+时间状态或删除发生变化时，在同一个 SQLite 事务里递增 owner 的待投影版本；正常写入只有在
+Neo4j/VDB 操作和持久化 callback 全部成功后才确认该版本。失败任务保留错误和重试次数，由后台
+worker 指数退避重试，Runtime 启动时也会先 reconcile。
+
+Outbox 不保存 Atom payload。重试根据 `owner_id` 重新读取 SQLite 当前完整状态，重新生成
+`description + atom_ids` 并幂等覆盖各投影。旧版本 worker 只能确认自己读取的 revision，不能误确认
+期间产生的新状态。owner 已删除时，Outbox 中仅保留实体名称或关系端点快照，用于幂等删除图和向量。
 
 ## 7. Runtime、Workspace 与公开接口
 
@@ -276,15 +278,15 @@ ID：
 
 正式入口为 `src/interface/api.py::MagiAPI`，目前提供：
 
-| 类别 | 接口 |
-|---|---|
-| 生命周期 | `build/from_engine`、`init`、`finalize`、`open`、`close` |
-| Workspace | `list_workspaces`、`create_workspace`、`switch_workspace` |
-| 原始写入 | `MagiHandle.ingest`、`ingest_file` |
-| 已抽取写入 | `MagiHandle.ingest_extracted` |
-| 检索 | `MagiHandle.search`，复用 `local/global/hybrid/mix/naive` |
-| 运行状态 | `MagiHandle.status` / `MagiAPI.status` |
-| 上层扩展 | `register_extension`、`MagiHandle.extension` |
+| 类别       | 接口                                                               |
+| ---------- | ------------------------------------------------------------------ |
+| 生命周期   | `build/from_engine`、`init`、`finalize`、`open`、`close` |
+| Workspace  | `list_workspaces`、`create_workspace`、`switch_workspace`    |
+| 原始写入   | `MagiHandle.ingest`、`ingest_file`                             |
+| 已抽取写入 | `MagiHandle.ingest_extracted`                                    |
+| 检索       | `MagiHandle.search`，复用 `local/global/hybrid/mix/naive`      |
+| 运行状态   | `MagiHandle.status` / `MagiAPI.status`                         |
+| 上层扩展   | `register_extension`、`MagiHandle.extension`                   |
 
 `index/query` 只保留为一期兼容别名。公开 API 还没有开放 delete/restore/rebuild、时间点查询或图谱
 探索写接口；其中 update/forget/主动探索此前已经明确延期到三期语义设计之后。
@@ -318,38 +320,34 @@ WebUI 是个人记忆系统的监测与管理入口，不再只是固定 Workspa
   tests/kg/neo4j_impl
 ```
 
-结果：`83 passed, 8 skipped`。默认跳过的 8 项包括 2 项真实 LLM integration 和 6 项真实 Neo4j
-integration；单元与 mock 回归全部通过。
+可靠投影收尾后的 Memory、Interface、API 和 Neo4j 专项结果：`87 passed, 8 skipped`。默认跳过项
+是两项真实 LLM integration 和六项真实 Neo4j integration；单元与故障注入回归全部通过。
 
 覆盖内容包括模型和 SQLite、Evidence 一对多、批量实体消歧、五分类 Atom 行为、抽取后写入、
 summary 血缘校验、删除投影、Runtime 生命周期、多句柄、Workspace 和日志接口。
 
 ### 9.2 真实 Neo4j
 
-使用当前 `.env` 连接 `neo4j://127.0.0.1:7687`，真实 Neo4j integration 结果为：
+使用当前 `.env` 连接本地 Neo4j，真实 Neo4j integration 结果为：
 
 ```text
-5 passed, 1 failed
+42 passed
 ```
 
-失败项：
+原先失败的 `test_search_labels_fallback_to_contains` 已修复：全文索引因最终一致性暂时返回空列表时，
+现在也会进入确定性的 `CONTAINS` fallback。
 
-```text
-tests/kg/neo4j_impl/test_neo4j_fulltext_index.py::test_search_labels_fallback_to_contains
-```
-
-测试中新节点写入后全文索引查询暂时返回空列表；`search_labels()` 只在查询抛异常时执行
-`CONTAINS` fallback，不会在“成功但为空”时 fallback。这是保留 Neo4j 实现的标签搜索稳定性缺陷，
-不是 Episode → Atom → 图投影主链路失败，但应在最终工程验收前修复并重跑真实集成测试。
+可靠投影新增 4 项故障测试，覆盖 owner revision 合并与旧版本栅栏、Neo4j 成功但 VDB 失败、
+持久化 callback 失败、重复重放、启动恢复、关系投影和 Episode 硬删除。
 
 ## 10. 尚未完成与优先级
 
-### P0：三期 Agent 接入前完成
+### 已完成的可靠性收尾
 
-1. 实装 `projection_outbox`：同 SQLite 记忆提交、幂等投影、重试、死信/错误状态和启动时 reconcile。
-2. 增加跨存储故障注入测试：Neo4j/VDB 在提交中途失败、重启后可恢复，重复重放不产生重复节点、边
-   或 Evidence。
-3. 修复 Neo4j `search_labels()` 空结果 fallback，并让 6 项真实 Neo4j integration 全部通过。
+1. `projection_outbox` 已与 Atom/Evidence/时间和删除事务接通，并支持 owner 级合并和版本栅栏。
+2. 已实现幂等重投、失败状态、指数退避 worker、启动 reconcile 和 storage callback 后确认。
+3. 跨存储故障注入、重复重放、重启恢复和关系/删除测试已经通过。
+4. Neo4j `search_labels()` 空结果 fallback 已修复，真实 Neo4j integration 为 `42 passed`。
 
 ### P1：三期检索与维护接口设计时完成
 
@@ -382,20 +380,20 @@ tests/kg/neo4j_impl/test_neo4j_fulltext_index.py::test_search_labels_fallback_to
 
 ## 12. 代码导航
 
-| 主题 | 主要文件 |
-|---|---|
-| 统一记忆模型 | `src/magi_core/memory/models.py` |
-| 实体消歧与 Atom 写入编排 | `src/magi_core/memory/adapter.py` |
-| LLM 决策解析与白名单校验 | `src/magi_core/memory/decisions.py` |
-| 抽取、消歧、裁决 Prompt | `src/magi_core/prompt.py` |
-| SQLite schema 与迁移 | `src/magi_core/backend/sqlite/migrations.py` |
-| SQLite 记录、Evidence、删除、演化、embedding | `src/magi_core/backend/sqlite/backend.py` |
-| LightRAG merge、summary 血缘校验 | `src/magi_core/operate.py` |
-| 原始/已抽取写入入口 | `src/magi_core/ingestion.py`、`src/magi_core/backend/engine/backend.py` |
-| 后端生命周期组装 | `src/magi_core/backend/bundle.py` |
-| Runtime 和 Workspace | `src/magi_runtime/runtime.py`、`src/magi_runtime/workspaces.py` |
-| 公开 API | `src/interface/api.py` |
-| REST/WebUI 服务 | `src/magi_core/api/lightrag_server.py`、`src/webui` |
+| 主题                                         | 主要文件                                                                    |
+| -------------------------------------------- | --------------------------------------------------------------------------- |
+| 统一记忆模型                                 | `src/magi_core/memory/models.py`                                          |
+| 实体消歧与 Atom 写入编排                     | `src/magi_core/memory/adapter.py`                                         |
+| LLM 决策解析与白名单校验                     | `src/magi_core/memory/decisions.py`                                       |
+| 抽取、消歧、裁决 Prompt                      | `src/magi_core/prompt.py`                                                 |
+| SQLite schema 与迁移                         | `src/magi_core/backend/sqlite/migrations.py`                              |
+| SQLite 记录、Evidence、删除、演化、embedding | `src/magi_core/backend/sqlite/backend.py`                                 |
+| LightRAG merge、summary 血缘校验             | `src/magi_core/operate.py`                                                |
+| 原始/已抽取写入入口                          | `src/magi_core/ingestion.py`、`src/magi_core/backend/engine/backend.py` |
+| 后端生命周期组装                             | `src/magi_core/backend/bundle.py`                                         |
+| Runtime 和 Workspace                         | `src/magi_runtime/runtime.py`、`src/magi_runtime/workspaces.py`         |
+| 公开 API                                     | `src/interface/api.py`                                                    |
+| REST/WebUI 服务                              | `src/magi_core/api/lightrag_server.py`、`src/webui`                     |
 
-二期至此可以封板为：**记忆系统功能基线完成，三期在可靠投影和正式 Agent Extension 接入前先做
-短暂工程加固。**
+二期至此正式封板为：**记忆系统、Runtime、公开接口、Workspace 和可靠投影基线完成，可以进入
+三期 Agent Extension 与主动图谱探索设计。**

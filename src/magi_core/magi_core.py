@@ -1679,21 +1679,24 @@ class MagiCore(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         if track_id is None:
             track_id = generate_track_id("ingest-extracted")
 
+        # Register only transient extraction context here.  The durable Episode
+        # is created by ``_prepare_knowledge_episode`` after document admission
+        # succeeds.  Persisting before admission leaves an orphan Episode when
+        # the document pipeline rejects a duplicate or source conflict.
         adapter = self._knowledge_ingestion_adapter
-        stage = getattr(adapter, "stage_episode", None)
-        if callable(stage):
-            for item in normalized:
-                await stage(item.episode)
-        else:
-            register = getattr(adapter, "register_episodes", None)
-            if callable(register):
-                register([item.episode for item in normalized])
+        register = getattr(adapter, "register_episodes", None)
+        if callable(register):
+            register([item.episode for item in normalized])
 
         await self.apipeline_enqueue_documents(
             [item.episode.content for item in normalized],
             ids=[item.episode.id for item in normalized],
             file_paths=[
-                item.episode.source_uri or f"episode-{item.episode.id}.txt"
+                # ``source_uri`` is provenance and may legitimately repeat
+                # across many conversation Episodes.  The retained pipeline
+                # treats file paths as unique document identity, so keep its
+                # canonical filename tied to the server-owned Episode id.
+                f"episode-{item.episode.id}.txt"
                 for item in normalized
             ],
             track_id=track_id,
@@ -2946,8 +2949,28 @@ class MagiCore(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         adapter = self._knowledge_ingestion_adapter
         clear = getattr(adapter, "clear_memory", None)
         if callable(clear):
-            return await clear()
+            return await clear(rag=self)
         return []
+
+    async def aclear_workspace_data(
+        self,
+        *,
+        reinitialize_doc_status: bool = False,
+    ):
+        """Clear every durable storage owned by this workspace.
+
+        The caller must hold the workspace's destructive lifecycle fence.
+        This reusable primitive backs both document clear and full workspace
+        deletion so Episode, graph, vector, KV, status, and cache teardown
+        cannot drift between entry points.
+        """
+
+        from magi_core.workspace_cleanup import clear_workspace_data
+
+        return await clear_workspace_data(
+            self,
+            reinitialize_doc_status=reinitialize_doc_status,
+        )
 
     async def _commit_extracted_knowledge(
         self,

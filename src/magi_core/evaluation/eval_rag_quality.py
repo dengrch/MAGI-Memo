@@ -9,7 +9,7 @@ Evaluates RAG response quality using RAGAS metrics:
 - Context Precision: Is retrieved context clean without noise?
 
 Usage:
-    # Use defaults (sample_dataset.json, http://localhost:9621)
+    # Use defaults (sample_dataset.json, http://localhost:3491)
     python magi_core/evaluation/eval_rag_quality.py
 
     # Specify custom dataset
@@ -17,11 +17,11 @@ Usage:
     python magi_core/evaluation/eval_rag_quality.py -d my_test.json
 
     # Specify custom RAG endpoint
-    python magi_core/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
-    python magi_core/evaluation/eval_rag_quality.py -r http://my-server.com:9621
+    python magi_core/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:3491
+    python magi_core/evaluation/eval_rag_quality.py -r http://my-server.com:3491
 
     # Specify both
-    python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+    python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:3491
 
     # Get help
     python magi_core/evaluation/eval_rag_quality.py --help
@@ -121,7 +121,7 @@ class RAGEvaluator:
 
         Args:
             test_dataset_path: Path to test dataset JSON file
-            rag_api_url: Base URL of LightRAG API (e.g., http://localhost:9621)
+            rag_api_url: Base URL of LightRAG API (e.g., http://localhost:3491)
                         If None, will try to read from environment or use default
 
         Environment Variables:
@@ -215,7 +215,7 @@ class RAGEvaluator:
             test_dataset_path = Path(__file__).parent / "sample_dataset.json"
 
         if rag_api_url is None:
-            rag_api_url = os.getenv("LIGHTRAG_API_URL", "http://localhost:9621")
+            rag_api_url = os.getenv("LIGHTRAG_API_URL", "http://localhost:3491")
 
         self.test_dataset_path = Path(test_dataset_path)
         self.rag_api_url = rag_api_url.rstrip("/")
@@ -953,12 +953,12 @@ async def main():
 
     Command-line arguments:
         --dataset, -d: Path to test dataset JSON file (default: sample_dataset.json)
-        --ragendpoint, -r: LightRAG API endpoint URL (default: http://localhost:9621 or $LIGHTRAG_API_URL)
+        --ragendpoint, -r: LightRAG API endpoint URL (default: http://localhost:3491 or $LIGHTRAG_API_URL)
 
     Usage:
         python magi_core/evaluation/eval_rag_quality.py
         python magi_core/evaluation/eval_rag_quality.py --dataset my_test.json
-        python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+        python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:3491
     """
     try:
         # Parse command-line arguments
@@ -974,10 +974,10 @@ Examples:
   python magi_core/evaluation/eval_rag_quality.py --dataset my_test.json
 
   # Specify custom RAG endpoint
-  python magi_core/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:9621
+  python magi_core/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:3491
 
   # Specify both
-  python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:9621
+  python magi_core/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:3491
             """,
         )
 
@@ -994,7 +994,7 @@ Examples:
             "-r",
             type=str,
             default=None,
-            help="LightRAG API endpoint URL (default: http://localhost:9621 or $LIGHTRAG_API_URL environment variable)",
+            help="LightRAG API endpoint URL (default: http://localhost:3491 or $LIGHTRAG_API_URL environment variable)",
         )
 
         args = parser.parse_args()

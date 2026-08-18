@@ -42,8 +42,14 @@ class BackendBundle:
         try:
             await self.engine.initialize()
             await self.neo4j.initialize()
+            if self.engine.memory_adapter is not None:
+                await self.engine.memory_adapter.start_projection_worker(
+                    self.engine.raw
+                )
         except Exception:
             try:
+                if self.engine.memory_adapter is not None:
+                    await self.engine.memory_adapter.stop_projection_worker()
                 await self.engine.finalize()
             finally:
                 await self.sqlite.finalize()
@@ -54,6 +60,8 @@ class BackendBundle:
         if not self._initialized:
             return
         try:
+            if self.engine.memory_adapter is not None:
+                await self.engine.memory_adapter.stop_projection_worker()
             await self.neo4j.finalize()
         finally:
             try:
@@ -71,8 +79,12 @@ class BackendBundle:
         pending: list[Episode] = []
         skipped = 0
         for episode in episodes:
-            record = await self.sqlite.put_episode(episode)
-            if record["status"] == EpisodeStatus.INDEXED.value:
+            record = await self.sqlite.get_episode(episode.id)
+            if record is not None and record["content_hash"] != episode.content_hash:
+                raise ValueError(
+                    f"episode {episode.id!r} already exists with different content"
+                )
+            if record is not None and record["status"] == EpisodeStatus.INDEXED.value:
                 skipped += 1
             else:
                 pending.append(episode)
@@ -89,14 +101,20 @@ class BackendBundle:
             track_id = await self.engine.index(pending)
         except Exception as exc:
             for episode in pending:
-                await self.sqlite.mark_episode(
-                    episode.id,
-                    EpisodeStatus.FAILED,
-                    error=str(exc),
-                )
+                if await self.sqlite.get_episode(episode.id) is not None:
+                    await self.sqlite.mark_episode(
+                        episode.id,
+                        EpisodeStatus.FAILED,
+                        error=str(exc),
+                    )
             raise
 
         for episode in pending:
+            # Legacy/custom engines may not invoke the knowledge adapter even
+            # after reporting the canonical document as processed.  Persisting
+            # here is safe because admission and processing already succeeded.
+            if await self.sqlite.get_episode(episode.id) is None:
+                await self.sqlite.put_episode(episode)
             await self.sqlite.mark_episode(
                 episode.id,
                 EpisodeStatus.INDEXED,
@@ -124,45 +142,91 @@ class BackendBundle:
         )
 
     async def ingest_extracted(
-        self, memories: Sequence[ExtractedMemory]
+        self,
+        memories: Sequence[ExtractedMemory],
+        *,
+        track_id: str | None = None,
     ) -> IndexResult:
         self._require_initialized()
         pending: list[ExtractedMemory] = []
         skipped = 0
+        resolved_episode_ids: list[str] = []
         for memory in memories:
-            record = await self.sqlite.put_episode(memory.episode)
-            if record["status"] == EpisodeStatus.INDEXED.value:
+            # Admission owns durable Episode creation.  Looking up here keeps
+            # idempotent replays cheap without staging an Episode that could be
+            # orphaned when the document pipeline rejects the input.
+            record = await self.sqlite.get_episode(memory.episode.id)
+            if (
+                record is not None
+                and record["content_hash"] != memory.episode.content_hash
+            ):
+                raise ValueError(
+                    f"episode {memory.episode.id!r} already exists with different content"
+                )
+            if record is None:
+                record = await self.sqlite.get_episode_by_content_hash(
+                    memory.episode.content_hash
+                )
+            if record is not None and record["status"] == EpisodeStatus.INDEXED.value:
                 skipped += 1
+                resolved_episode_ids.append(str(record["episode_id"]))
+            elif record is not None and record["episode_id"] != memory.episode.id:
+                # A retry can arrive while the original server-owned Episode
+                # is still queued. Follow that canonical admission instead of
+                # enqueueing a new ID that retained content dedup will reject.
+                status_row = await self.engine.wait_for_document(record["episode_id"])
+                await self.sqlite.mark_episode(
+                    record["episode_id"],
+                    EpisodeStatus.INDEXED,
+                    track_id=status_row.get("track_id"),
+                )
+                skipped += 1
+                resolved_episode_ids.append(str(record["episode_id"]))
             else:
                 pending.append(memory)
+                resolved_episode_ids.append(memory.episode.id)
         if not pending:
             return IndexResult(
-                episode_ids=tuple(item.episode.id for item in memories),
+                episode_ids=tuple(resolved_episode_ids),
                 indexed_count=0,
                 skipped_count=skipped,
                 track_id=None,
             )
         try:
-            track_id = await self.engine.ingest_extracted(pending)
+            engine_track_id = (
+                await self.engine.ingest_extracted(pending)
+                if track_id is None
+                else await self.engine.ingest_extracted(pending, track_id=track_id)
+            )
+        except TimeoutError:
+            # Admission remains live and may still complete in the background.
+            # Do not rewrite the canonical Episode as failed on caller timeout.
+            raise
         except Exception as exc:
             for memory in pending:
-                await self.sqlite.mark_episode(
-                    memory.episode.id,
-                    EpisodeStatus.FAILED,
-                    error=str(exc),
-                )
+                # A rejected admission has no canonical document and therefore
+                # must not leave an Episode.  Once admission has created the
+                # matching Episode, preserve the failure on both sides.
+                if await self.sqlite.get_episode(memory.episode.id) is not None:
+                    await self.sqlite.mark_episode(
+                        memory.episode.id,
+                        EpisodeStatus.FAILED,
+                        error=str(exc),
+                    )
             raise
         for memory in pending:
+            if await self.sqlite.get_episode(memory.episode.id) is None:
+                await self.sqlite.put_episode(memory.episode)
             await self.sqlite.mark_episode(
                 memory.episode.id,
                 EpisodeStatus.INDEXED,
-                track_id=track_id,
+                track_id=engine_track_id,
             )
         return IndexResult(
-            episode_ids=tuple(item.episode.id for item in memories),
+            episode_ids=tuple(resolved_episode_ids),
             indexed_count=len(pending),
             skipped_count=skipped,
-            track_id=track_id,
+            track_id=engine_track_id,
         )
 
     async def status(self) -> dict[str, Any]:

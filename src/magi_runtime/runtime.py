@@ -50,6 +50,14 @@ class RuntimeHandle:
         self.idle.set()
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeWorkspaceDeletion:
+    deleted_workspace_id: str
+    active_workspace_id: str
+    deleted_episode_count: int
+    dropped_storage_count: int
+
+
 class MagiRuntime:
     """Own exactly one active Core instance and any number of handles."""
 
@@ -80,15 +88,7 @@ class MagiRuntime:
                 selected = workspace_id or self.workspace_manager.active_workspace_id
                 layout = self.workspace_manager.layout(selected)
                 layout.ensure()
-                engine = self.core_factory(layout.ragstore, layout.workspace_id)
-                sqlite = SQLiteBackend(layout.sqlite_path, layout.workspace_id)
-                adapter = MagiKnowledgeAdapter(sqlite)
-                engine_backend = EngineBackend(engine, layout, memory_adapter=adapter)
-                backend = BackendBundle(
-                    engine=engine_backend,
-                    sqlite=sqlite,
-                    neo4j=Neo4jBackend(engine.chunk_entity_relation_graph),
-                )
+                backend = self._build_backend(layout)
                 await backend.initialize()
                 self.workspace_manager.set_active(selected)
             except BaseException:
@@ -246,6 +246,107 @@ class MagiRuntime:
         self, workspace_id: str | None = None, *, label: str | None = None
     ) -> WorkspaceRecord:
         return self.workspace_manager.create(workspace_id, label=label)
+
+    async def delete_workspace(
+        self,
+        workspace_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> RuntimeWorkspaceDeletion:
+        """Delete one workspace across MAGI and every retained storage.
+
+        Storage ``drop`` implementations remain workspace-scoped: shared
+        Neo4j, database, and vector services survive and other workspaces are
+        not touched.
+        """
+
+        self._require_ready()
+        record = self.workspace_manager.get(workspace_id)
+        allowed, reason = self.workspace_manager.delete_capability(workspace_id)
+        if not allowed:
+            raise ValueError(reason or f"workspace {workspace_id!r} cannot be deleted")
+        async with self._handle_lock:
+            if self._handles:
+                raise RuntimeError(
+                    "workspace deletion requires every public handle to be closed"
+                )
+
+        is_active = workspace_id == self.active_workspace_id
+        temporary_backend: BackendBundle | None = None
+        if is_active:
+            backend = self.backend
+            if backend is None:
+                raise RuntimeError("runtime instance is unavailable")
+        else:
+            layout = self.workspace_manager.layout(workspace_id)
+            temporary_backend = self._build_backend(layout)
+            await temporary_backend.initialize()
+            backend = temporary_backend
+
+        try:
+            cleanup = await backend.engine.raw.aclear_workspace_data(
+                reinitialize_doc_status=False
+            )
+            if cleanup.errors:
+                raise RuntimeError(
+                    "workspace storage cleanup was incomplete: "
+                    + "; ".join(cleanup.errors)
+                )
+        finally:
+            if temporary_backend is not None:
+                await temporary_backend.finalize()
+
+        if is_active:
+            await self.instance_destroy(timeout=timeout, final=False)
+        try:
+            deletion = self.workspace_manager.delete(record.id)
+        except BaseException:
+            if is_active:
+                await self.instance_init(record.id)
+            raise
+
+        from magi_core.kg.shared_storage import (
+            finalize_pipeline_ingress,
+            finalize_scan_job_store,
+            get_pipeline_ingress,
+            get_scan_job_store,
+        )
+
+        try:
+            try:
+                ingress = await get_pipeline_ingress(record.id)
+                ingress.clear()
+                scan_jobs = get_scan_job_store(record.id)
+                scan_jobs.clear()
+            except Exception:
+                # Lightweight interface users may not initialize the API
+                # server's process-shared scheduler registries. Scheduler
+                # metadata is best-effort after durable deletion and must not
+                # strand the runtime between active workspaces.
+                pass
+        finally:
+            await finalize_pipeline_ingress(record.id)
+            finalize_scan_job_store(record.id)
+
+        if is_active:
+            await self.instance_init(deletion.active_workspace_id)
+        return RuntimeWorkspaceDeletion(
+            deleted_workspace_id=record.id,
+            active_workspace_id=deletion.active_workspace_id,
+            deleted_episode_count=len(cleanup.episode_backup_ids),
+            dropped_storage_count=len(cleanup.dropped_storages),
+        )
+
+    def _build_backend(self, layout: Any) -> BackendBundle:
+        engine = self.core_factory(layout.ragstore, layout.workspace_id)
+        sqlite = SQLiteBackend(layout.sqlite_path, layout.workspace_id)
+        adapter = MagiKnowledgeAdapter(sqlite)
+        engine_backend = EngineBackend(engine, layout, memory_adapter=adapter)
+        return BackendBundle(
+            engine=engine_backend,
+            sqlite=sqlite,
+            neo4j=Neo4jBackend(engine.chunk_entity_relation_graph),
+        )
 
     def _require_ready(self) -> None:
         self._require_loop()

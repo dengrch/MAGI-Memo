@@ -22,6 +22,7 @@ import sys
 
 from magi_core.constants import (
     DEFAULT_WOKERS,
+    DEFAULT_SERVER_PORT,
     DEFAULT_TIMEOUT,
     DEFAULT_TOP_K,
     DEFAULT_CHUNK_TOP_K,
@@ -335,8 +336,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--port",
         type=int,
-        default=get_env_value("PORT", 9621, int),
-        help="Server port (default: from env or 9621)",
+        default=get_env_value("PORT", DEFAULT_SERVER_PORT, int),
+        help=f"Server port (default: from env or {DEFAULT_SERVER_PORT})",
     )
 
     # Directory configuration

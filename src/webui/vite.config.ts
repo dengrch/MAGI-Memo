@@ -18,14 +18,13 @@ import { normalizeApiPrefix, normalizeWebuiPrefix } from './src/lib/pathPrefix'
  * always reads its prefix the same way, so behaviour matches between
  * `bun run dev` and a production deploy.
  *
- * Only `VITE_DEV_API_PREFIX` is read; the WebUI mount path is fixed at
- * `/webui` (matching the backend's hardcoded `WEBUI_PATH`), so the
- * injected `webuiPrefix` follows the production formula
- * `apiPrefix + "/webui/"` automatically.
+ * Only `VITE_DEV_API_PREFIX` is read. The WebUI is mounted at the site root,
+ * so the injected `webuiPrefix` is `/` without an API prefix and
+ * `apiPrefix + "/"` when simulating a reverse-proxied deployment.
  */
 function lightragRuntimeConfigPlugin(env: Record<string, string>): Plugin {
   const apiPrefix = normalizeApiPrefix(env.VITE_DEV_API_PREFIX)
-  const webuiPrefix = normalizeWebuiPrefix(apiPrefix ? `${apiPrefix}/webui/` : '')
+  const webuiPrefix = normalizeWebuiPrefix(apiPrefix)
   const payload = JSON.stringify({ apiPrefix, webuiPrefix }).replace(
     /<\//g,
     '<\\/'
@@ -61,10 +60,9 @@ export default defineConfig(({ mode }) => {
       dedupe: ['katex']
     },
     // Relative base: asset URLs in index.html become `./assets/...` so the
-    // built bundle works under any reverse-proxy mount point. The browser
-    // resolves them against the current document URL — which means the
-    // server MUST serve index.html at a URL ending in '/' (the existing
-    // /webui → /webui/ redirect already handles this).
+    // built bundle works under any reverse-proxy site root. The browser
+    // resolves them against the current document URL, which always ends in
+    // `/` for both the default root and a configured API prefix.
     base: './',
     build: {
       outDir: path.resolve(__dirname, '../magi_core/api/webui'),
@@ -83,18 +81,26 @@ export default defineConfig(({ mode }) => {
       }
     },
     server: {
+      // The integrated MAGI server owns 3491. Vite is only a hot-reload
+      // development surface and proxies API calls to that server.
+      port: 5173,
+      strictPort: true,
       proxy: env.VITE_API_PROXY === 'true' && env.VITE_API_ENDPOINTS ?
         Object.fromEntries(
           env.VITE_API_ENDPOINTS.split(',').map(endpoint => [
             devApiPrefix + endpoint,
             {
-              target: env.VITE_BACKEND_URL || 'http://localhost:9621',
+              target: env.VITE_BACKEND_URL || 'http://localhost:3491',
               changeOrigin: true
               // No rewrite: the backend already understands its own prefix
               // via FastAPI's root_path, so forward the path verbatim.
             }
           ])
         ) : {}
+    },
+    preview: {
+      port: 4173,
+      strictPort: true
     }
   }
 })

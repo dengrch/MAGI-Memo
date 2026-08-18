@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -67,6 +68,36 @@ class EngineBackend:
         if not self._initialized:
             raise RuntimeError("MAGI engine backend is not initialized")
 
+    async def wait_for_document(self, doc_id: str) -> dict[str, Any]:
+        """Wait until an admitted document reaches a durable terminal state."""
+
+        self._require_initialized()
+        llm_timeout = float(getattr(self.raw, "default_llm_timeout", 300) or 300)
+        deadline = asyncio.get_running_loop().time() + max(60.0, llm_timeout * 2)
+        strict_get = getattr(self.raw.doc_status, "get_by_id_strict", None)
+        get_by_id = strict_get if callable(strict_get) else self.raw.doc_status.get_by_id
+        last_status = "missing"
+        while True:
+            status_row = await get_by_id(doc_id)
+            status = status_row.get("status") if status_row else None
+            status_value = getattr(status, "value", status)
+            last_status = str(status_value or "missing")
+            if status_row is None:
+                # Enqueue admission persists doc_status before returning. A
+                # missing row therefore means rejection/dedup, not queued work.
+                raise RuntimeError(f"{doc_id}: missing")
+            if status_value == "processed":
+                return status_row
+            if status_value == "failed":
+                error = (status_row or {}).get("error_msg") or last_status
+                raise RuntimeError(f"{doc_id}: {error}")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for {doc_id!r} to finish; "
+                    f"last status: {last_status}"
+                )
+            await asyncio.sleep(0.05)
+
     async def index(self, episodes: Sequence[Episode]) -> str | None:
         self._require_initialized()
         if not episodes:
@@ -90,6 +121,10 @@ class EngineBackend:
                 error = (status_row or {}).get("error_msg") or status_value or "missing"
                 failures.append(f"{episode.id}: {error}")
         if failures:
+            if self.memory_adapter is not None:
+                self.memory_adapter.unregister_episodes(
+                    [episode.id for episode in episodes]
+                )
             raise RuntimeError(
                 "MAGI indexing did not reach the processed state: "
                 + "; ".join(failures)
@@ -97,7 +132,10 @@ class EngineBackend:
         return track_id
 
     async def ingest_extracted(
-        self, memories: Sequence[ExtractedMemory]
+        self,
+        memories: Sequence[ExtractedMemory],
+        *,
+        track_id: str | None = None,
     ) -> str | None:
         self._require_initialized()
         if not memories:
@@ -106,16 +144,24 @@ class EngineBackend:
             self.memory_adapter.register_episodes(
                 [memory.episode for memory in memories]
             )
-        track_id = await self.raw.aingest_extracted(list(memories))
+        if track_id is None:
+            track_id = await self.raw.aingest_extracted(list(memories))
+        else:
+            track_id = await self.raw.aingest_extracted(
+                list(memories),
+                track_id=track_id,
+            )
         failures: list[str] = []
         for memory in memories:
-            status_row = await self.raw.doc_status.get_by_id(memory.episode.id)
-            status = status_row.get("status") if status_row else None
-            status_value = getattr(status, "value", status)
-            if status_value != "processed":
-                error = (status_row or {}).get("error_msg") or status_value or "missing"
-                failures.append(f"{memory.episode.id}: {error}")
+            try:
+                await self.wait_for_document(memory.episode.id)
+            except RuntimeError as exc:
+                failures.append(str(exc))
         if failures:
+            if self.memory_adapter is not None:
+                self.memory_adapter.unregister_episodes(
+                    [memory.episode.id for memory in memories]
+                )
             raise RuntimeError(
                 "MAGI extracted-memory ingestion did not reach the processed "
                 "state: " + "; ".join(failures)

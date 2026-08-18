@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import unicodedata
 from uuid import uuid4
 from dataclasses import asdict, dataclass
@@ -27,6 +28,12 @@ class WorkspaceRecord:
     @property
     def path(self) -> Path:
         return Path(self.root)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceDeletion:
+    deleted: WorkspaceRecord
+    active_workspace_id: str
 
 
 class WorkspaceManager:
@@ -123,6 +130,68 @@ class WorkspaceManager:
                 return records[key]
             except KeyError as exc:
                 raise KeyError(f"unknown MAGI workspace {key!r}") from exc
+
+    def delete_capability(self, workspace_id: str) -> tuple[bool, str | None]:
+        """Return whether a registry-owned workspace can be deleted safely."""
+
+        with self._lock:
+            self.initialize()
+            key = self._validate_id(workspace_id)
+            _, records, _ = self._read_registry()
+            try:
+                record = records[key]
+            except KeyError as exc:
+                raise KeyError(f"unknown MAGI workspace {key!r}") from exc
+            if key == self.default_workspace_id:
+                return False, "The default workspace cannot be deleted"
+            expected = (self.home / "workspaces" / key).resolve()
+            if record.path.resolve() != expected:
+                return False, "Externally managed workspace roots cannot be deleted"
+            if len(records) <= 1:
+                return False, "At least one workspace must remain"
+            return True, None
+
+    def delete(self, workspace_id: str) -> WorkspaceDeletion:
+        """Remove one managed workspace registry entry and its local files.
+
+        Durable backend records must already have been cleared by the runtime.
+        The directory is renamed before the registry commit so registry-write
+        failures can restore it without exposing a half-deleted workspace.
+        """
+
+        with self._lock:
+            self.initialize()
+            key = self._validate_id(workspace_id)
+            active, records, _ = self._read_registry()
+            allowed, reason = self.delete_capability(key)
+            if not allowed:
+                raise ValueError(reason or f"workspace {key!r} cannot be deleted")
+            record = records[key]
+            remaining = {item_id: item for item_id, item in records.items() if item_id != key}
+            if active == key:
+                replacement = (
+                    self.default_workspace_id
+                    if self.default_workspace_id in remaining
+                    else sorted(remaining)[0]
+                )
+            else:
+                replacement = active
+            if replacement is None or replacement not in remaining:
+                raise RuntimeError("workspace registry has no valid active replacement")
+
+            target = record.path.resolve()
+            tombstone = target.with_name(f".deleting-{key}-{uuid4().hex}")
+            if target.exists():
+                target.replace(tombstone)
+            try:
+                self._write(remaining, active_workspace_id=replacement)
+            except BaseException:
+                if tombstone.exists():
+                    tombstone.replace(target)
+                raise
+            if tombstone.exists():
+                shutil.rmtree(tombstone)
+            return WorkspaceDeletion(record, replacement)
 
     def create(
         self,

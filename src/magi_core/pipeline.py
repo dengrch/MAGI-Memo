@@ -5919,6 +5919,31 @@ class _PipelineMixin:
         p = Path(file_path)
         name = p.name
         source_name = Path(str(source_file or "").strip()).name
+
+        # A runtime-managed workspace owns a self-contained layout:
+        # ``<root>/{inputs,ragstore}``.  Derive the input directory from this
+        # core instance instead of relying only on the process-wide INPUT_DIR,
+        # which still points at the bootstrap workspace after a live switch.
+        # Keep the nested workspace candidate for uploads written by versions
+        # that accidentally appended the workspace id twice.
+        working_dir = str(getattr(self, "working_dir", "") or "").strip()
+        if working_dir:
+            workspace_input_path = (
+                Path(working_dir).expanduser().resolve().parent / "inputs"
+            )
+            candidates.append(workspace_input_path / name)
+            candidates.append(workspace_input_path / PARSED_DIR_NAME / name)
+            roots.append(workspace_input_path)
+            roots.append(workspace_input_path / PARSED_DIR_NAME)
+            workspace = getattr(self, "workspace", "") or ""
+            if workspace:
+                candidates.append(workspace_input_path / workspace / name)
+                candidates.append(
+                    workspace_input_path / workspace / PARSED_DIR_NAME / name
+                )
+                roots.append(workspace_input_path / workspace)
+                roots.append(workspace_input_path / workspace / PARSED_DIR_NAME)
+
         input_path = input_dir_path()
         # API ``DocumentManager`` scopes its input dir to
         # ``<base_input_dir>/<workspace>/`` (see DocumentManager.__init__);

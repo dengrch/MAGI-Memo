@@ -3091,6 +3091,46 @@ def test_parser_source_resolver_prefers_exact_canonical_file(tmp_path, monkeypat
 
 
 @pytest.mark.offline
+def test_parser_source_resolver_uses_runtime_workspace_input_dir(
+    tmp_path, monkeypatch
+):
+    bootstrap_input = tmp_path / "bootstrap" / "inputs"
+    bootstrap_input.mkdir(parents=True)
+    monkeypatch.setenv("INPUT_DIR", str(bootstrap_input))
+
+    workspace_root = tmp_path / "workspaces" / "space1"
+    workspace_input = workspace_root / "inputs"
+    workspace_input.mkdir(parents=True)
+    source = workspace_input / "demo.txt"
+    source.write_text("workspace payload", encoding="utf-8")
+    rag = _new_rag(workspace_root / "ragstore")
+
+    resolved = rag._resolve_source_file_for_parser("demo.txt")
+
+    assert Path(resolved) == source
+
+
+@pytest.mark.offline
+def test_parser_source_resolver_recovers_double_nested_workspace_upload(
+    tmp_path, monkeypatch
+):
+    bootstrap_input = tmp_path / "bootstrap" / "inputs"
+    bootstrap_input.mkdir(parents=True)
+    monkeypatch.setenv("INPUT_DIR", str(bootstrap_input))
+
+    workspace_root = tmp_path / "workspaces" / "space1"
+    rag = _new_rag(workspace_root / "ragstore")
+    misplaced_input = workspace_root / "inputs" / rag.workspace
+    misplaced_input.mkdir(parents=True)
+    source = misplaced_input / "demo.txt"
+    source.write_text("recoverable payload", encoding="utf-8")
+
+    resolved = rag._resolve_source_file_for_parser("demo.txt")
+
+    assert Path(resolved) == source
+
+
+@pytest.mark.offline
 def test_parse_mineru_to_lightrag_document(tmp_path, monkeypatch):
     """End-to-end: parse_mineru routes through MinerURawClient + sidecar
     writer and produces spec-compliant *.parsed/ + *.mineru_raw/ artifacts.

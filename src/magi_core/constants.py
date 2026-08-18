@@ -10,6 +10,7 @@ from typing import Literal, TypeAlias
 
 # Default values for server settings
 DEFAULT_WOKERS = 2
+DEFAULT_SERVER_PORT = 3491
 DEFAULT_MAX_GRAPH_NODES = 1000
 
 # Default values for extraction settings

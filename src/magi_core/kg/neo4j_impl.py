@@ -1977,7 +1977,13 @@ class Neo4JStorage(BaseGraphStorage):
                 logger.debug(
                     f"[{self.workspace}] Full-text search ({'Chinese' if is_chinese else 'Latin'}) for '{query}' returned {len(labels)} results (limit: {limit})"
                 )
-                return labels
+                if labels:
+                    return labels
+                # Neo4j full-text indexes are eventually consistent. A node
+                # written immediately before this query can therefore produce
+                # a successful but empty result. Route that case through the
+                # same deterministic CONTAINS fallback used for index errors.
+                raise LookupError("full-text search returned no labels")
 
         except Exception as e:
             # If the full-text search fails, fall back to CONTAINS search

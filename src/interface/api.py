@@ -58,11 +58,14 @@ class MagiHandle:
         return await self._api.ingest_file(self, path, episode_id=episode_id)
 
     async def ingest_extracted(
-        self, memories: ExtractedMemory | Sequence[ExtractedMemory]
+        self,
+        memories: ExtractedMemory | Sequence[ExtractedMemory],
+        *,
+        track_id: str | None = None,
     ) -> IndexResult:
         """Ingest already-extracted knowledge after the first LLM stage."""
 
-        return await self._api.ingest_extracted(self, memories)
+        return await self._api.ingest_extracted(self, memories, track_id=track_id)
 
     async def search(
         self, text: str, *, mode: str = "mix", **query_options: Any
@@ -238,6 +241,16 @@ class MagiAPI:
             label=normalized_name,
         )
 
+    async def delete_workspace(
+        self,
+        workspace_id: str,
+        *,
+        timeout: float | None = None,
+    ):
+        """Delete a managed workspace and all of its workspace-scoped data."""
+
+        return await self.runtime.delete_workspace(workspace_id, timeout=timeout)
+
     async def ingest(
         self,
         handle: MagiHandle,
@@ -265,6 +278,8 @@ class MagiAPI:
         self,
         handle: MagiHandle,
         memories: ExtractedMemory | Sequence[ExtractedMemory],
+        *,
+        track_id: str | None = None,
     ) -> IndexResult:
         normalized = (
             [memories] if isinstance(memories, ExtractedMemory) else list(memories)
@@ -272,7 +287,9 @@ class MagiAPI:
         if not normalized:
             raise ValueError("at least one extracted memory input is required")
         async with self._use(handle) as backend:
-            return await backend.ingest_extracted(normalized)
+            if track_id is None:
+                return await backend.ingest_extracted(normalized)
+            return await backend.ingest_extracted(normalized, track_id=track_id)
 
     async def search(
         self,

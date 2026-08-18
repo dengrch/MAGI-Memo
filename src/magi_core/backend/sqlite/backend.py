@@ -8,7 +8,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,12 @@ import numpy as np
 
 from uuid import uuid4
 
-from magi_core.backend.sqlite.migrations import MIGRATION_1, MIGRATION_2, MIGRATION_3
+from magi_core.backend.sqlite.migrations import (
+    MIGRATION_1,
+    MIGRATION_2,
+    MIGRATION_3,
+    MIGRATION_4,
+)
 from magi_core.memory import (
     AtomEvidence,
     AtomMemory,
@@ -152,6 +157,38 @@ class SQLiteBackend:
                 "VALUES (?, ?)",
                 (3, _utc_now()),
             )
+            self._ensure_column(connection, "projection_outbox", "owner_id", "TEXT")
+            self._ensure_column(
+                connection, "projection_outbox", "owner_kind", "TEXT"
+            )
+            self._ensure_column(
+                connection,
+                "projection_outbox",
+                "owner_snapshot_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            self._ensure_column(
+                connection, "projection_outbox", "updated_at", "TEXT"
+            )
+            self._ensure_column(
+                connection, "projection_outbox", "next_attempt_at", "TEXT"
+            )
+            # Builds before schema v4 never produced actionable owner tasks.
+            # Discard any legacy aggregate rows rather than pretending they
+            # can be replayed without an owner locator.
+            connection.execute(
+                "DELETE FROM projection_outbox WHERE owner_id IS NULL"
+            )
+            connection.execute(
+                "UPDATE projection_outbox SET updated_at = created_at "
+                "WHERE updated_at IS NULL"
+            )
+            connection.executescript(MIGRATION_4)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
+                (4, _utc_now()),
+            )
             self._prune_orphan_projection_owners(connection)
 
     def _prune_orphan_projection_owners(self, connection: sqlite3.Connection) -> None:
@@ -238,6 +275,261 @@ class SQLiteBackend:
         if not self._initialized:
             raise RuntimeError("SQLite backend is not initialized")
 
+    @staticmethod
+    def _projection_operation_id(workspace_id: str, owner_id: str) -> str:
+        digest = hashlib.sha256(
+            f"{workspace_id}\x1f{owner_id}".encode("utf-8")
+        ).hexdigest()
+        return f"projection-{digest}"
+
+    def _owner_snapshot_sync(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        """Capture only the graph locator needed if the owner is later deleted."""
+
+        if owner_id.startswith("relation-"):
+            row = connection.execute(
+                "SELECT entity_a_name, entity_b_name FROM relation_registry "
+                "WHERE workspace_id = ? AND relation_id = ?",
+                (self.workspace_id, owner_id),
+            ).fetchone()
+            snapshot: dict[str, Any] = {"owner_kind": "relation"}
+            if row is not None:
+                source, target = sorted(
+                    (str(row["entity_a_name"]), str(row["entity_b_name"]))
+                )
+                snapshot.update({"source": source, "target": target})
+            return snapshot
+
+        row = connection.execute(
+            "SELECT canonical_name FROM entity_registry "
+            "WHERE workspace_id = ? AND entity_id = ?",
+            (self.workspace_id, owner_id),
+        ).fetchone()
+        snapshot = {"owner_kind": "entity"}
+        if row is not None:
+            snapshot["canonical_name"] = str(row["canonical_name"])
+        return snapshot
+
+    def _queue_owner_projection_sync(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: str,
+        *,
+        episode_id: str | None = None,
+        snapshot: dict[str, Any] | None = None,
+    ) -> int:
+        """Mark an owner dirty inside the caller's SQLite transaction."""
+
+        now = _utc_now()
+        current_snapshot = snapshot or self._owner_snapshot_sync(connection, owner_id)
+        if len(current_snapshot) == 1:
+            existing = connection.execute(
+                "SELECT owner_snapshot_json FROM projection_outbox "
+                "WHERE operation_id = ?",
+                (self._projection_operation_id(self.workspace_id, owner_id),),
+            ).fetchone()
+            if existing is not None:
+                previous_snapshot = json.loads(
+                    existing["owner_snapshot_json"] or "{}"
+                )
+                if len(previous_snapshot) > len(current_snapshot):
+                    current_snapshot = previous_snapshot
+        owner_kind = str(
+            current_snapshot.get("owner_kind")
+            or ("relation" if owner_id.startswith("relation-") else "entity")
+        )
+        operation_id = self._projection_operation_id(self.workspace_id, owner_id)
+        connection.execute(
+            """
+            INSERT INTO projection_outbox(
+                operation_id, workspace_id, episode_id, owner_ids_json,
+                target_revision, status, attempts, last_error, created_at,
+                applied_at, owner_id, owner_kind, owner_snapshot_json,
+                updated_at, next_attempt_at
+            ) VALUES (?, ?, ?, ?, 1, 'pending', 0, NULL, ?, NULL, ?, ?, ?, ?, NULL)
+            ON CONFLICT(operation_id) DO UPDATE SET
+                episode_id = COALESCE(excluded.episode_id, projection_outbox.episode_id),
+                owner_ids_json = excluded.owner_ids_json,
+                target_revision = projection_outbox.target_revision + 1,
+                status = 'pending',
+                attempts = 0,
+                last_error = NULL,
+                applied_at = NULL,
+                owner_id = excluded.owner_id,
+                owner_kind = excluded.owner_kind,
+                owner_snapshot_json = excluded.owner_snapshot_json,
+                updated_at = excluded.updated_at,
+                next_attempt_at = NULL
+            """,
+            (
+                operation_id,
+                self.workspace_id,
+                episode_id,
+                json.dumps([owner_id], ensure_ascii=False),
+                now,
+                owner_id,
+                owner_kind,
+                json.dumps(current_snapshot, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        row = connection.execute(
+            "SELECT target_revision FROM projection_outbox "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"failed to queue projection for {owner_id!r}")
+        return int(row["target_revision"])
+
+    async def queue_owner_projection(
+        self,
+        owner_id: str,
+        *,
+        episode_id: str | None = None,
+    ) -> int:
+        self._require_initialized()
+
+        def queue() -> int:
+            with self._connect() as connection:
+                return self._queue_owner_projection_sync(
+                    connection, owner_id, episode_id=episode_id
+                )
+
+        return await asyncio.to_thread(queue)
+
+    async def list_projection_tasks(
+        self,
+        *,
+        owner_ids: list[str] | tuple[str, ...] | None = None,
+        ready_only: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._list_projection_tasks_sync,
+            owner_ids,
+            ready_only,
+            limit,
+        )
+
+    def _list_projection_tasks_sync(
+        self,
+        owner_ids: list[str] | tuple[str, ...] | None,
+        ready_only: bool,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses = ["workspace_id = ?", "status IN ('pending', 'failed')"]
+        params: list[Any] = [self.workspace_id]
+        if owner_ids is not None:
+            if not owner_ids:
+                return []
+            placeholders = ",".join("?" for _ in owner_ids)
+            clauses.append(f"owner_id IN ({placeholders})")
+            params.extend(owner_ids)
+        if ready_only:
+            clauses.append("(next_attempt_at IS NULL OR next_attempt_at <= ?)")
+            params.append(_utc_now())
+        params.append(max(1, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM projection_outbox WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY CASE owner_kind WHEN 'entity' THEN 0 ELSE 1 END, "
+                "updated_at, operation_id LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        tasks = []
+        for row in rows:
+            item = dict(row)
+            item["owner_snapshot"] = json.loads(
+                item.pop("owner_snapshot_json") or "{}"
+            )
+            tasks.append(item)
+        return tasks
+
+    async def mark_projection_applied(
+        self,
+        owner_id: str,
+        target_revision: int,
+    ) -> bool:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._mark_projection_applied_sync, owner_id, target_revision
+        )
+
+    def _mark_projection_applied_sync(
+        self,
+        owner_id: str,
+        target_revision: int,
+    ) -> bool:
+        now = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE projection_outbox
+                SET status = 'applied', applied_at = ?, updated_at = ?,
+                    last_error = NULL, next_attempt_at = NULL
+                WHERE workspace_id = ? AND owner_id = ?
+                  AND target_revision = ? AND status IN ('pending', 'failed')
+                """,
+                (now, now, self.workspace_id, owner_id, target_revision),
+            )
+        return cursor.rowcount == 1
+
+    async def mark_projection_failed(
+        self,
+        owner_id: str,
+        target_revision: int,
+        error: str,
+    ) -> bool:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._mark_projection_failed_sync,
+            owner_id,
+            target_revision,
+            error,
+        )
+
+    def _mark_projection_failed_sync(
+        self,
+        owner_id: str,
+        target_revision: int,
+        error: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM projection_outbox WHERE workspace_id = ? "
+                "AND owner_id = ? AND target_revision = ?",
+                (self.workspace_id, owner_id, target_revision),
+            ).fetchone()
+            if row is None:
+                return False
+            attempts = int(row["attempts"]) + 1
+            now = datetime.now(timezone.utc)
+            retry_at = now + timedelta(seconds=min(60, 2 ** min(attempts, 6)))
+            cursor = connection.execute(
+                """
+                UPDATE projection_outbox
+                SET status = 'failed', attempts = ?, last_error = ?,
+                    updated_at = ?, next_attempt_at = ?
+                WHERE workspace_id = ? AND owner_id = ? AND target_revision = ?
+                """,
+                (
+                    attempts,
+                    str(error)[:4000],
+                    now.isoformat(),
+                    retry_at.isoformat(),
+                    self.workspace_id,
+                    owner_id,
+                    target_revision,
+                ),
+            )
+        return cursor.rowcount == 1
+
     async def get_episode(self, episode_id: str) -> dict[str, Any] | None:
         self._require_initialized()
         return await asyncio.to_thread(self._get_episode_sync, episode_id)
@@ -247,6 +539,38 @@ class SQLiteBackend:
             row = connection.execute(
                 "SELECT * FROM episodes WHERE episode_id = ? AND workspace_id = ?",
                 (episode_id, self.workspace_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def get_episode_by_content_hash(
+        self, content_hash: str
+    ) -> dict[str, Any] | None:
+        """Resolve the canonical Episode already admitted for this content."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._get_episode_by_content_hash_sync, content_hash
+        )
+
+    def _get_episode_by_content_hash_sync(
+        self, content_hash: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM episodes
+                WHERE workspace_id = ? AND content_hash = ?
+                ORDER BY
+                    CASE status
+                        WHEN 'indexed' THEN 0
+                        WHEN 'processing' THEN 1
+                        WHEN 'pending' THEN 2
+                        ELSE 3
+                    END,
+                    created_at ASC
+                LIMIT 1
+                """,
+                (self.workspace_id, content_hash),
             ).fetchone()
         return dict(row) if row is not None else None
 
@@ -748,6 +1072,11 @@ class SQLiteBackend:
             row = connection.execute(
                 "SELECT * FROM atoms WHERE atom_id = ?", (atom_id,)
             ).fetchone()
+            self._queue_owner_projection_sync(
+                connection,
+                atom.owner_id,
+                episode_id=evidence.episode_id,
+            )
         if row is None:
             raise RuntimeError(f"failed to persist atom {atom_id!r}")
         return self._atom_from_row(row), inserted
@@ -804,6 +1133,12 @@ class SQLiteBackend:
                 "SELECT * FROM atoms WHERE atom_id = ? AND workspace_id = ?",
                 (atom_id, self.workspace_id),
             ).fetchone()
+            if row is not None:
+                self._queue_owner_projection_sync(
+                    connection,
+                    str(row["owner_id"]),
+                    episode_id=evidence.episode_id,
+                )
         if row is None:
             raise KeyError(f"unknown atom {atom_id!r}")
         return self._atom_from_row(row)
@@ -912,6 +1247,81 @@ class SQLiteBackend:
         value = row["summary_cited"]
         return str(value) if value else None
 
+    async def get_owner_provenance(self, owner_id: str) -> dict[str, list[str]]:
+        """Return stable source ids and file paths for graph materialization."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(self._get_owner_provenance_sync, owner_id)
+
+    def _get_owner_provenance_sync(self, owner_id: str) -> dict[str, list[str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ae.extraction_revision, ae.episode_id, e.source_uri
+                FROM atoms a
+                JOIN atom_evidence ae ON ae.atom_id = a.atom_id
+                JOIN episodes e ON e.episode_id = ae.episode_id
+                WHERE a.workspace_id = ? AND a.owner_id = ?
+                ORDER BY ae.created_at, ae.episode_id
+                """,
+                (self.workspace_id, owner_id),
+            ).fetchall()
+        source_ids = list(
+            dict.fromkeys(
+                str(row["extraction_revision"] or row["episode_id"])
+                for row in rows
+            )
+        )
+        file_paths = list(
+            dict.fromkeys(
+                str(row["source_uri"] or f"episode://{row['episode_id']}")
+                for row in rows
+            )
+        )
+        return {"source_ids": source_ids, "file_paths": file_paths}
+
+    async def set_owner_materialization(
+        self,
+        owner_id: str,
+        *,
+        atom_ids: list[str],
+        summary_cited: str,
+    ) -> None:
+        """Persist the last successfully projected owner representation."""
+
+        self._require_initialized()
+        await asyncio.to_thread(
+            self._set_owner_materialization_sync,
+            owner_id,
+            atom_ids,
+            summary_cited,
+        )
+
+    def _set_owner_materialization_sync(
+        self,
+        owner_id: str,
+        atom_ids: list[str],
+        summary_cited: str,
+    ) -> None:
+        table, id_column = (
+            ("relation_registry", "relation_id")
+            if owner_id.startswith("relation-")
+            else ("entity_registry", "entity_id")
+        )
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE {table} SET atom_ids_json = ?, summary_cited = ?, "
+                "summary_embedding_text = ? WHERE workspace_id = ? "
+                f"AND {id_column} = ?",
+                (
+                    json.dumps(atom_ids, ensure_ascii=False),
+                    summary_cited,
+                    summary_cited,
+                    self.workspace_id,
+                    owner_id,
+                ),
+            )
+
     @staticmethod
     def _atom_from_row(row: sqlite3.Row) -> AtomRecord:
         return AtomRecord(
@@ -940,6 +1350,12 @@ class SQLiteBackend:
 
     def _expire_atom_sync(self, atom_id: str, expired_at: datetime) -> None:
         with self._connect() as connection:
+            row = connection.execute(
+                "SELECT owner_id FROM atoms WHERE atom_id = ? AND workspace_id = ?",
+                (atom_id, self.workspace_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown atom {atom_id!r}")
             cursor = connection.execute(
                 "UPDATE atoms SET expired_at = ?, updated_at = ? "
                 "WHERE atom_id = ? AND workspace_id = ?",
@@ -952,6 +1368,7 @@ class SQLiteBackend:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown atom {atom_id!r}")
+            self._queue_owner_projection_sync(connection, str(row["owner_id"]))
 
     async def set_atom_invalid_at(self, atom_id: str, *, invalid_at: datetime) -> None:
         self._require_initialized()
@@ -979,6 +1396,7 @@ class SQLiteBackend:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown atom {atom_id!r}")
+            self._queue_owner_projection_sync(connection, str(row["owner_id"]))
 
     async def recent_episode_context(self, *, limit: int = 4) -> list[dict[str, Any]]:
         self._require_initialized()
@@ -1371,6 +1789,15 @@ class SQLiteBackend:
                     entity_ids.update(
                         (relation["entity_a_id"], relation["entity_b_id"])
                     )
+            projection_owner_ids = list(
+                dict.fromkeys(
+                    (*affected_owner_ids, *relation_ids, *sorted(entity_ids))
+                )
+            )
+            owner_snapshots = {
+                owner_id: self._owner_snapshot_sync(connection, owner_id)
+                for owner_id in projection_owner_ids
+            }
             entity_rows = []
             alias_rows = []
             entity_embedding_rows: list[dict[str, Any]] = []
@@ -1576,11 +2003,20 @@ class SQLiteBackend:
                     _utc_now(),
                 ),
             )
+            # Keep dirty owner markers after the Episode row is removed.  The
+            # outbox owns only an optional diagnostic Episode reference, so
+            # clear that foreign key before deleting the Episode itself.
             connection.execute(
-                "DELETE FROM projection_outbox "
+                "UPDATE projection_outbox SET episode_id = NULL "
                 "WHERE workspace_id = ? AND episode_id = ?",
                 (self.workspace_id, episode_id),
             )
+            for owner_id in projection_owner_ids:
+                self._queue_owner_projection_sync(
+                    connection,
+                    owner_id,
+                    snapshot=owner_snapshots[owner_id],
+                )
             connection.execute(
                 "DELETE FROM episodes WHERE episode_id = ? AND workspace_id = ?",
                 (episode_id, self.workspace_id),
@@ -1588,7 +2024,7 @@ class SQLiteBackend:
         return {
             "backup_id": backup_id,
             "episode_id": episode_id,
-            "affected_owner_ids": affected_owner_ids,
+            "affected_owner_ids": projection_owner_ids,
             "removed_atom_ids": orphan_atom_ids,
         }
 
@@ -1605,10 +2041,6 @@ class SQLiteBackend:
 
     def _clear_registry_sync(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM projection_outbox WHERE workspace_id = ?",
-                (self.workspace_id,),
-            )
             connection.execute(
                 "DELETE FROM memory_embeddings WHERE workspace_id = ?",
                 (self.workspace_id,),
@@ -1713,6 +2145,26 @@ class SQLiteBackend:
                     """,
                     (atom_id, _utc_now(), atom_id),
                 )
+            affected_owner_ids = {
+                str(row["owner_id"])
+                for atom_id in affected_atom_ids
+                if (
+                    row := connection.execute(
+                        "SELECT owner_id FROM atoms WHERE workspace_id = ? "
+                        "AND atom_id = ?",
+                        (self.workspace_id, atom_id),
+                    ).fetchone()
+                )
+                is not None
+            }
+            affected_owner_ids.update(
+                str(row["entity_id"]) for row in payload.get("entities", [])
+            )
+            affected_owner_ids.update(
+                str(row["relation_id"]) for row in payload.get("relations", [])
+            )
+            for owner_id in sorted(affected_owner_ids):
+                self._queue_owner_projection_sync(connection, owner_id)
             connection.execute(
                 "UPDATE memory_deletion_backups SET restored_at = ? "
                 "WHERE backup_id = ?",

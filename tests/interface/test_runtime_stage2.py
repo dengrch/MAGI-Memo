@@ -18,6 +18,7 @@ from interface import (
     ExtractedRelation,
     MagiAPI,
 )
+from magi_core.workspace_cleanup import WorkspaceCleanupResult
 
 
 class Neo4JStorage:
@@ -46,6 +47,7 @@ class FakeEngine:
         self.query_started = asyncio.Event()
         self.query_release = asyncio.Event()
         self.extracted: list[ExtractedMemory] = []
+        self.accept_extracted = True
         self.finalized = False
 
     def register_knowledge_ingestion_adapter(self, adapter: Any) -> None:
@@ -67,16 +69,37 @@ class FakeEngine:
         ids: list[str],
         file_paths: list[str],
     ) -> str:
-        for doc_id in ids:
+        for text, doc_id, file_path in zip(content, ids, file_paths, strict=True):
+            await self.knowledge_adapter.prepare_episode(
+                doc_id=doc_id,
+                content=text,
+                file_path=file_path,
+            )
             self.doc_status.rows[doc_id] = {"status": "processed"}
+            await self.knowledge_adapter.complete_episode(
+                doc_id,
+                track_id="track-raw",
+            )
         return "track-raw"
 
     async def aingest_extracted(
         self, memories: list[ExtractedMemory]
     ) -> str:
         self.extracted.extend(memories)
+        if not self.accept_extracted:
+            return "track-rejected"
         for memory in memories:
+            await self.knowledge_adapter.prepare_episode(
+                doc_id=memory.episode.id,
+                content=memory.episode.content,
+                file_path=f"episode-{memory.episode.id}.txt",
+                reference_at=memory.episode.effective_reference_at.isoformat(),
+            )
             self.doc_status.rows[memory.episode.id] = {"status": "processed"}
+            await self.knowledge_adapter.complete_episode(
+                memory.episode.id,
+                track_id="track-extracted",
+            )
         return "track-extracted"
 
     async def aquery(self, text: str, *, param: Any) -> str:
@@ -86,6 +109,17 @@ class FakeEngine:
 
     async def get_processing_status(self) -> dict[str, int]:
         return {"processed": len(self.doc_status.rows)}
+
+    async def aclear_workspace_data(
+        self, *, reinitialize_doc_status: bool = False
+    ) -> WorkspaceCleanupResult:
+        del reinitialize_doc_status
+        self.doc_status.rows.clear()
+        return WorkspaceCleanupResult(
+            episode_backup_ids=(f"episode-{self.workspace}",),
+            dropped_storages=(f"FakeStorage:{self.workspace}",),
+            errors=(),
+        )
 
 
 @pytest.mark.asyncio
@@ -198,6 +232,38 @@ def test_workspace_id_is_generated_from_label_and_deduplicated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_inactive_workspace_keeps_active_runtime_ready() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "mgc-test"
+        engines: list[FakeEngine] = []
+
+        def factory(ragstore: Path, workspace: str) -> FakeEngine:
+            engine = FakeEngine(ragstore, workspace)
+            engines.append(engine)
+            return engine
+
+        api = MagiAPI.build(
+            workspace=root,
+            workspace_id="default",
+            core_factory=factory,
+        )
+        await api.init()
+        record = api.create_workspace("Research", workspace_id="research")
+
+        result = await api.delete_workspace("research")
+
+        assert result.deleted_workspace_id == "research"
+        assert result.active_workspace_id == "default"
+        assert result.deleted_episode_count == 1
+        assert result.dropped_storage_count == 1
+        assert api.runtime.active_workspace_id == "default"
+        assert not record.path.exists()
+        assert engines[-1].workspace == "research"
+        assert engines[-1].finalized
+        await api.finalize()
+
+
+@pytest.mark.asyncio
 async def test_extracted_ingest_skips_engine_extraction_entrypoint() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary) / "mgc-test"
@@ -250,5 +316,47 @@ async def test_extracted_ingest_skips_engine_extraction_entrypoint() -> None:
         stored = await api.runtime.backend.sqlite.get_episode(memory.episode.id)
         assert stored is not None
         assert stored["content"] == episode.content
+        await handle.close()
+        await api.finalize()
+
+
+@pytest.mark.asyncio
+async def test_rejected_extracted_ingest_does_not_leave_orphan_episode() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "mgc-test"
+        engines: list[FakeEngine] = []
+
+        def factory(ragstore: Path, workspace: str) -> FakeEngine:
+            engine = FakeEngine(ragstore, workspace)
+            engine.accept_extracted = False
+            engines.append(engine)
+            return engine
+
+        api = MagiAPI.build(
+            workspace=root,
+            workspace_id="default",
+            core_factory=factory,
+        )
+        await api.init()
+        handle = await api.open(owner="agent")
+        episode = Episode(content="Alice prefers concise status reports.")
+        memory = ExtractedMemory.create(
+            episode=episode,
+            entities=(
+                ExtractedEntity(
+                    "Alice",
+                    (ExtractedAtom("Alice prefers concise status reports."),),
+                ),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match=f"{episode.id}: missing"):
+            await handle.ingest_extracted(memory)
+
+        assert await api.runtime.backend.sqlite.get_episode(episode.id) is None
+        assert (
+            api.runtime.backend.engine.memory_adapter.get_extraction_context(episode.id)
+            == {}
+        )
         await handle.close()
         await api.finalize()

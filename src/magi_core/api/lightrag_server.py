@@ -38,6 +38,7 @@ from magi_core.api.utils_api import (
     internal_server_error,
 )
 from magi_core.api.admission_middleware import AdmissionMiddleware
+from magi_core.api.background_memory import start_managed_extracted_ingest
 from .config import (
     global_args,
     update_uvicorn_mode_config,
@@ -45,7 +46,7 @@ from .config import (
     resolve_asymmetric_embedding_opt_in,
     PREFIX_ASYMMETRIC_EMBEDDING_BINDINGS,
 )
-from magi_core.utils import get_env_value
+from magi_core.utils import generate_track_id, get_env_value
 from magi_core import LightRAG, MagiCore, ROLES, RoleLLMConfig, __version__ as core_version
 from interface import (
     Episode,
@@ -154,7 +155,6 @@ class ExtractedRelationRequest(BaseModel):
 
 
 class ExtractedIngestRequest(BaseModel):
-    episode_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     kind: EpisodeKind = EpisodeKind.CONVERSATION
     reference_at: datetime | None = None
@@ -162,6 +162,7 @@ class ExtractedIngestRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     entities: list[ExtractedEntityRequest] = Field(min_length=1)
     relations: list[ExtractedRelationRequest] = Field(default_factory=list)
+    wait_for_completion: bool = True
 
 
 def _inject_swagger_theme(html: str, theme: str) -> str:
@@ -456,13 +457,11 @@ def _inject_swagger_theme(html: str, theme: str) -> str:
     return html.replace(needle, f"{theme_snippet}\n{needle}", 1)
 
 
-# Fixed WebUI mount path. Used as `app.mount(WEBUI_PATH, ...)` and as the
-# in-app component of `webuiPrefix` injected into window.__LIGHTRAG_CONFIG__
-# (which the browser sees as `LIGHTRAG_API_PREFIX + WEBUI_PATH + "/"`).
-# Not user-configurable: a single mount path simplifies the operator surface
-# and matches how LightRAG is deployed in practice. See
-# docs/MultiSiteDeployment.md.
-WEBUI_PATH = "/webui"
+# The WebUI owns the site root. API, docs, auth, and static Swagger routes are
+# registered before this catch-all mount, so they keep their natural paths.
+# With LIGHTRAG_API_PREFIX configured, FastAPI exposes the same root mount at
+# `<api-prefix>/` through ASGI root_path handling.
+WEBUI_PATH = "/"
 
 
 def _normalize_api_prefix(value: str | None) -> str:
@@ -487,14 +486,10 @@ class _RootPathNormalizationMiddleware:
     """Make Mount sub-apps work when the reverse proxy strips the API prefix.
 
     When ``LIGHTRAG_API_PREFIX=/site01`` and nginx strips ``/site01`` before
-    forwarding, the backend sees ``scope["path"]="/webui/"`` while FastAPI's
+    forwarding, the backend sees ``scope["path"]="/"`` while FastAPI's
     ``__call__`` sets ``scope["root_path"]="/site01"``. Starlette's outer
-    Mount.matches still hits via ``get_route_path`` 's fallback branch (path
-    not starting with root_path is returned unchanged), but it mutates the
-    child scope to ``root_path="/site01/webui"`` without touching
-    ``scope["path"]``. The inner ``StaticFiles.get_path`` then sees a
-    non-overlapping pair and falls through to a literal ``webui`` filename
-    lookup → 404 on the actual file system.
+    Mount and the inner ``StaticFiles`` app then receive path/root-path values
+    that do not overlap and can resolve the wrong file-system path.
 
     Prepending ``root_path`` to a non-prefixed ``scope["path"]`` restores the
     canonical ASGI form (path always contains root_path), matching what a
@@ -1426,6 +1421,7 @@ def create_app(args):
             doc_manager_holder["value"] = DocumentManager(
                 str(active_input_dir),
                 workspace=active_workspace,
+                input_dir_is_workspace_root=True,
             )
             app.state.magi_memory_db = memory_db
             app.state.magi_core_api = core_api
@@ -1490,8 +1486,7 @@ def create_app(args):
         + "\n\n[View ReDoc documentation](/redoc)"
     )
 
-    # The WebUI mount path is fixed at "/webui" — see
-    # docs/MultiSiteDeployment.md for the rationale.
+    # The WebUI is the site-root catch-all. API routes are registered first.
     api_prefix = _normalize_api_prefix(getattr(args, "api_prefix", None))
     webui_path = WEBUI_PATH
 
@@ -2440,6 +2435,7 @@ def create_app(args):
                     "id": item.id,
                     "name": item.label or item.id,
                     "active": item.id == active,
+                    "deletable": workspace_manager.delete_capability(item.id)[0],
                 }
                 for item in core_api.list_workspaces()
             ],
@@ -2458,7 +2454,12 @@ def create_app(args):
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"id": item.id, "name": item.label or item.id, "active": False}
+        return {
+            "id": item.id,
+            "name": item.label or item.id,
+            "active": False,
+            "deletable": workspace_manager.delete_capability(item.id)[0],
+        }
 
     @app.post(
         "/workspaces/{workspace_id}/activate",
@@ -2509,9 +2510,72 @@ def create_app(args):
         input_dir = record.path / "inputs"
         input_dir.mkdir(parents=True, exist_ok=True)
         doc_manager_holder["value"] = DocumentManager(
-            str(input_dir), workspace=workspace_id
+            str(input_dir),
+            workspace=workspace_id,
+            input_dir_is_workspace_root=True,
         )
         return {"active_workspace_id": workspace_id, "status": "ready"}
+
+    @app.delete(
+        "/workspaces/{workspace_id}",
+        tags=["runtime"],
+        dependencies=[Depends(workspace_auth)],
+    )
+    async def delete_runtime_workspace(workspace_id: str):
+        if "LIGHTRAG_GUNICORN_MODE" in os.environ:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Workspace deletion is available only in the single-process "
+                    "server; stop all workers before deleting shared data"
+                ),
+            )
+        if getattr(app.state, "background_tasks", set()):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete a workspace while background tasks are active",
+            )
+        current = core_api.runtime.active_workspace_id
+        if current == workspace_id:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=current
+            )
+            snapshot = pipeline_status.copy()
+            if any(
+                snapshot.get(key)
+                for key in (
+                    "busy",
+                    "scanning",
+                    "destructive_busy",
+                    "pending_enqueues",
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot delete a workspace while its pipeline is active",
+                )
+        try:
+            result = await core_api.delete_workspace(workspace_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        active_record = workspace_manager.get(result.active_workspace_id)
+        active_input_dir = active_record.path / "inputs"
+        active_input_dir.mkdir(parents=True, exist_ok=True)
+        doc_manager_holder["value"] = DocumentManager(
+            str(active_input_dir),
+            workspace=result.active_workspace_id,
+            input_dir_is_workspace_root=True,
+        )
+        return {
+            "deleted_workspace_id": result.deleted_workspace_id,
+            "active_workspace_id": result.active_workspace_id,
+            "deleted_episode_count": result.deleted_episode_count,
+            "dropped_storage_count": result.dropped_storage_count,
+            "status": "ready",
+        }
 
     @app.get(
         "/runtime/status",
@@ -2546,14 +2610,16 @@ def create_app(args):
         tags=["memory"],
         dependencies=[Depends(workspace_auth)],
     )
-    async def ingest_extracted_memory(request: ExtractedIngestRequest):
+    async def ingest_extracted_memory(
+        request: ExtractedIngestRequest,
+        http_request: Request,
+    ):
         def atom(row: ExtractedAtomRequest) -> ExtractedAtom:
             return ExtractedAtom(**row.model_dump())
 
         try:
             memory = ExtractedMemory.create(
                 episode=Episode(
-                    id=request.episode_id,
                     content=request.content,
                     kind=request.kind,
                     reference_at=request.reference_at,
@@ -2581,6 +2647,28 @@ def create_app(args):
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not request.wait_for_completion:
+            track_id = generate_track_id("ingest-extracted")
+            handle = await core_api.open(owner="http:extracted-ingest-background")
+            managed_tasks = http_request.app.state.background_tasks
+            await start_managed_extracted_ingest(
+                managed_tasks=managed_tasks,
+                handle=handle,
+                memory=memory,
+                track_id=track_id,
+            )
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "episode_ids": [memory.episode.id],
+                    "indexed_count": 0,
+                    "skipped_count": 0,
+                    "track_id": track_id,
+                    "status": "accepted",
+                    "completion": "background",
+                },
+            )
+
         handle = await core_api.open(owner="http:extracted-ingest")
         try:
             result = await handle.ingest_extracted(memory)
@@ -2621,18 +2709,12 @@ def create_app(args):
         """OAuth2 redirect for Swagger UI"""
         return get_swagger_ui_oauth2_redirect_html()
 
-    @app.get("/")
-    async def redirect_to_webui(request: Request):
-        """Redirect root path based on WebUI availability.
+    if not webui_assets_exist:
 
-        Prepend the ASGI root_path so that, behind a reverse proxy, the
-        absolute redirect target keeps the configured prefix instead of
-        bypassing it.
-        """
-        root = request.scope.get("root_path", "")
-        if webui_assets_exist:
-            return RedirectResponse(url=f"{root}{webui_path}/")
-        else:
+        @app.get("/")
+        async def redirect_to_docs(request: Request):
+            """Redirect the site root to docs when no WebUI build is present."""
+            root = request.scope.get("root_path", "")
             return RedirectResponse(url=f"{root}/docs")
 
     @app.get("/auth-status")
@@ -2990,7 +3072,7 @@ def create_app(args):
     _runtime_config_payload = json.dumps(
         {
             "apiPrefix": api_prefix,
-            "webuiPrefix": f"{api_prefix}{webui_path}/",
+            "webuiPrefix": f"{api_prefix}/" if api_prefix else "/",
         }
     ).replace("</", "<\\/")
     runtime_config_script = (
@@ -3094,14 +3176,6 @@ def create_app(args):
         logger.info(f"WebUI assets mounted at {webui_path}")
     else:
         logger.info("WebUI assets not available, WebUI route not mounted")
-
-        # Add redirect for WebUI path when assets are not available
-        @app.get(webui_path)
-        @app.get(f"{webui_path}/")
-        async def webui_redirect_to_docs(request: Request):
-            """Redirect WebUI path to /docs when WebUI is not available."""
-            root = request.scope.get("root_path", "")
-            return RedirectResponse(url=f"{root}/docs")
 
     return app
 

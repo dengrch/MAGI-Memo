@@ -99,7 +99,7 @@ WebUI 首页已经改为 MAGI Memo 的记忆工作台：可查看 SQLite 中的 
 
 ```dotenv
 HOST=127.0.0.1
-PORT=9621
+PORT=3491
 INPUT_DIR=./mgc-test/inputs
 WORKING_DIR=./mgc-test/ragstore
 LOG_DIR=./mgc-test/logs
@@ -114,8 +114,9 @@ WORKSPACE=magi_memo_dev
 
 `./scripts/run-webui.sh` 仍保留为兼容入口，并会转发到同一个 `server` 可执行文件。
 
-然后访问 `http://127.0.0.1:9621/webui/`。健康检查和 OpenAPI 文档分别位于
-`http://127.0.0.1:9621/health`、`http://127.0.0.1:9621/docs`。
+然后访问 `http://127.0.0.1:3491/`。WebUI、健康检查和 OpenAPI 文档由同一个
+MAGI Memo 服务提供；后两者分别位于 `http://127.0.0.1:3491/health`、
+`http://127.0.0.1:3491/docs`。
 
 首次拉取或修改了 `src/webui` 后，安装依赖并重新构建静态包：
 

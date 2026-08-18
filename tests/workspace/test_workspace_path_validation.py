@@ -131,6 +131,20 @@ class TestUploadPath:
         dm = DocumentManager(str(tmp_path), workspace="")
         assert dm.input_dir == tmp_path
 
+    def test_document_manager_accepts_runtime_scoped_input_dir(self, tmp_path):
+        DocumentManager = _import_document_manager()
+        scoped_inputs = tmp_path / "workspaces" / "space1" / "inputs"
+
+        dm = DocumentManager(
+            str(scoped_inputs),
+            workspace="space1",
+            input_dir_is_workspace_root=True,
+        )
+
+        assert dm.workspace == "space1"
+        assert dm.input_dir == scoped_inputs
+        assert not (scoped_inputs / "space1").exists()
+
     def test_api_sanitizer_output_always_accepted(self):
         import re
 

@@ -28,6 +28,7 @@ from magi_core.memory.models import (
     EntityResolution,
     EntityResolutionRequest,
     Episode,
+    EpisodeKind,
     EpisodeStatus,
     RelationRecord,
     normalize_name,
@@ -36,8 +37,12 @@ from magi_core.memory.models import (
     stable_entity_name_embedding_id,
     utc_now,
 )
-from magi_core.operate import _truncate_vdb_content, merge_nodes_and_edges
-from magi_core.utils import compute_mdhash_id
+from magi_core.operate import (
+    _handle_entity_relation_summary,
+    _truncate_vdb_content,
+    merge_nodes_and_edges,
+)
+from magi_core.utils import compute_mdhash_id, logger
 
 if TYPE_CHECKING:
     from magi_core.backend.sqlite import SQLiteBackend
@@ -85,6 +90,326 @@ class MagiKnowledgeAdapter:
         self.atom_similarity_threshold = atom_similarity_threshold
         self._episode_contexts: dict[str, dict[str, Any]] = {}
         self._commit_lock = asyncio.Lock()
+        self._projection_lock = asyncio.Lock()
+        self._projection_worker_task: asyncio.Task[None] | None = None
+        self._projection_wakeup: asyncio.Event | None = None
+        self._projection_stop: asyncio.Event | None = None
+
+    async def start_projection_worker(self, rag: Any) -> None:
+        """Reconcile durable owner tasks, then keep retrying in the background."""
+
+        if self._projection_worker_task is not None:
+            return
+        self._projection_wakeup = asyncio.Event()
+        self._projection_stop = asyncio.Event()
+        await self.reconcile_projections(rag, ready_only=False)
+        self._projection_worker_task = asyncio.create_task(
+            self._projection_worker_loop(rag),
+            name=f"magi-projection-{self.sqlite.workspace_id}",
+        )
+
+    async def stop_projection_worker(self) -> None:
+        task = self._projection_worker_task
+        if task is None:
+            return
+        if self._projection_stop is not None:
+            self._projection_stop.set()
+        if self._projection_wakeup is not None:
+            self._projection_wakeup.set()
+        await task
+        self._projection_worker_task = None
+        self._projection_wakeup = None
+        self._projection_stop = None
+
+    def notify_projection_worker(self) -> None:
+        if self._projection_wakeup is not None:
+            self._projection_wakeup.set()
+
+    async def _projection_worker_loop(self, rag: Any) -> None:
+        if self._projection_wakeup is None or self._projection_stop is None:
+            return
+        while not self._projection_stop.is_set():
+            try:
+                await asyncio.wait_for(self._projection_wakeup.wait(), timeout=5.0)
+            except TimeoutError:
+                pass
+            self._projection_wakeup.clear()
+            if self._projection_stop.is_set():
+                break
+            try:
+                await self.reconcile_projections(rag, ready_only=True)
+            except Exception:
+                logger.exception("Unexpected MAGI projection worker failure")
+
+    async def reconcile_projections(
+        self,
+        rag: Any,
+        *,
+        ready_only: bool = True,
+        limit: int = 100,
+    ) -> dict[str, int]:
+        """Project the latest SQLite state for queued owners idempotently."""
+
+        async with self._projection_lock:
+            return await self._reconcile_projections_locked(
+                rag,
+                ready_only=ready_only,
+                limit=limit,
+            )
+
+    async def _reconcile_projections_locked(
+        self,
+        rag: Any,
+        *,
+        ready_only: bool,
+        limit: int,
+    ) -> dict[str, int]:
+        tasks = await self.sqlite.list_projection_tasks(
+            ready_only=ready_only,
+            limit=limit,
+        )
+        return await self._apply_projection_tasks_locked(
+            rag,
+            tasks,
+            raise_on_error=False,
+        )
+
+    async def _apply_projection_tasks_locked(
+        self,
+        rag: Any,
+        tasks: Sequence[dict[str, Any]],
+        *,
+        raise_on_error: bool,
+    ) -> dict[str, int]:
+        result = {"processed": 0, "applied": 0, "failed": 0}
+        successful_tasks: list[dict[str, Any]] = []
+        for task in tasks:
+            result["processed"] += 1
+            try:
+                await self._project_owner(rag, task)
+                successful_tasks.append(task)
+            except Exception as exc:
+                result["failed"] += 1
+                await self.sqlite.mark_projection_failed(
+                    str(task["owner_id"]),
+                    int(task["target_revision"]),
+                    str(exc),
+                )
+                logger.exception(
+                    "Failed to reconcile projection owner %s",
+                    task["owner_id"],
+                )
+                if raise_on_error:
+                    self.notify_projection_worker()
+                    raise
+        if successful_tasks:
+            try:
+                await self._flush_projection_storages(rag)
+            except Exception as exc:
+                for task in successful_tasks:
+                    await self.sqlite.mark_projection_failed(
+                        str(task["owner_id"]),
+                        int(task["target_revision"]),
+                        str(exc),
+                    )
+                result["failed"] += len(successful_tasks)
+                successful_tasks.clear()
+                self.notify_projection_worker()
+                if raise_on_error:
+                    raise
+                logger.exception("Failed to flush reconciled projection storages")
+            else:
+                for task in successful_tasks:
+                    applied = await self.sqlite.mark_projection_applied(
+                        str(task["owner_id"]),
+                        int(task["target_revision"]),
+                    )
+                    if applied:
+                        result["applied"] += 1
+        return result
+
+    async def _owner_description(
+        self,
+        rag: Any,
+        *,
+        owner_id: str,
+        description_type: str,
+        description_name: str,
+    ) -> tuple[str, list[AtomRecord]]:
+        atoms = await self.sqlite.list_owner_atoms(owner_id)
+        current_atoms = [atom for atom in atoms if atom.expired_at is None]
+        description, _ = await _handle_entity_relation_summary(
+            description_type,
+            description_name,
+            [atom.presentation() for atom in current_atoms],
+            GRAPH_FIELD_SEP,
+            rag._build_global_config(),
+            getattr(rag, "llm_response_cache", None),
+        )
+        return description, atoms
+
+    async def _project_entity_record(
+        self,
+        rag: Any,
+        entity: EntityRecord,
+    ) -> None:
+        graph = rag.chunk_entity_relation_graph
+        description, atoms = await self._owner_description(
+            rag,
+            owner_id=entity.id,
+            description_type="entity",
+            description_name=entity.canonical_name,
+        )
+        provenance = await self.sqlite.get_owner_provenance(entity.id)
+        source_id = GRAPH_FIELD_SEP.join(provenance["source_ids"])
+        file_path = GRAPH_FIELD_SEP.join(provenance["file_paths"]) or "unknown_source"
+        existing = await graph.get_node(entity.canonical_name) or {}
+        node = {
+            **existing,
+            "entity_id": entity.canonical_name,
+            "entity_type": entity.entity_type or existing.get("entity_type", "UNKNOWN"),
+            "description": description,
+            "source_id": source_id or existing.get("source_id", ""),
+            "file_path": file_path,
+            "magi_entity_id": entity.id,
+            "atom_ids": [atom.id for atom in atoms],
+        }
+        await graph.upsert_node(entity.canonical_name, node_data=node)
+        if rag.entities_vdb is not None:
+            global_config = rag._build_global_config()
+            content = _truncate_vdb_content(
+                f"{entity.canonical_name}\n{description}",
+                global_config,
+                f"entity:{entity.canonical_name}",
+            )
+            await rag.entities_vdb.upsert(
+                {
+                    compute_mdhash_id(entity.canonical_name, prefix="ent-"): {
+                        "content": content,
+                        "entity_name": entity.canonical_name,
+                        "entity_type": node["entity_type"],
+                        "source_id": node["source_id"],
+                        "file_path": node["file_path"],
+                    }
+                }
+            )
+        await self.sqlite.set_owner_materialization(
+            entity.id,
+            atom_ids=[atom.id for atom in atoms],
+            summary_cited=description,
+        )
+
+    async def _project_relation_record(
+        self,
+        rag: Any,
+        relation: RelationRecord,
+    ) -> None:
+        graph = rag.chunk_entity_relation_graph
+        for entity_id in (relation.entity_a_id, relation.entity_b_id):
+            entity = await self.sqlite.get_entity(entity_id)
+            if entity is not None and await graph.get_node(entity.canonical_name) is None:
+                await self._project_entity_record(rag, entity)
+
+        source, target = sorted(
+            (relation.entity_a_name, relation.entity_b_name)
+        )
+        description, atoms = await self._owner_description(
+            rag,
+            owner_id=relation.id,
+            description_type="relation",
+            description_name=f"{source} -> {target}",
+        )
+        provenance = await self.sqlite.get_owner_provenance(relation.id)
+        source_id = GRAPH_FIELD_SEP.join(provenance["source_ids"])
+        file_path = GRAPH_FIELD_SEP.join(provenance["file_paths"]) or "unknown_source"
+        existing = await graph.get_edge(source, target) or {}
+        keywords = GRAPH_FIELD_SEP.join(relation.keywords)
+        edge = {
+            **existing,
+            "src_id": source,
+            "tgt_id": target,
+            "description": description,
+            "keywords": keywords or existing.get("keywords", ""),
+            "weight": existing.get("weight", 1.0),
+            "source_id": source_id or existing.get("source_id", ""),
+            "file_path": file_path,
+            "magi_relation_id": relation.id,
+            "atom_ids": [atom.id for atom in atoms],
+        }
+        await graph.upsert_edge(source, target, edge_data=edge)
+        if rag.relationships_vdb is not None:
+            relation_id = compute_mdhash_id(source + target, prefix="rel-")
+            reverse_id = compute_mdhash_id(target + source, prefix="rel-")
+            await rag.relationships_vdb.delete([relation_id, reverse_id])
+            global_config = rag._build_global_config()
+            content = _truncate_vdb_content(
+                f"{edge['keywords']}\t{source}\n{target}\n{description}",
+                global_config,
+                f"relationship:{source}-{target}",
+            )
+            await rag.relationships_vdb.upsert(
+                {
+                    relation_id: {
+                        "src_id": source,
+                        "tgt_id": target,
+                        "source_id": edge["source_id"],
+                        "content": content,
+                        "keywords": edge["keywords"],
+                        "description": description,
+                        "weight": edge["weight"],
+                        "file_path": edge["file_path"],
+                    }
+                }
+            )
+        await self.sqlite.set_owner_materialization(
+            relation.id,
+            atom_ids=[atom.id for atom in atoms],
+            summary_cited=description,
+        )
+
+    async def _project_owner(self, rag: Any, task: dict[str, Any]) -> None:
+        owner_id = str(task["owner_id"])
+        snapshot = task.get("owner_snapshot") or {}
+        if str(task.get("owner_kind")) == "relation":
+            relation = await self.sqlite.get_relation(owner_id)
+            if relation is not None:
+                await self._project_relation_record(rag, relation)
+                return
+            source = snapshot.get("source")
+            target = snapshot.get("target")
+            if source and target:
+                source, target = sorted((str(source), str(target)))
+                if rag.relationships_vdb is not None:
+                    await rag.relationships_vdb.delete(
+                        [
+                            compute_mdhash_id(source + target, prefix="rel-"),
+                            compute_mdhash_id(target + source, prefix="rel-"),
+                        ]
+                    )
+                await rag.chunk_entity_relation_graph.remove_edges([(source, target)])
+            return
+
+        entity = await self.sqlite.get_entity(owner_id)
+        if entity is not None:
+            await self._project_entity_record(rag, entity)
+            return
+        canonical_name = snapshot.get("canonical_name")
+        if canonical_name:
+            canonical_name = str(canonical_name)
+            if rag.entities_vdb is not None:
+                await rag.entities_vdb.delete_entity(canonical_name)
+            await rag.chunk_entity_relation_graph.delete_node(canonical_name)
+
+    @staticmethod
+    async def _flush_projection_storages(rag: Any) -> None:
+        for storage in (
+            rag.chunk_entity_relation_graph,
+            rag.entities_vdb,
+            rag.relationships_vdb,
+        ):
+            callback = getattr(storage, "index_done_callback", None)
+            if callable(callback):
+                await callback()
 
     def register_episodes(self, episodes: Sequence[Episode]) -> None:
         for episode in episodes:
@@ -93,7 +418,14 @@ class MagiKnowledgeAdapter:
                 "reference_at": episode.effective_reference_at.isoformat(),
                 "kind": episode.kind.value,
                 "source_uri": episode.source_uri,
+                "metadata": dict(episode.metadata),
             }
+
+    def unregister_episodes(self, episode_ids: Sequence[str]) -> None:
+        """Discard transient contexts for inputs rejected before admission."""
+
+        for episode_id in episode_ids:
+            self._episode_contexts.pop(episode_id, None)
 
     async def stage_episode(self, episode: Episode) -> None:
         await self.sqlite.put_episode(episode)
@@ -112,11 +444,18 @@ class MagiKnowledgeAdapter:
     ) -> None:
         existing = await self.sqlite.get_episode_model(doc_id)
         if existing is None:
+            context = self._episode_contexts.get(doc_id, {})
             episode = Episode(
                 id=doc_id,
                 content=content,
-                reference_at=_parse_optional_time(reference_at) or utc_now(),
-                source_uri=file_path,
+                kind=EpisodeKind(context.get("kind", EpisodeKind.DOCUMENT.value)),
+                reference_at=(
+                    _parse_optional_time(context.get("reference_at"))
+                    or _parse_optional_time(reference_at)
+                    or utc_now()
+                ),
+                source_uri=context.get("source_uri") or file_path,
+                metadata=context.get("metadata") or {},
             )
             await self.sqlite.put_episode(episode)
         else:
@@ -153,96 +492,39 @@ class MagiKnowledgeAdapter:
         self._episode_contexts.pop(doc_id, None)
 
     async def delete_episode(self, doc_id: str, *, rag: Any) -> str | None:
-        """Delete SQLite evidence and refresh surviving graph projections."""
+        """Delete evidence and durably converge graph/vector projections."""
 
-        result = await self.sqlite.backup_and_delete_episode(doc_id)
-        if result is None:
-            return None
-        global_config = rag._build_global_config()
-        graph = rag.chunk_entity_relation_graph
-        for owner_id in result["affected_owner_ids"]:
-            atoms = await self.sqlite.list_owner_atoms(owner_id)
-            current_atoms = [atom for atom in atoms if atom.expired_at is None]
-            description = GRAPH_FIELD_SEP.join(
-                atom.presentation() for atom in current_atoms
+        async with self._projection_lock:
+            result = await self.sqlite.backup_and_delete_episode(doc_id)
+            if result is None:
+                return None
+            tasks = await self.sqlite.list_projection_tasks(
+                owner_ids=list(result["affected_owner_ids"]),
+                ready_only=False,
+                limit=max(1, len(result["affected_owner_ids"])),
             )
-            atom_ids = [atom.id for atom in atoms]
-            if owner_id.startswith("entity-"):
-                entity = await self.sqlite.get_entity(owner_id)
-                if entity is None:
-                    continue
-                node = await graph.get_node(entity.canonical_name)
-                if node is None:
-                    continue
-                node = {
-                    **node,
-                    "description": description,
-                    "magi_entity_id": entity.id,
-                    "atom_ids": atom_ids,
-                }
-                await graph.upsert_node(entity.canonical_name, node_data=node)
-                if rag.entities_vdb is not None:
-                    content = _truncate_vdb_content(
-                        f"{entity.canonical_name}\n{description}",
-                        global_config,
-                        f"entity:{entity.canonical_name}",
-                    )
-                    await rag.entities_vdb.upsert(
-                        {
-                            compute_mdhash_id(entity.canonical_name, prefix="ent-"): {
-                                "content": content,
-                                "entity_name": entity.canonical_name,
-                                "entity_type": node.get("entity_type", "UNKNOWN"),
-                                "source_id": node.get("source_id", ""),
-                                "file_path": node.get("file_path", "unknown_source"),
-                            }
-                        }
-                    )
-                continue
-
-            relation = await self.sqlite.get_relation(owner_id)
-            if relation is None:
-                continue
-            source, target = sorted((relation.entity_a_name, relation.entity_b_name))
-            edge = await graph.get_edge(source, target)
-            if edge is None:
-                continue
-            edge = {
-                **edge,
-                "description": description,
-                "magi_relation_id": relation.id,
-                "atom_ids": atom_ids,
-            }
-            await graph.upsert_edge(source, target, edge_data=edge)
-            if rag.relationships_vdb is not None:
-                relation_id = compute_mdhash_id(source + target, prefix="rel-")
-                reverse_id = compute_mdhash_id(target + source, prefix="rel-")
-                await rag.relationships_vdb.delete([relation_id, reverse_id])
-                keywords = edge.get("keywords", "")
-                content = _truncate_vdb_content(
-                    f"{keywords}\t{source}\n{target}\n{description}",
-                    global_config,
-                    f"relationship:{source}-{target}",
-                )
-                await rag.relationships_vdb.upsert(
-                    {
-                        relation_id: {
-                            "src_id": source,
-                            "tgt_id": target,
-                            "source_id": edge.get("source_id", ""),
-                            "content": content,
-                            "keywords": keywords,
-                            "description": description,
-                            "weight": edge.get("weight", 1.0),
-                            "file_path": edge.get("file_path", "unknown_source"),
-                        }
-                    }
-                )
+            await self._apply_projection_tasks_locked(
+                rag,
+                tasks,
+                raise_on_error=True,
+            )
         return str(result["backup_id"])
 
-    async def clear_memory(self) -> list[str]:
+    async def clear_memory(self, *, rag: Any | None = None) -> list[str]:
         self._episode_contexts.clear()
-        return await self.sqlite.backup_and_clear()
+        async with self._projection_lock:
+            backup_ids = await self.sqlite.backup_and_clear()
+            if rag is not None:
+                tasks = await self.sqlite.list_projection_tasks(
+                    ready_only=False,
+                    limit=100_000,
+                )
+                await self._apply_projection_tasks_locked(
+                    rag,
+                    tasks,
+                    raise_on_error=True,
+                )
+            return backup_ids
 
     @staticmethod
     def _embedding_model(engine: Any) -> str:
@@ -715,7 +997,12 @@ class MagiKnowledgeAdapter:
         # duplicate identities. Finer owner-scoped locking can replace this
         # once throughput measurements justify the added complexity.
         async with self._commit_lock:
-            await self._commit_serialized(chunk_results, context)
+            async with self._projection_lock:
+                try:
+                    await self._commit_serialized(chunk_results, context)
+                except Exception:
+                    self.notify_projection_worker()
+                    raise
 
     async def _commit_serialized(
         self,
@@ -792,7 +1079,10 @@ class MagiKnowledgeAdapter:
                         self.sqlite.workspace_id,
                         episode.id,
                         entity.id,
-                        f"entity:{record.get('source_id', '')}:{record_index}",
+                        (
+                            f"entity:{normalize_name(extracted_name)}:"
+                            f"{record.get('source_id', '')}:{record_index}"
+                        ),
                     ),
                 )
                 evidence = AtomEvidence(
@@ -849,7 +1139,11 @@ class MagiKnowledgeAdapter:
                         self.sqlite.workspace_id,
                         episode.id,
                         relation.id,
-                        f"relation:{record.get('source_id', '')}:{record_index}",
+                        (
+                            f"relation:{normalize_name(source_name)}:"
+                            f"{normalize_name(target_name)}:"
+                            f"{record.get('source_id', '')}:{record_index}"
+                        ),
                     ),
                 )
                 evidence = AtomEvidence(
@@ -926,6 +1220,13 @@ class MagiKnowledgeAdapter:
                 projected_edges[pair].append(projected)
                 touched_edges[pair] = relation.id
 
+        touched_owner_ids = [*touched_nodes.values(), *touched_edges.values()]
+        projection_tasks = await self.sqlite.list_projection_tasks(
+            owner_ids=touched_owner_ids,
+            ready_only=False,
+            limit=max(1, len(touched_owner_ids)),
+        )
+
         # Materialize every Atom for touched owners, not only this Episode's
         # delta. The LightRAG merge then summarizes Atom presentations rather
         # than recursively merging an older summary with new facts.
@@ -995,11 +1296,31 @@ class MagiKnowledgeAdapter:
             node["magi_entity_id"] = entity_id
             node["atom_ids"] = [atom.id for atom in atoms]
             await graph.upsert_node(canonical_name, node_data=node)
+            await self.sqlite.set_owner_materialization(
+                entity_id,
+                atom_ids=node["atom_ids"],
+                summary_cited=str(node.get("description") or ""),
+            )
         for pair, relation_id in touched_edges.items():
             edge = await graph.get_edge(*pair) or {}
             atoms = await self.sqlite.list_owner_atoms(relation_id)
             edge["magi_relation_id"] = relation_id
             edge["atom_ids"] = [atom.id for atom in atoms]
             await graph.upsert_edge(pair[0], pair[1], edge_data=edge)
+            await self.sqlite.set_owner_materialization(
+                relation_id,
+                atom_ids=edge["atom_ids"],
+                summary_cited=str(edge.get("description") or ""),
+            )
+
+        # Buffered vector stores become durable before the outbox revision is
+        # acknowledged.  A crash before this point leaves the owner pending and
+        # startup reconciliation safely reapplies its latest SQLite state.
+        await self._flush_projection_storages(context.rag)
+        for task in projection_tasks:
+            await self.sqlite.mark_projection_applied(
+                str(task["owner_id"]),
+                int(task["target_revision"]),
+            )
 
         self._episode_contexts.pop(episode.id, None)

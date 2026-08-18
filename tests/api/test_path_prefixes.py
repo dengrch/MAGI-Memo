@@ -240,11 +240,11 @@ class TestOpenAPISpecIntegration:
 
 
 class TestWebUIPrefixIntegration:
-    """Test that the WebUI is served at the expected (fixed) /webui path,
-    composed with `root_path` when an API prefix is set."""
+    """Test that the WebUI is served at the site root, composed with
+    `root_path` when an API prefix is set."""
 
     def test_webui_at_prefixed_path(self, mock_args_api_prefix):
-        """With root_path="/test-api" the WebUI lives at /test-api/webui/
+        """With root_path="/test-api" the WebUI lives at /test-api/
         because FastAPI injects root_path into the ASGI scope."""
         with patch("magi_core.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
@@ -253,11 +253,23 @@ class TestWebUIPrefixIntegration:
             app = create_app(mock_args_api_prefix)
             client = TestClient(app)
 
-            response = client.get("/test-api/webui/")
-            assert response.status_code in [200, 307]
+            response = client.get("/test-api/")
+            assert response.status_code == 200
 
     def test_webui_without_api_prefix(self, mock_args_no_prefix):
-        """Without an API prefix the WebUI is served at /webui/."""
+        """Without an API prefix the WebUI is served at /."""
+        with patch("magi_core.api.lightrag_server.LightRAG") as mock_rag:
+            mock_rag.return_value = MagicMock()
+            from magi_core.api.lightrag_server import create_app
+
+            app = create_app(mock_args_no_prefix)
+            client = TestClient(app)
+
+            response = client.get("/")
+            assert response.status_code == 200
+
+    def test_legacy_webui_suffix_is_not_mounted(self, mock_args_no_prefix):
+        """The retired /webui/ mount must not remain as a second entrypoint."""
         with patch("magi_core.api.lightrag_server.LightRAG") as mock_rag:
             mock_rag.return_value = MagicMock()
             from magi_core.api.lightrag_server import create_app
@@ -266,7 +278,7 @@ class TestWebUIPrefixIntegration:
             client = TestClient(app)
 
             response = client.get("/webui/")
-            assert response.status_code in [200, 307]
+            assert response.status_code == 404
 
 
 class TestEnvironmentVariables:
@@ -384,7 +396,7 @@ class TestRuntimeConfigInjection:
         app = self._build_app(tmp_path, monkeypatch, "--api-prefix", "/site01")
         client = TestClient(app)
 
-        response = client.get("/site01/webui/")
+        response = client.get("/site01/")
         assert response.status_code == 200
         body = response.text
 
@@ -393,8 +405,8 @@ class TestRuntimeConfigInjection:
         assert "window.__LIGHTRAG_CONFIG__" in body
         assert '"apiPrefix": "/site01"' in body or '"apiPrefix":"/site01"' in body
         assert (
-            '"webuiPrefix": "/site01/webui/"' in body
-            or '"webuiPrefix":"/site01/webui/"' in body
+            '"webuiPrefix": "/site01/"' in body
+            or '"webuiPrefix":"/site01/"' in body
         )
 
     def test_injection_default_prefixes_when_unconfigured(self, tmp_path, monkeypatch):
@@ -405,12 +417,12 @@ class TestRuntimeConfigInjection:
         app = self._build_app(tmp_path, monkeypatch)
         client = TestClient(app)
 
-        response = client.get("/webui/")
+        response = client.get("/")
         assert response.status_code == 200
         body = response.text
 
         assert '"apiPrefix": ""' in body or '"apiPrefix":""' in body
-        assert '"webuiPrefix": "/webui/"' in body or '"webuiPrefix":"/webui/"' in body
+        assert '"webuiPrefix": "/"' in body or '"webuiPrefix":"/"' in body
 
     def test_missing_placeholder_serves_original_html(self, tmp_path, monkeypatch):
         """Older builds without the placeholder must still serve cleanly —
@@ -420,7 +432,7 @@ class TestRuntimeConfigInjection:
         app = self._build_app(tmp_path, monkeypatch)
         client = TestClient(app)
 
-        response = client.get("/webui/")
+        response = client.get("/")
         assert response.status_code == 200
         # No placeholder was present, so no injected script either.
         assert "window.__LIGHTRAG_CONFIG__" not in response.text
@@ -432,8 +444,8 @@ class TestRuntimeConfigInjection:
         app = self._build_app(tmp_path, monkeypatch, "--api-prefix", "/abc")
         client = TestClient(app)
 
-        first = client.get("/abc/webui/").text
-        second = client.get("/abc/webui/").text
+        first = client.get("/abc/").text
+        second = client.get("/abc/").text
         assert first == second
         # Source file untouched.
         on_disk = (tmp_path / "webui" / "index.html").read_text(encoding="utf-8")
@@ -447,7 +459,7 @@ class TestRuntimeConfigInjection:
         app = self._build_app(tmp_path, monkeypatch, "--api-prefix", "/x")
         client = TestClient(app)
 
-        response = client.get("/x/webui/")
+        response = client.get("/x/")
         assert response.status_code == 200
         cache_control = response.headers.get("cache-control", "")
         assert "no-cache" in cache_control
@@ -475,15 +487,10 @@ class TestUvicornRootPathSemantics:
         ``scope["root_path"]`` that do not overlap, and 404s.
 
     Concrete failure mode without the middleware (proxy strips /site01,
-    backend sees ``/webui/``):
-
-        outer get_route_path:  /webui/ does not start with /site01 → /webui/
-        Mount.matches:         path_regex "^/webui/(?P<path>.*)$" matches
-                               child scope.root_path = /site01/webui
-                               child scope.path      = /webui/  (unchanged)
-        StaticFiles.get_path:  /webui/ does not start with /site01/webui →
-                               returns /webui/ → looked up as filename
-                               "webui" inside the webui static dir → 404
+    backend sees ``/``): the root StaticFiles mount receives
+    ``scope["root_path"]="/site01"`` but ``scope["path"]="/"``. Those values
+    do not overlap, so its file-system lookup does not resolve the site-root
+    index. Normalization changes the path to ``/site01/`` before routing.
 
     ``_RootPathNormalizationMiddleware`` runs before routing and prepends
     ``root_path`` to ``scope["path"]`` whenever the latter does not already
@@ -562,22 +569,20 @@ class TestUvicornRootPathSemantics:
 
     @pytest.mark.asyncio
     async def test_mount_strip_mode_matches(self):
-        """WebUI Mount, proxy-strip mode: backend receives /webui/.
+        """WebUI Mount, proxy-strip mode: backend receives /.
 
         This is the bug the middleware fixes. Without normalization,
-        StaticFiles.get_path sees path=/webui/ and root_path=/site01/webui
-        (mutated by Mount.matches) and serves the literal "webui" filename
-        lookup → 404. With normalization, scope.path becomes
-        /site01/webui/ before routing and the lookup resolves to
-        index.html.
+        StaticFiles receives a path that does not include root_path. With
+        normalization, scope.path becomes /site01/ before routing and the
+        lookup resolves to index.html.
         """
         app = self._build_app_with_prefix("/site01")
-        status = await self._call_with_scope(app, "/webui/")
+        status = await self._call_with_scope(app, "/")
         assert status == 200
 
     @pytest.mark.asyncio
     async def test_mount_verbatim_mode_matches(self):
-        """WebUI Mount, verbatim mode: backend receives /site01/webui/.
+        """WebUI Mount, verbatim mode: backend receives /site01/.
 
         Already canonical; the middleware is a no-op for this case. The
         test guards against accidentally regressing verbatim while fixing
@@ -585,7 +590,7 @@ class TestUvicornRootPathSemantics:
         the Mount path with its nested ``get_route_path`` resolution.
         """
         app = self._build_app_with_prefix("/site01")
-        status = await self._call_with_scope(app, "/site01/webui/")
+        status = await self._call_with_scope(app, "/site01/")
         assert status == 200
 
     @pytest.mark.asyncio
