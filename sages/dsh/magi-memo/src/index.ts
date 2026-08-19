@@ -79,9 +79,11 @@ export function foldMemoryMode(
   return mode
 }
 
-export function memoryModePrompt(mode: MemoryMode): string {
+export function memoryModePrompt(mode: MemoryMode, referenceAt = new Date().toISOString()): string {
   const common = [
     `MAGI Memo memory mode for this session: ${mode}.`,
+    `Current system time and default Episode reference_at: ${referenceAt}.`,
+    'Unless the user explicitly provides a historical Episode time, use this reference_at before generating Atom temporal fields. Do not invent a different current year.',
     'MAGI memory tools always operate on the currently active workspace.',
     'Never create, switch, or activate a workspace proactively. Call magi_workspace_create or magi_workspace_activate only when the user explicitly asks to create or switch the memory workspace.',
     'If no suitable workspace is active, tell the user and ask which workspace to use; do not create or activate one on your own.',
@@ -202,9 +204,11 @@ export function apply(ctx: Context, config: Config) {
   ctx.systemPrompt.section({
     name: 'magi-memo',
     order: 112,
-    text: context => memoryModePrompt(context.agent === undefined
-      ? config.defaultMemoryMode
-      : foldMemoryMode(context.agent.session.events, config.defaultMemoryMode)),
+    text: context => memoryModePrompt(
+      context.agent === undefined
+        ? config.defaultMemoryMode
+        : foldMemoryMode(context.agent.session.events, config.defaultMemoryMode),
+    ),
   })
 
   ctx.inject(['sessionProjections'], (projectionCtx) => {

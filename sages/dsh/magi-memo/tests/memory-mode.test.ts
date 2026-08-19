@@ -36,7 +36,9 @@ test('ignores an incomplete command and honors the configured default', () => {
 })
 
 test('auto prompt defines per-turn recall and write gates', () => {
-  const prompt = memoryModePrompt('auto')
+  const prompt = memoryModePrompt('auto', '2026-08-19T12:34:56.000Z')
+  assert.match(prompt, /Current system time and default Episode reference_at: 2026-08-19T12:34:56\.000Z/)
+  assert.match(prompt, /Do not invent a different current year/)
   assert.match(prompt, /Recall Gate/)
   assert.match(prompt, /Write Gate/)
   assert.match(prompt, /final tool step/)
