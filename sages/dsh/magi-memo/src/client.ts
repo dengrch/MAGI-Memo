@@ -38,6 +38,21 @@ export interface RecallInput {
   enableRerank?: boolean
 }
 
+export interface VisitInput {
+  entities: string[]
+  relations: Array<[string, string]>
+}
+
+export interface ExpandInput {
+  frontier: string[]
+  visit: VisitInput
+  maxCandidatesPerFrontier?: number
+}
+
+export type EvidenceOwnerInput =
+  | { entity: string }
+  | { relation: [string, string] }
+
 interface WorkspaceItem {
   id: string
   name: string
@@ -121,6 +136,41 @@ function positiveInteger(value: number | undefined, field: string): number | und
 function compactObject(entries: Record<string, JsonValue | undefined>): Record<string, JsonValue> {
   return Object.fromEntries(
     Object.entries(entries).filter((entry): entry is [string, JsonValue] => entry[1] !== undefined),
+  )
+}
+
+/** Stable Entity/Relation ids validate Core addressing but never enter model context. */
+export function hideMagiStableIds(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(hideMagiStableIds)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !['magi_entity_id', 'magi_relation_id', 'magi_owner_id'].includes(key))
+      .map(([key, child]) => [key, hideMagiStableIds(child as JsonValue)]),
+  )
+}
+
+/** Keep graph previews semantic; Atom lineage and temporal metadata belong to evidence. */
+export function stripExplorerEvidenceMetadata(value: string): string {
+  return value
+    .replace(/\[atom-[^\]\r\n]+\]\s*/gi, '')
+    .replace(/\[status=[^\]\r\n]+\]\s*/gi, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .trim()
+}
+
+/** Filter only expandable graph descriptions; evidence responses stay lossless. */
+export function compactExplorerExpandResult(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(compactExplorerExpandResult)
+  if (!isRecord(value)) return value
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [
+      key,
+      key === 'description' && typeof child === 'string'
+        ? stripExplorerEvidenceMetadata(child)
+        : compactExplorerExpandResult(child as JsonValue),
+    ]),
   )
 }
 
@@ -263,11 +313,17 @@ export class MagiClient {
     if (typeof payload.content !== 'string' || !payload.content.trim()) {
       throw new Error('content must not be empty')
     }
-    if (!Array.isArray(payload.entities) || payload.entities.length === 0) {
-      throw new Error('entities must contain at least one extracted entity')
+    const entities = payload.entities ?? []
+    const relations = payload.relations ?? []
+    if (!Array.isArray(entities)) throw new Error('entities must be an array')
+    if (!Array.isArray(relations)) throw new Error('relations must be an array')
+    if (entities.length === 0 && relations.length === 0) {
+      throw new Error('extracted memory must contain an entity or a relationship')
     }
     return this.request('POST', '/memory/ingest/extracted', signal, {
       ...payload,
+      entities,
+      relations,
       reference_at: typeof payload.reference_at === 'string' && payload.reference_at.trim()
         ? payload.reference_at
         : new Date().toISOString(),
@@ -278,7 +334,7 @@ export class MagiClient {
   async recall(input: RecallInput, signal: AbortSignal): Promise<JsonValue> {
     const query = nonEmpty(input.query, 'query')
     if (query.length < 3) throw new Error('query must contain at least 3 characters')
-    return this.request('POST', '/query/data', signal, compactObject({
+    return hideMagiStableIds(await this.request('POST', '/query/data', signal, compactObject({
       query,
       mode: input.mode ?? 'mix',
       top_k: positiveInteger(input.topK, 'top_k'),
@@ -286,6 +342,44 @@ export class MagiClient {
       hl_keywords: input.highLevelKeywords,
       ll_keywords: input.lowLevelKeywords,
       enable_rerank: input.enableRerank,
-    }))
+    })))
+  }
+
+  async expand(input: ExpandInput, signal: AbortSignal): Promise<JsonValue> {
+    if (input.frontier.length === 0) throw new Error('frontier must not be empty')
+    const frontier = input.frontier.map((name, index) => nonEmpty(name, `frontier[${index}]`))
+    const entities = input.visit.entities.map((name, index) => nonEmpty(name, `visit.entities[${index}]`))
+    const relations = input.visit.relations.map(([source, target], index) => [
+      nonEmpty(source, `visit.relations[${index}][0]`),
+      nonEmpty(target, `visit.relations[${index}][1]`),
+    ] as [string, string])
+    const result = hideMagiStableIds(await this.request('POST', '/memory/explore/expand', signal, compactObject({
+      frontier,
+      visit: { entities, relations },
+      max_candidates_per_frontier: positiveInteger(
+        input.maxCandidatesPerFrontier,
+        'max_candidates_per_frontier',
+      ),
+    })))
+    return compactExplorerExpandResult(result)
+  }
+
+  async evidence(owners: EvidenceOwnerInput[], signal: AbortSignal): Promise<JsonValue> {
+    if (owners.length === 0) throw new Error('owners must not be empty')
+    const normalized = owners.map((owner, index) => {
+      if ('entity' in owner) return { entity: nonEmpty(owner.entity, `owners[${index}].entity`) }
+      return {
+        relation: [
+          nonEmpty(owner.relation[0], `owners[${index}].relation[0]`),
+          nonEmpty(owner.relation[1], `owners[${index}].relation[1]`),
+        ],
+      }
+    })
+    return hideMagiStableIds(await this.request(
+      'POST',
+      '/memory/explore/evidence',
+      signal,
+      { owners: normalized },
+    ))
   }
 }

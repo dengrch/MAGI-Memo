@@ -7,3 +7,8 @@
         timeoutMs: !!js Number(process.env.MAGI_MEMO_TIMEOUT_MS ?? 30000)
         maxModelOutputChars: !!js Number(process.env.MAGI_MEMO_MAX_OUTPUT_CHARS ?? 30000)
         defaultMemoryMode: !!js process.env.MAGI_MEMO_DEFAULT_MODE ?? 'auto'
+        subagentProvider: !!js process.env.MAGI_MEMO_SUBAGENT_PROVIDER ?? 'spawn'
+        explorerTopK: !!js Number(process.env.MAGI_MEMO_EXPLORER_TOP_K ?? 20)
+        explorerChunkTopK: !!js Number(process.env.MAGI_MEMO_EXPLORER_CHUNK_TOP_K ?? 10)
+        explorerMaxTokens: !!js Number(process.env.MAGI_MEMO_EXPLORER_MAX_TOKENS ?? 8192)
+        explorerMaxCandidatesPerFrontier: !!js Number(process.env.MAGI_MEMO_EXPLORER_MAX_CANDIDATES_PER_FRONTIER ?? 50)

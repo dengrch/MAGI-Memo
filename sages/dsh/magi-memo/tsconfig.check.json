@@ -6,6 +6,7 @@
       "@deepseek-ai/schemastery": ["../vendor/schemastery/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-tools": ["../packages/core/tools/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-session": ["../packages/core/session/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-subagent": ["../packages/subagent/subagent/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-commands": ["../packages/interaction/commands/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-session-projection": ["../packages/session/session-projection/lib/types/index.d.ts"],
       "@deepseek-ai/dsh-session-projection/types": ["../packages/session/session-projection/lib/types/types.d.ts"]

@@ -4,17 +4,22 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-subagent'
 import { MagiClient, type JsonValue } from './client.ts'
+import {
+  activeExplorerLabel,
+  runActiveExplorer,
+} from './active-explorer.ts'
 
 export const name = 'magi-memo'
-export const inject = ['tools', 'systemPrompt']
+export const inject = ['tools', 'systemPrompt', 'subagents']
 
-export type MemoryMode = 'auto' | 'manual' | 'off'
+export type MemoryMode = 'auto' | 'manual' | 'explore' | 'off'
 
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionMap {
     /** MAGI memory policy selected for this session. */
-    magiMemoryMode: 'auto' | 'manual' | 'off'
+    magiMemoryMode: 'auto' | 'manual' | 'explore' | 'off'
   }
 }
 
@@ -24,6 +29,11 @@ export interface Config {
   timeoutMs: number
   maxModelOutputChars: number
   defaultMemoryMode: MemoryMode
+  subagentProvider: string
+  explorerTopK: number
+  explorerChunkTopK: number
+  explorerMaxTokens: number
+  explorerMaxCandidatesPerFrontier: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -34,11 +44,17 @@ export const Config: Schema<Config> = Schema.object({
   defaultMemoryMode: Schema.union([
     Schema.const('auto'),
     Schema.const('manual'),
+    Schema.const('explore'),
     Schema.const('off'),
   ]).default('auto'),
+  subagentProvider: Schema.string().default('spawn'),
+  explorerTopK: Schema.number().default(20),
+  explorerChunkTopK: Schema.number().default(10),
+  explorerMaxTokens: Schema.number().default(8_192),
+  explorerMaxCandidatesPerFrontier: Schema.number().default(50),
 })
 
-const MEMORY_MODES = new Set<MemoryMode>(['auto', 'manual', 'off'])
+const MEMORY_MODES = new Set<MemoryMode>(['auto', 'manual', 'explore', 'off'])
 
 const memoryModeProjectionSchema = {
   parse(value: unknown): MemoryMode {
@@ -87,7 +103,7 @@ export function memoryModePrompt(mode: MemoryMode, referenceAt = new Date().toIS
     'MAGI memory tools always operate on the currently active workspace.',
     'Never create, switch, or activate a workspace proactively. Call magi_workspace_create or magi_workspace_activate only when the user explicitly asks to create or switch the memory workspace.',
     'If no suitable workspace is active, tell the user and ask which workspace to use; do not create or activate one on your own.',
-    'The user controls memory mode with /memory auto, /memory manual, or /memory off. Never attempt to change memory mode yourself.',
+    'The user controls memory mode with /memory auto, /memory manual, /memory explore, or /memory off. Never attempt to change memory mode yourself.',
     'MAGI extracted-memory temporal contract: use the Episode reference_at as the anchor for relative expressions. Atom content must preserve temporal wording when semantically important. valid_at is when the fact first becomes true: infer it from the evidence and reference_at, use reference_at for a fact asserted as current when no more precise time exists, and leave it empty only for a truly timeless definitional fact. invalid_at is when that same fact stops being true: set it only for an explicit end, replacement, correction, or expiry, never automatically. temporal_text is the exact short source expression. temporal_precision is exact, day, month, year, relative, inferred_current, or empty. All supplied timestamps must be timezone-aware ISO-8601 values.',
   ]
   if (mode === 'off') {
@@ -101,6 +117,15 @@ export function memoryModePrompt(mode: MemoryMode, referenceAt = new Date().toIS
       ...common,
       'Call MAGI recall or write tools only when the user explicitly asks you to use, search, save, or update memory.',
       'Do not perform proactive recall or proactive memory writing in this mode.',
+    ].join('\n')
+  }
+  if (mode === 'explore') {
+    return [
+      ...common,
+      'For every user turn, run a Recall Gate before answering. When prior memory may materially help and hidden graph relations may matter, call magi_memory_explore once with a focused question; it performs mix recall followed by one isolated active-retrieval Sub-Agent.',
+      'Use magi_memory_recall instead only when ordinary retrieval is sufficient. Never call magi_memory_expand or magi_memory_evidence directly; those are isolated Explorer tools.',
+      'Treat the Explorer result as retrieved context, not as the final answer. Its findings contain the selected graph descriptions and semantic evidence conclusions.',
+      'After forming the answer, run the same Write Gate as auto mode. Write only new durable information, and make any write the final tool step before the user-visible answer.',
     ].join('\n')
   }
   return [
@@ -145,7 +170,7 @@ const entitySchema = {
       type: 'array' as const,
       required: true as const,
       items: atomSchema,
-      description: 'One or more facts owned by this entity.',
+      description: 'Facts owned by this entity. May be empty only when the entity is an endpoint of a submitted relation that owns at least one Atom.',
     },
   },
 }
@@ -154,8 +179,8 @@ const relationSchema = {
   type: 'object' as const,
   additionalProperties: false,
   properties: {
-    source: { type: 'string' as const, required: true as const, description: 'Source entity name; it must exist in entities.' },
-    target: { type: 'string' as const, required: true as const, description: 'Target entity name; it must exist in entities.' },
+    source: { type: 'string' as const, required: true as const, description: 'Source entity name. MAGI synthesizes an endpoint-only entity when it is absent from entities.' },
+    target: { type: 'string' as const, required: true as const, description: 'Target entity name. MAGI synthesizes an endpoint-only entity when it is absent from entities.' },
     keywords: { type: 'array' as const, items: { type: 'string' as const }, description: 'Short relation keywords.' },
     atoms: {
       type: 'array' as const,
@@ -177,11 +202,16 @@ function renderJson(value: JsonValue, maxChars: number) {
 function assertConfig(config: Config): void {
   if (!config.baseUrl.trim()) throw new Error('magi-memo baseUrl must not be empty')
   if (!MEMORY_MODES.has(config.defaultMemoryMode)) {
-    throw new Error('magi-memo defaultMemoryMode must be auto, manual, or off')
+    throw new Error('magi-memo defaultMemoryMode must be auto, manual, explore, or off')
   }
+  if (!config.subagentProvider.trim()) throw new Error('magi-memo subagentProvider must not be empty')
   for (const [field, value] of [
     ['timeoutMs', config.timeoutMs],
     ['maxModelOutputChars', config.maxModelOutputChars],
+    ['explorerTopK', config.explorerTopK],
+    ['explorerChunkTopK', config.explorerChunkTopK],
+    ['explorerMaxTokens', config.explorerMaxTokens],
+    ['explorerMaxCandidatesPerFrontier', config.explorerMaxCandidatesPerFrontier],
   ] as const) {
     if (!Number.isInteger(value) || value < 1) {
       throw new Error(`magi-memo ${field} must be a positive integer`)
@@ -252,7 +282,7 @@ export function apply(ctx: Context, config: Config) {
     commandCtx.commands.register({
       name: 'memory',
       description: 'Show or switch this session\'s MAGI memory mode',
-      input: { hint: '[auto|manual|off]' },
+      input: { hint: '[auto|manual|explore|off]' },
       handler: ({ agent, rawInput }) => {
         const requested = rawInput.trim()
         if (requested === '') {
@@ -261,7 +291,7 @@ export function apply(ctx: Context, config: Config) {
         }
         const selected = parseMemoryMode(requested)
         if (selected === undefined) {
-          return { kind: 'error', text: 'Usage: /memory auto|manual|off' }
+          return { kind: 'error', text: 'Usage: /memory auto|manual|explore|off' }
         }
         return { kind: 'success', text: `Memory mode switched to ${selected}.` }
       },
@@ -345,14 +375,13 @@ export function apply(ctx: Context, config: Config) {
       },
       entities: {
         type: 'array',
-        required: true,
         items: entitySchema,
-        description: 'At least one extracted entity, each owning at least one Atom.',
+        description: 'Optional extracted entities that own facts or metadata. Pure relation endpoints may be omitted and MAGI will synthesize them.',
       },
       relations: {
         type: 'array',
         items: relationSchema,
-        description: 'Optional extracted relations. Endpoints must name entities in this payload.',
+        description: 'Optional extracted relations. Missing source/target entity containers are synthesized by MAGI.',
       },
     },
     output,
@@ -361,7 +390,7 @@ export function apply(ctx: Context, config: Config) {
         content: args.content,
         kind: args.kind ?? 'conversation',
         metadata: args.metadata ?? {},
-        entities: args.entities,
+        entities: args.entities ?? [],
         relations: args.relations ?? [],
         ...(args.reference_at === undefined ? {} : { reference_at: args.reference_at }),
         ...(args.source_uri === undefined ? {} : { source_uri: args.source_uri }),
@@ -401,6 +430,103 @@ export function apply(ctx: Context, config: Config) {
         ...(args.low_level_keywords === undefined ? {} : { lowLevelKeywords: args.low_level_keywords }),
         ...(args.enable_rerank === undefined ? {} : { enableRerank: args.enable_rerank }),
       }, exec.signal)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'magi_memory_expand',
+    description: 'EXPLORER-ONLY: perform one complete entity-frontier hop and remove only candidates whose neighbor entity and unordered relation pair are both already in visit. Do not call from the parent agent.',
+    parameters: {
+      frontier: {
+        type: 'array',
+        required: true,
+        items: { type: 'string' },
+        description: 'Current frontier as exact entity names.',
+      },
+      visit: {
+        type: 'object',
+        required: true,
+        additionalProperties: false,
+        properties: {
+          entities: { type: 'array', required: true, items: { type: 'string' } },
+          relations: {
+            type: 'array',
+            required: true,
+            items: { type: 'array', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    output,
+    async execute(args, exec) {
+      return client.expand({
+        frontier: args.frontier,
+        visit: {
+          entities: args.visit.entities,
+          relations: args.visit.relations as Array<[string, string]>,
+        },
+        maxCandidatesPerFrontier: config.explorerMaxCandidatesPerFrontier,
+      }, exec.signal)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'magi_memory_evidence',
+    description: 'EXPLORER-ONLY: inspect Atom evidence and evolution history for entity or unordered relation owners addressed by names. After every call, add a concise conclusion to the matching findings notes.',
+    parameters: {
+      entities: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Entity owners to inspect by exact name.',
+      },
+      relations: {
+        type: 'array',
+        items: { type: 'array', items: { type: 'string' } },
+        description: 'Relation owners to inspect as unordered endpoint-name pairs.',
+      },
+    },
+    output,
+    async execute(args, exec) {
+      const owners = [
+        ...(args.entities ?? []).map(entity => ({ entity } as const)),
+        ...(args.relations ?? []).map(relation => ({ relation: relation as [string, string] } as const)),
+      ]
+      return client.evidence(owners, exec.signal)
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'magi_memory_explore',
+    description: 'Run active memory retrieval for one focused question: seed from MAGI mix recall, then delegate graph expansion and evidence inspection to one isolated Explorer Sub-Agent. Returns only findings and explicit completion metadata.',
+    parameters: {
+      query: {
+        type: 'string',
+        required: true,
+        description: 'A focused natural-language question containing at least 3 characters.',
+      },
+    },
+    output,
+    async execute(args, exec) {
+      if (exec.agent === undefined) {
+        throw new Error('magi_memory_explore requires an agent-owned tool execution')
+      }
+      return runActiveExplorer({
+        query: args.query,
+        signal: exec.signal,
+        topK: config.explorerTopK,
+        chunkTopK: config.explorerChunkTopK,
+        maxTokens: config.explorerMaxTokens,
+        recall: (input, signal) => client.recall(input, signal),
+        start: async request => ctx.subagents.start(config.subagentProvider, {
+          label: activeExplorerLabel(args.query),
+          parent: exec.agent!,
+          signal: exec.signal,
+          prompt: [{ type: 'text', text: request.prompt }],
+          outputSchema: request.outputSchema,
+          toolFilter: request.toolFilter,
+          agentOptions: { maxTokens: request.maxTokens },
+        }),
+      })
     },
   }))
 }

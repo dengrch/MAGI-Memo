@@ -35,13 +35,13 @@ export function apply(ctx: Context, config: Config) { /* registrations */ }
 
 插件配置由 `@deepseek-ai/schemastery` 定义：
 
-| 配置                    |                    默认值 | 作用                                 |
-| ----------------------- | ------------------------: | ------------------------------------ |
-| `baseUrl`             | `http://127.0.0.1:3491` | MAGI Memo 根地址                     |
-| `apiKey`              |                        空 | 可选 API Key，以`X-API-Key` 发送   |
-| `timeoutMs`           |                 `30000` | 单次 HTTP 请求超时                   |
-| `maxModelOutputChars` |                 `30000` | 工具结果进入模型上下文前的最大字符数 |
-| `defaultMemoryMode` |                   `auto` | 尚未执行模式命令时的 Session 默认策略 |
+| 配置                    |                    默认值 | 作用                                  |
+| ----------------------- | ------------------------: | ------------------------------------- |
+| `baseUrl`             | `http://127.0.0.1:3491` | MAGI Memo 根地址                      |
+| `apiKey`              |                        空 | 可选 API Key，以`X-API-Key` 发送    |
+| `timeoutMs`           |                 `30000` | 单次 HTTP 请求超时                    |
+| `maxModelOutputChars` |                 `30000` | 工具结果进入模型上下文前的最大字符数  |
+| `defaultMemoryMode`   |                  `auto` | 尚未执行模式命令时的 Session 默认策略 |
 
 插件加载时会拒绝空 `baseUrl`、非整数或小于 1 的超时和输出上限。
 
@@ -123,7 +123,7 @@ DSH Web 提供两个等价入口：输入栏右侧的“记忆 · 自动/手动/
 
 ### Extracted 写入
 
-`write_extracted` 要求至少一个 entity，每个 entity 和 relation 都至少拥有一个 Atom。relation 的 `source` 与 `target` 必须对应本次 payload 中的实体名称。插件固定发送 `wait_for_completion=false`；MAGI 接收后返回 HTTP 202、Episode ID 与 track ID，DSH 不等待实体消歧、Atom 裁决、时序演化、embedding 或图/向量投影完成。
+`write_extracted` 要求至少包含一个 entity 或 relation。每个 relation 都必须至少拥有一个 Atom；其 `source` 或 `target` 即使没有出现在 `entities` 中，MAGI 也会自动补成 endpoint-only entity。模型不应为了填满实体数组而编造 Entity Atom；如果实体拥有 aliases、type metadata 或自己的事实，仍应显式提交。没有 Atom 且不是任何关系端点的孤立 entity 仍会被拒绝。插件固定发送 `wait_for_completion=false`；MAGI 接收后返回 HTTP 202、Episode ID 与 track ID，DSH 不等待实体消歧、Atom 裁决、时序演化、embedding 或图/向量投影完成。
 
 同步 API 兼容性保持不变：其他客户端省略 `wait_for_completion` 时仍默认等待完成。后台任务由 MAGI API lifespan 统一追踪，服务关闭时会被纳入 drain；处理失败进入服务端日志和文档状态，不会把已经返回给 DSH 的工具调用重新变成同步失败。
 

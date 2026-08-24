@@ -1,18 +1,32 @@
 # MAGI Memo plugin for DeepSeek Harness
 
 This local Cordis plugin connects DeepSeek Harness to the MAGI Memo service at
-`http://127.0.0.1:3491` by default. It registers five model-facing tools:
+`http://127.0.0.1:3491` by default. It registers the ordinary workspace and
+memory tools plus an active-retrieval composite:
 
 - `magi_workspace_create`: create or reuse a workspace and activate it, only on an explicit user request.
 - `magi_workspace_activate`: activate an existing workspace by exact id or name, only on an explicit user request.
 - `magi_memory_write_episode`: enqueue an Episode through MAGI's normal extraction pipeline.
 - `magi_memory_write_extracted`: commit entities, relations, and Atoms already extracted in the current DSH step.
 - `magi_memory_recall`: retrieve structured context through `/query/data` without final-answer generation.
+- `magi_memory_explore`: run mix recall and exactly one isolated Explorer Sub-Agent, returning `visit` and `findings`.
+
+The plugin declares `ctx.subagents` as a required Cordis service and uses the
+configured `spawn` provider by default. The Explorer child can see only
+`magi_memory_expand` and `magi_memory_evidence`; the parent prompt tells the
+parent agent never to call those two internal tools directly. Entity and
+relation stable ids are validated inside MAGI and stripped by the client before
+any recall, expansion, or evidence result reaches model context.
 
 Workspace creation and activation are user-authorized operations. The system
 prompt explicitly forbids the agent from calling either workspace tool
 proactively; ordinary memory operations stay scoped to the currently active
 workspace.
+
+For extracted writes, a relationship endpoint may be omitted from `entities`.
+MAGI synthesizes an endpoint-only entity from `source` or `target`; the
+relationship must still own at least one Atom. The plugin tells the model not to
+invent an Entity Atom merely to satisfy the payload shape.
 
 ## Runtime memory mode
 
@@ -21,6 +35,7 @@ The Web profile registers a session-scoped `/memory` command:
 ```text
 /memory auto
 /memory manual
+/memory explore
 /memory off
 /memory
 ```
@@ -28,8 +43,11 @@ The Web profile registers a session-scoped `/memory` command:
 - `auto` runs a Recall Gate before each answer and a Write Gate at the end;
   neither gate forces a tool call when memory is not useful.
 - `manual` uses recall/write tools only when the user explicitly asks.
+- `explore` enables the Recall Gate to choose `magi_memory_explore` when hidden
+  graph relations may matter. One Sub-Agent owns the iterative context; the
+  parent receives only its structured result.
 - `off` prohibits recall and memory writes.
-- In DSH Web, entering bare `/memory` opens an Auto / Manual / Off popup; the
+- In DSH Web, entering bare `/memory` opens the available mode selector; the
   right-side composer selector uses the same command and session state.
 - Direct host/API execution of `/memory` with no argument reports the current mode.
 
@@ -60,6 +78,11 @@ export MAGI_MEMO_API_KEY=your-x-api-key
 export MAGI_MEMO_TIMEOUT_MS=30000
 export MAGI_MEMO_MAX_OUTPUT_CHARS=30000
 export MAGI_MEMO_DEFAULT_MODE=auto
+export MAGI_MEMO_SUBAGENT_PROVIDER=spawn
+export MAGI_MEMO_EXPLORER_TOP_K=20
+export MAGI_MEMO_EXPLORER_CHUNK_TOP_K=10
+export MAGI_MEMO_EXPLORER_MAX_TOKENS=8192
+export MAGI_MEMO_EXPLORER_MAX_CANDIDATES_PER_FRONTIER=50
 ```
 
 `MAGI_MEMO_API_KEY` is sent as `X-API-Key`. Leave it unset when MAGI authentication
@@ -71,6 +94,6 @@ From the DeepSeek Harness checkout:
 
 ```sh
 node node_modules/typescript/bin/tsc -p magi-memo/tsconfig.check.json
-node --import tsx --test magi-memo/tests/client.test.ts
+node --import tsx --test magi-memo/tests/*.test.ts
 node --import tsx scripts/run-oxlint.ts magi-memo
 ```

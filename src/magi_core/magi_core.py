@@ -60,6 +60,10 @@ from magi_core.constants import (
     DEFAULT_SUMMARY_MAX_TOKENS,
     DEFAULT_SUMMARY_CONTEXT_SIZE,
     DEFAULT_SUMMARY_LENGTH_RECOMMENDED,
+    DEFAULT_MAGI_SUMMARY_DELTA_ATOM_THRESHOLD,
+    DEFAULT_MAGI_SUMMARY_DELTA_TOKEN_THRESHOLD,
+    DEFAULT_MAGI_SUMMARY_DESCRIPTION_TOKEN_BUDGET,
+    DEFAULT_MAGI_SUMMARY_FULL_REBUILD_INTERVAL,
     DEFAULT_MAX_ASYNC,
     DEFAULT_MAX_PARALLEL_INSERT,
     DEFAULT_MAX_GRAPH_NODES,
@@ -573,6 +577,42 @@ class MagiCore(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         )
     )
     """Recommended length of LLM summary output."""
+
+    magi_summary_delta_atom_threshold: int = field(
+        default=get_env_value(
+            "MAGI_SUMMARY_DELTA_ATOM_THRESHOLD",
+            DEFAULT_MAGI_SUMMARY_DELTA_ATOM_THRESHOLD,
+            int,
+        )
+    )
+    """Pending Atom count that triggers owner-summary delta compaction."""
+
+    magi_summary_delta_token_threshold: int = field(
+        default=get_env_value(
+            "MAGI_SUMMARY_DELTA_TOKEN_THRESHOLD",
+            DEFAULT_MAGI_SUMMARY_DELTA_TOKEN_THRESHOLD,
+            int,
+        )
+    )
+    """Pending delta token count that triggers owner-summary compaction."""
+
+    magi_summary_description_token_budget: int = field(
+        default=get_env_value(
+            "MAGI_SUMMARY_DESCRIPTION_TOKEN_BUDGET",
+            DEFAULT_MAGI_SUMMARY_DESCRIPTION_TOKEN_BUDGET,
+            int,
+        )
+    )
+    """Maximum checkpoint plus pending presentation budget before compaction."""
+
+    magi_summary_full_rebuild_interval: int = field(
+        default=get_env_value(
+            "MAGI_SUMMARY_FULL_REBUILD_INTERVAL",
+            DEFAULT_MAGI_SUMMARY_FULL_REBUILD_INTERVAL,
+            int,
+        )
+    )
+    """Incremental compactions allowed before a drift-resetting full rebuild."""
 
     llm_model_max_async: int = field(
         default=get_env_value(
@@ -1157,6 +1197,14 @@ class MagiCore(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             logger.warning(
                 f"max_total_tokens({self.summary_max_tokens}) should greater than summary_length_recommended({self.summary_length_recommended})"
             )
+        for name in (
+            "magi_summary_delta_atom_threshold",
+            "magi_summary_delta_token_threshold",
+            "magi_summary_description_token_budget",
+            "magi_summary_full_rebuild_interval",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be at least 1")
 
         if self.rerank_model_func is not None:
             self.rerank_model_func = priority_limit_async_func_call(

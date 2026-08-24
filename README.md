@@ -1,1600 +1,798 @@
-# MAGI Memo：面向 Agent 的三贤者记忆协商模块
+# MAGI Memo
 
-## 1. 动机：从 RAG 到可协商的个人记忆
+> 面向 Agent 的可演化图谱记忆系统。
 
-早期的 LLM 记忆设计大多从 RAG 开始。
+MAGI Memo 是一个以知识图谱为主要组织与检索结构、面向 Agent 长期记忆场景的图谱记忆系统。它从 LightRAG 的图谱检索内核演化而来，在 Neo4j 语义图之下增加独立的 Episode、Atom、Evidence、实体注册表和双时间记录层，使图中的实体与关系不只是一次抽取产生的静态描述，而是能够持续写入、消歧、演化、追溯和重新物化的长期记忆。
 
-它的基本思路是：
+图谱是 MAGI Memo 的主体：Entity 与 Relation 构成可检索、可遍历的语义网络；Episode、Atom 和 Evidence 是让这张图能够长期维护的底层记忆机制。普通 GraphRAG 回答“哪些节点和关系与问题相关”，MAGI Memo 还要记录“这些图谱事实来自哪里、是否是同一实体、何时成立、后来如何变化，以及当前投影为什么采用这个版本”。
 
-```text
-外部文档 / 历史记录
-  ↓
-切分为 chunk
-  ↓
-embedding / keyword index
-  ↓
-top-k retrieval
-  ↓
-塞入 LLM context
+项目从 LightRAG 的检索内核出发，已经完成两次关键演进：
+
+1. 从文档 RAG 演进为可持续维护的图谱记忆系统；
+2. 从单一服务演进为可被 Agent Harness 调用的记忆基础设施。
+
+当前主线是 DeepSeek Harness（DSH）接入、受预算约束的主动图谱检索，以及 Reflect / 社区摘要研究。未来的 MAGI Sys 才负责人格化的 CASPER、MELCHIOR、BALTHASAR、Blackboard、MQP、MCC 与通用多 Agent 协商。
+
+> [!IMPORTANT]
+> MAGI Memo 当前处于 Beta / research preview。记忆内核、Runtime、REST API、WebUI 和 DSH 插件已经可用；主动检索 v1 正在验收，Reflect、多 Explorer 并发和通用 MCP 入口仍在演进。
+
+## 快速开始
+
+### 1. 环境要求
+
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/)
+- 一个 LLM 与 embedding provider；默认示例使用 OpenAI-compatible API
+- Neo4j（当前完整图谱记忆主路径）
+- Bun（仅修改或重新构建 WebUI 时需要）
+
+### 2. 安装
+
+```bash
+git clone <your-magi-memo-repository>
+cd MAGI-Memo
+uv sync --frozen --extra api --extra offline-storage --extra offline-llm
 ```
 
-这种方式解决了最直接的事实召回问题，但很快暴露出一个核心缺陷：
+### 3. 配置
 
-> 普通 RAG 擅长局部片段命中，却难以回答全局性问题。
-
-例如，当用户询问：
-
-```text
-我长期以来关注的研究方向是什么？
-这个项目和我之前讨论过的方向有什么关系？
-过去几个月我在某个主题上的思路如何演化？
-我现在这个想法是不是继承了之前某条技术路线？
+```bash
+cp env.example .env
 ```
 
-这些问题往往不是命中几个 chunk 就能解决的。
+至少检查以下配置：
 
-它们需要跨越：
+```dotenv
+HOST=127.0.0.1
+PORT=3491
+WORKSPACE_HOME=./mgc-test
 
-```text
-大量片段
-长时间跨度
-多层语义抽象
-实体与实体之间的关系
-用户长期偏好
-项目演化脉络
+LLM_BINDING=openai
+LLM_BINDING_HOST=https://api.openai.com/v1
+LLM_BINDING_API_KEY=your_api_key
+LLM_MODEL=your_model
+
+EMBEDDING_BINDING=openai
+EMBEDDING_BINDING_HOST=https://api.openai.com/v1
+EMBEDDING_BINDING_API_KEY=your_api_key
+EMBEDDING_MODEL=your_embedding_model
+EMBEDDING_DIM=your_embedding_dimension
+
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your_password
+NEO4J_DATABASE=neo4j
 ```
 
-为了缓解普通 RAG 的局部性，人们开始引入层次化 summary、树状索引、文档主题摘要等结构。它们可以在一定程度上回答全局问题，但树状结构通常预设了很强的父子层级关系，而现实中的个人记忆并不总是树状的。
+角色级 LLM 可以用 `EXTRACT_*`、`RESOLVE_*`、`DEDUPLICATE_*`、`KEYWORD_*`、`QUERY_*`、`VLM_*` 单独覆盖。完整变量及注释以 [`env.example`](./env.example) 为准。
 
-真实记忆更像一张不断变化的网络：
+> [!WARNING]
+> 未配置 `AUTH_ACCOUNTS` 或 `LIGHTRAG_API_KEY` 时，服务没有身份验证。仅本机使用请保持 `HOST=127.0.0.1`；暴露到网络前必须配置认证，并检查 `WHITELIST_PATHS`。
 
-```text
-一个项目会连接多个技术概念；
-一个偏好会反复出现在不同对话；
-一个旧想法会在几个月后被重新激活；
-一个新方向可能同时继承多个历史主题；
-同一条记忆可能既是事实，也是偏好，也是项目线索。
+### 4. 启动服务与 WebUI
+
+```bash
+./server
 ```
 
-于是图谱被引入 RAG 和记忆系统。GraphRAG、LightRAG、HippoRAG 等方向试图通过实体、关系、社区、子图和路径结构补足传统 RAG 的不足。
+默认入口：
 
-图谱结构带来了几个重要能力：
+- WebUI：[http://127.0.0.1:3491/](http://127.0.0.1:3491/)
+- 健康检查：[http://127.0.0.1:3491/health](http://127.0.0.1:3491/health)
+- OpenAPI：[http://127.0.0.1:3491/docs](http://127.0.0.1:3491/docs)
 
-1. 通过实体链接跨越 chunk 边界；
-2. 通过关系连接分散在不同上下文中的信息；
-3. 通过子图扩展发现多跳关联；
-4. 通过社区或主题结构形成更高层级抽象；
-5. 通过 evidence trace 保持可解释性。
+也可以使用安装后的入口：
 
-但图谱记忆的代价也很明显。
-
-为了构建可用图谱，系统通常需要大量 LLM 参与：
-
-```text
-实体抽取
-关系抽取
-实体合并
-关系合并
-社区总结
-全局摘要
-查询时子图解释
-冲突判断
+```bash
+magi-core-server
+# 或生产多进程入口
+magi-core-gunicorn
 ```
 
-这使图谱记忆在构建成本、更新成本和查询时延上都变得很重。
+修改 WebUI 后重新构建：
 
-对于个人记忆系统而言，这个问题更加尖锐。个人记忆不是一次性构建的静态知识库，而是持续增长、持续变化、可能冲突、可能过期、可能被用户纠正的动态系统。
-
-因此，真正的个人记忆系统不仅要“查得到”，还要能够：
-
-1. 持续写入；
-2. 持续更新；
-3. 处理冲突；
-4. 处理过期；
-5. 判断哪些记忆值得扩展；
-6. 判断什么时候应该停止；
-7. 在不同记忆范式之间选择合适的调用方式；
-8. 为上层 Agent 构造可用、可解释、可收敛的上下文。
-
-MAGI Memo 就是在这个问题背景下出现的。
-
----
-
-## 2. MAGI 的来源与隐喻
-
-MAGI 的灵感来自《新世纪福音战士》中的 MAGI System。
-
-在 EVA 中，MAGI 是由三台超级计算机组成的决策系统，分别承载开发者赤木直子博士的三种人格侧面：
-
-```text
-科学家
-母亲
-女人
+```bash
+cd src/webui
+bun install --frozen-lockfile
+bun run build:bun
 ```
 
-三台计算机不是简单并行计算，而是从不同人格视角出发，对重大问题进行判断、协商和表决。
+## 为什么图谱还需要记忆语义
 
-MAGI Memo 借用的是这个核心思想：
+普通向量 RAG 擅长回答“哪段文本与问题相似”，GraphRAG 进一步回答“哪些实体和关系连接了这些信息”。但一张长期增长的记忆图谱还必须回答：
 
-> 一个复杂系统不应该只有单一判断视角，而应该由多个认知视角共同参与决策。
+- 两个相似名称是否真的是同一个实体？
+- 这条信息来自哪一次经历？
+- 多次出现的是同一事实、补充、后续状态，还是冲突？
+- 一个事实在现实世界中何时有效，在系统中又何时被记录或淘汰？
+- 删除一段经历后，哪些事实仍有其他证据支持？
+- Agent 应该直接召回，还是沿图谱继续探索隐藏关系？
 
-在 MAGI Memo 中，三贤者不再对应 EVA 原作中的人格身份，而是对应个人记忆系统中的三种认知功能：
-
-```text
-CASPER·3      = Intuition / 直觉
-MELCHIOR·1    = Analysis / 分析
-BALTHASAR·2   = Judgment / 判断
-```
-
-也可以概括为：
+MAGI Memo 因此把检索建立在显式记忆语义之上：
 
 ```text
-CASPER sees.
-MELCHIOR explains.
-BALTHASAR decides.
+Episode
+  └─ Evidence ──> Atom ──> Entity / Relation owner
+                       │
+                       ├─ temporal state & evolution
+                       └─ reliable projection ──> semantic graph / vector retrieval
 ```
 
-中文对应为：
+这带来几个直接能力：
+
+- **可追溯**：每个 Atom 可以由多个 Episode 支持，也能回到原始内容；
+- **会演化**：重复、独立、细化、时间继任与冲突被分别处理；
+- **懂时间**：现实有效时间与系统记录时间互不混淆；
+- **可恢复**：SQLite 是记忆事实源，Neo4j 与向量索引是可重建投影；
+- **可接入**：Python API、REST/WebUI 与 DSH plugin 共用同一套服务端语义；
+- **可探索**：普通召回不足时，隔离的 Explorer 可以只读展开图谱并下钻 Evidence。
+
+因此，“Episode / Atom-aware”是 MAGI Memo 的内部记忆语义，不是项目最上层的品类定位；项目首先是图谱记忆系统，这套语义负责让图谱能够长期演化而不丢失身份、时间和来源。
+
+## 当前能力
+
+| 能力                      | 状态     | 说明                                                               |
+| ------------------------- | -------- | ------------------------------------------------------------------ |
+| Entity / Relation 语义图  | 稳定     | 稳定身份、语义关系、Neo4j 图遍历与可重建 owner description         |
+| LightRAG 检索基座         | 稳定     | 保留`local`、`global`、`hybrid`、`mix`、`naive` 五种模式 |
+| Episode / Atom / Evidence | 稳定     | 原始经历、原子记忆与多对多证据血缘                                 |
+| 实体消歧与 Atom 裁决      | 稳定     | Episode 内归一化、候选召回、批量消歧和五类演化决策                 |
+| 双时间模型                | 稳定写入 | `valid_at` / `invalid_at` 与 `created_at` / `expired_at`   |
+| 可靠投影                  | 稳定     | SQLite transactional outbox 驱动 Neo4j / VDB 最终一致投影          |
+| Runtime / Workspace       | 稳定     | 单 active Runtime、多 Handle、Workspace 隔离、切换与级联删除       |
+| REST API / WebUI          | 可用     | 写入队列、Memory Core、语义图、检索、Workspace 与运行日志          |
+| DSH plugin                | 可用     | Session 级`auto` / `manual` / `explore` / `off` 记忆模式   |
+| 主动图谱检索 v1           | 验收中   | Mix 冷启动、单 Explorer、单跳 expand、Evidence 下钻                |
+| 主动检索 v2 / Reflect     | 规划中   | 热启动、query rewrite、多 Explorer、社区聚类与层次摘要             |
+
+## 架构
 
 ```text
-CASPER 直觉命中。
-MELCHIOR 结构分析。
-BALTHASAR 全局裁决。
+WebUI / Python caller / DSH plugin / future MCP clients
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────────┐
+│ MagiAPI + REST                                               │
+│ stable handles · ingest · search · workspace · status        │
+└──────────────────────────────┬───────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│ MagiRuntime                                                  │
+│ instance lifecycle · in-flight drain · workspace isolation   │
+└──────────────────────────────┬───────────────────────────────┘
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│ MagiCore                                                     │
+│ queue · parsing · extraction · resolution · Atom evolution   │
+│ graph/vector retrieval · active exploration read surface     │
+└───────────────┬──────────────────────┬───────────────────────┘
+                │                      │
+                ▼                      ▼
+┌──────────────────────────┐  ┌───────────────────────────────┐
+│ SQLite: source of truth  │  │ Neo4j + LightRAG projections │
+│ Episode · Atom · Evidence│  │ semantic graph · vector/KV   │
+│ registry · outbox · time │  │ query context · doc status   │
+└──────────────────────────┘  └───────────────────────────────┘
 ```
 
-这个隐喻不是视觉风格，而是系统架构的核心。
+三层公开边界保持清晰：
 
-MAGI Memo 的目标不是做一个更大的检索器，而是让不同记忆视角形成快速、可约束、可回放的协商。
+- `interface` 提供调用方可以依赖的 `MagiAPI` / `MagiHandle`；
+- `magi_runtime` 管理资源生命周期、在途调用和 Workspace；
+- `magi_core` 负责记忆语义、写入管线、图投影与检索。
 
----
+上层 Agent 不应直接持有 SQLite、Neo4j 或底层 LightRAG 资源对象。
 
-## 3. 设计转向：从记忆系统到 Agentic Memory Council
-
-最初的 MAGI Memo 可以被理解为一个可协商的个人记忆召回内核：
+### 写入链路
 
 ```text
-User Query
-  ↓
-BALTHASAR global judgment
-  ↓
-CASPER fast search / activation
-  ↓
-MELCHIOR graph analysis
-  ↓
-BALTHASAR pruning / stop / MCC
-  ↓
-上层模型回答
+Episode
+  → durable queue / parse / chunk
+  → Entity + Relation + Atom + time extraction
+  → Episode-local normalization
+  → batch entity resolution
+  → owner-scoped Atom decision
+  → SQLite transaction + projection outbox
+  → Neo4j / vector / KV materialization
 ```
 
-这个版本的核心是：
+已完成结构化提取的 Agent 也可以通过 `ingest_extracted` 跳过第一次抽取，但仍会经过实体消歧、Atom 裁决、Evidence、幂等写入与可靠投影。
+
+### 检索链路
+
+普通检索沿用 LightRAG 的五种模式：
+
+- `local`：围绕命中实体和邻近关系组织上下文；
+- `global`：从关系与高层结构回答全局问题；
+- `hybrid`：组合 local 与 global；
+- `naive`：直接做文本块向量召回；
+- `mix`：融合知识图谱与向量上下文，通常配合 reranker 使用。
+
+主动检索 v1 在普通 Mix 召回之后增加一个隔离的只读 Explorer：
 
 ```text
-不同记忆范式通过 MQP 交换 query；
-CASPER 负责快速召回；
-MELCHIOR 负责关系分析；
-BALTHASAR 负责全局判断；
-最终生成 MCC。
+query → mix seeds → frontier
+                       ↓
+              expand one hop
+                       ↓
+              select candidate
+                       ↓
+              inspect Evidence
+                       ↓
+             continue or stop
 ```
 
-但继续推演后会遇到一个关键矛盾：
+Explorer 只接收 `expand` 和 `evidence` 两个内部工具，不能写入记忆。它维护紧凑的 `visit` 与 `findings`，所有真实写入仍统一经过单一 Memory Writer。
 
-如果底层选择 Neo4j 或 LightRAG 这样的图谱记忆后端，那么同一个实例本身就可能同时承载：
+## 图谱记忆如何形成
+
+MAGI Memo 的核心不是把 Episode 或 Atom 当成新的检索噱头，而是解决一张长期增长的知识图谱如何保持身份稳定、事实可追溯、状态可演化。写入时依次完成：
 
 ```text
-vector search
-keyword search
-entity lookup
-graph traversal
-hybrid retrieval
-relation expansion
+Episode 证据边界
+  → Entity 身份归一与跨 Episode 消歧
+  → Relation 端点重写与稳定注册
+  → Atom 的 owner 隔离候选过滤
+  → 五类演化裁决与双时间更新
+  → 当前 Entity / Relation description 重新物化
+  → Neo4j 图和向量检索投影
 ```
 
-这时如果把 CASPER 定义成“向量检索模块”，把 MELCHIOR 定义成“图谱检索模块”，二者就会被底层数据库能力吞掉。
+### Episode：一次输入的证据边界
 
-换句话说：
+Episode 是不可变的输入与溯源边界，目前支持：
+
+- `document`：文件或文本输入；
+- `conversation`：由外层 Agent 选择并提交的对话；
+- `multimodal_text`：多模态内容经过分析后的文本表示。
+
+Episode 保存原始内容、来源 URI、参考时间、创建时间和处理状态。长文档可以被切成多个 chunk 并并行抽取，但所有结果仍回到同一个 Episode；chunk 是处理单元，不是长期记忆本体。
+
+### Entity 与 Relation：图谱的稳定骨架
+
+Entity 和 Relation 是 Neo4j 语义图中真正参与检索与遍历的结构。Entity registry 为同一个现实对象维护稳定 ID、规范名称、别名和类型；Relation registry 在完成实体消歧后，用两端稳定 Entity ID 生成稳定 Relation ID。Entity Atom 与 Relation Atom 分别归属于这些 owner。
+
+这样，同一个人被不同 Episode 写成“周航”“Zhou Hang”或明确别名时，可以汇入同一图节点；两个同名但不同的人则可以保留为不同节点。关系端点会在实体裁决后统一重写，不会继续连接抽取阶段的临时名称。
+
+## 实体消歧与分层候选过滤
+
+实体消歧发生在 Atom 裁决之前。只有先确定“这是谁”，后续 Atom 才能被严格限制在正确的 Entity 或 Relation owner 下比较。
+
+### 第一层：Episode 内显式别名归并
+
+同一 Episode 中，系统先根据抽取结果明确给出的主名称与 aliases 做归一化比较和并查集合并：
 
 ```text
-如果三贤者只是三个检索器包装器，
-MAGI Memo 就没有足够独特的系统意义。
+周航 + aliases=[Zhou Hang]
+Zhou Hang + aliases=[周航]
+        ↓
+同一个 Episode-local Entity container
 ```
 
-因此，MAGI Memo 的定位需要进一步改变。
+归并后会同步重写本轮所有 Relation 端点。这里只采用 Episode 明确提供的别名，不凭字符串相似度擅自合并两个实体；归并后变成自环的临时关系会被移除。
 
-新版本中，MAGI Memo 不再被定义为某种 RAG 或图谱记忆后端，而是被定义为：
+### 第二层：从已有实体注册表召回候选
+
+系统使用新实体的主名称和每个 alias，从当前 Workspace 的未过期实体中并行收集多路候选：
+
+| 候选来源    | 当前行为                                          |
+| ----------- | ------------------------------------------------- |
+| Exact       | 规范化 alias 完全一致，基础分数`1.0`            |
+| Lexical     | 新旧名称互为包含，基础分数`0.8`                 |
+| SQLite FTS5 | 名称分词后全文匹配，基础分数`0.7`               |
+| Embedding   | 每个主名称和 alias 独立向量召回，默认阈值`0.72` |
+
+候选按 Entity ID 去重，同一实体从多路命中时保留最高分。默认最终最多保留 8 个候选；每个候选还会补充其最近 8 条 owner Atom 表示，避免模型仅凭名字决定同一性。
+
+只有关系端点、没有 Entity Atom 的 endpoint-only entity 也不会退化成纯名称判断：系统会把它相邻的 Relation Atom 文本作为消歧语义。
+
+### 第三层：Episode 级批量语义裁决
+
+候选生成只负责缩小范围，不直接等同于“已经匹配”。之后本 Episode 中所有拥有候选的实体会进入一次批量 LLM 裁决，并附带最近 4 个 Episode 的上下文：
+
+- 每个新实体只能选择分配给自己的候选 ID，不能越过 allow-list；
+- 主题相似、同名人物、相关组织、版本和父子实体不会自动视为同一对象；
+- 没有任何候选时不调用 LLM，直接创建新实体；
+- 证据不足时模型必须返回 `null`，系统创建新的稳定 Entity；
+- 模型调用失败或返回非法候选时安全地创建新实体，不会误合并既有身份；
+- 新实体若与候选规范名称冲突，会生成可区分的规范名称，避免 namesake 再次碰撞。
+
+成功合并后，本轮新名称与 aliases 会补入既有 Entity，并分别建立名称 embedding。由于整个 commit 边界串行化，两个并发文档不会同时看到空注册表后各自创建重复身份。
 
 ```text
-一个面向 Host Agent 接入的多子 Agent 记忆协商模块。
+Episode-local alias merge
+        ↓
+exact / lexical / FTS / embedding candidate union
+        ↓
+candidate Atom context + recent Episode context
+        ↓
+one batched, allow-listed entity decision
+        ↓
+reuse stable Entity ID or create a new Entity
+        ↓
+rewrite Relation endpoints
 ```
 
-它不替代 LightRAG、RAG-Anything、Neo4j。
+## Atom、Evidence 与分层裁决
 
-它的职责是：
+Atom 是归属于 Entity 或 Relation 的最小可演化事实单元，并不是 Neo4j 节点。Evidence 连接 Atom 与支持它的 Episode：
 
 ```text
-组织多个记忆 Agent 如何调用、讨论、互证、裁决和提交这些后端能力。
+Episode 1 ─┐
+Episode 2 ─┼─ AtomEvidence ─> Atom ─> Entity / Relation owner
+Episode N ─┘
 ```
 
-这使 MAGI Memo 从：
+同一 Atom 可以由多个 Episode 支持。重复事实不会复制 Atom，而是新增 Evidence 并增加 `support_count`，因此系统既能保持事实唯一，又能回溯每一条来源。
+
+Atom 的候选选择也不是把整个数据库交给模型比较，而是逐层收窄。
+
+### 第零层：严格 owner 隔离
+
+Entity Atom 只与同一个 Entity 的 Atom 比较，Relation Atom 只与同一对稳定关系端点的 Atom 比较。不同 owner、Entity 与 Relation、两个不同同名实体之间都不能互选候选。
+
+这是最重要的安全边界：embedding 只决定同一 owner 内哪些历史事实值得进入上下文，不决定事实属于谁。
+
+### 第一层：同一 Episode 的批内归并
+
+长文档的不同 chunk 可能在同一 Episode 中重复或逐步补全一个事实。系统会在访问历史数据库之前，按 owner 对本轮 Atom 分组：
+
+1. `normalized_content + invalid_at` 完全相同的 Atom 直接折叠到最早出现的代表 Atom，Evidence 合并；
+2. 后出现的 Atom 只能指向同 owner、同 Episode 中更早的 Atom，避免环和跨 owner 误判；
+3. owner 内本轮先前 Atom 不超过 16 条时全部进入上下文；
+4. 超过 16 条时使用 embedding Top-K 8（默认阈值 `0.45`），再补最近 4 条，保持时间状态变化可见；
+5. 有语义候选的 Atom 组成一次批量裁决，非法目标或调用失败降级为 `INDEPENDENT`。
+
+批内先处理可以避免同一文档的并行 chunk 因数据库尚未提交而制造重复 Atom，也让同一 Episode 内的细化、后继和冲突能够形成演化链。
+
+### 第二层：历史 Atom 本地快速路径
+
+对每个批内代表 Atom，系统再检查同 owner 的历史：如果一个当前活跃 Atom 同时满足：
 
 ```text
-可协商 RAG
+normalized_content 完全相同
+AND invalid_at 完全相同
 ```
 
-演化为：
+则无需调用 LLM，直接判为 `DUPLICATE`。新 Episode 只为旧 Atom 增加 Evidence。
+
+这里有意不要求 `valid_at` 完全相同：重复陈述可能因为新 Episode 的参考时间而得到较晚的推断起点，但只要文本断言和明确结束时间相同，仍视为同一当前事实。
+
+### 第三层：按历史规模切换上下文
+
+未命中本地快速路径时，系统构造同 owner 的历史候选窗口：
+
+| owner 历史规模 | 候选上下文                                                     |
+| -------------- | -------------------------------------------------------------- |
+| 不超过 16 条   | 提供该 owner 的全部历史 Atom                                   |
+| 超过 16 条     | embedding Top-K 8，默认阈值`0.45`，再补最近 4 条 active Atom |
+
+同时附带 owner 当前 summary 和最近 4 个 Episode 的上下文。embedding 适合找语义相近事实，但可能漏掉“同一属性最近发生变化”的旧状态，所以近期 active tail 是独立的补充通道，不能被相似度 Top-K 取代。
+
+### 第四层：Episode 级批量裁决与结果校验
+
+所有需要访问历史的 Atom 组成一次 Episode 级批量请求。候选 Atom 表在整个请求中去重，但每个 `new_atom` 都有独立的 `candidate_atom_ids` allow-list：
+
+- 模型必须在五类操作中选择一个；
+- 非 `INDEPENDENT` 操作必须指向自己的一个允许候选；
+- 模型不能跨 owner、不能选择未召回的 Atom；
+- 非法 decision、缺失结果、越权目标或模型异常都安全降级为 `INDEPENDENT`；
+- 裁决完成后才确定 Evidence 复用、新 Atom 插入、旧 Atom 时间更新和演化边。
+
+批内裁决和历史裁决分别批量执行；不是为每一个 Atom 单独调用一次 LLM。
+
+## 双时间：事实时间与系统时间
+
+五类决策不是五种“相似度”，而是五种对旧 Atom 的演化操作。判断时始终有两个对象：
+
+- `new_atom`：本次 Episode 新提取出的事实；
+- `matched_atom`：同一 owner 下、经过上述分层过滤后与它最相关的历史事实。
+
+理解这些操作前，必须先区分两条时间轴：
+
+| 时间轴        | 字段                            | 含义                                                   |
+| ------------- | ------------------------------- | ------------------------------------------------------ |
+| 现实有效时间  | `valid_at` / `invalid_at`   | 事实在现实世界中何时开始成立、何时不再成立             |
+| MAGI 系统时间 | `created_at` / `expired_at` | Atom 何时被 MAGI 记录、何时退出当前 description 与投影 |
+
+`expired_at` 不等于“事实为假”，也不是硬删除。它只表示当前 Entity / Relation description 和图谱投影不再采用这个旧版本；旧 Atom、Evidence 和演化链仍保留，用于历史查询、审计和溯源。
+
+例如系统在 2026 年才得知用户 2024 年搬家：
 
 ```text
-Agentic Memory Council
+invalid_at = 2024-03-01   # 旧居住状态在现实世界中结束
+expired_at = 2026-08-24   # MAGI 在此时获知变化并撤下旧投影
 ```
 
-在工程形态上，第一版倾向采用：
+这两条时间轴让“后来才知道的旧变化”和“现在才发生的新变化”不会混为一谈。当前写入和物化已经使用双时间；完整的 query-time 双时间过滤仍属于后续工作。
+
+## 五类 Atom 演化操作
+
+| 决策                           | 新建 Atom | 旧 Atom 增加 Evidence |   旧`invalid_at` |   旧`expired_at` |                        演化记录 |
+| ------------------------------ | --------: | --------------------: | -----------------: | -----------------: | ------------------------------: |
+| `DUPLICATE`                  |        否 |                    是 |               不变 |               不变 |                              无 |
+| `INDEPENDENT`                |        是 |                    否 |               不变 |               不变 |                              无 |
+| `REFINEMENT`                 |        是 |                    否 |               不变 | 设置为当前系统时间 |         `新 → 旧 REFINEMENT` |
+| `TEMPORAL_SUCCESSOR`         |        是 |                    否 | 设置为状态转变时间 | 设置为当前系统时间 | `新 → 旧 TEMPORAL_SUCCESSOR` |
+| `CONTRADICTION`              |        是 |                    否 |           默认不变 |           默认不变 |      `新 → 旧 CONTRADICTION` |
+| `CONTRADICTION + supersedes` |        是 |                    否 |   有可靠时间时设置 | 设置为当前系统时间 |      `新 → 旧 CONTRADICTION` |
+
+演化关系保存在 SQLite 的 `atom_evolution` 表，方向统一为：
 
 ```text
-对外：MCP-first memory server
-对内：轻量 Pi Agent / Pi-style sub-agent
+新 Atom ──REFINES / SUCCEEDS / CONTRADICTS──> 旧 Atom
 ```
 
-也就是说，MAGI Memo 首先作为一个通用 MCP 记忆服务挂载到 Host Agent 上。Codex、Pi Agent 或其他 Host Agent 都可以通过 MCP 调用它。
-
-同时，MAGI Memo 内部的 CASPER、MELCHIOR、BALTHASAR 可以采用轻量化 Pi Agent 范式运行。它们在一次 search、ingest、update、forget 或 reflect 调用中按需启动，使用各自独立 workspace 与 `AGENT.md` 描述自身的记忆角色、协商风格、输出协议和工具边界。
-
-这意味着：
+### 1. DUPLICATE：同一事实的新证据
 
 ```text
-MCP 负责对外稳定；
-Pi-style sub-agent 负责对内灵活；
-LightRAG / RAG-Anything / Neo4j 负责内部记忆能力。
+已有 A1：周航喜欢推理小说
+新建候选 N1：周航喜欢推理小说
 ```
 
----
-
-## 4. 总体架构
+系统不会创建 N1，而是把新 Episode 的 Evidence 指向 A1：
 
 ```text
-Host Agent
-    │
-    │ search / ingest / update / forget / reflect / status / trace
-    ▼
-┌────────────────────────────────────┐
-│             MAGI Memo              │
-│                                    │
-│   CASPER ←→ Shared Blackboard ←→ MELCHIOR
-│                    ↑               │
-│               BALTHASAR            │
-└────────────────────┬───────────────┘
-                     │ GraphPatch
-                     ▼
-          Deterministic Commit Service
-                     │
-                     ▼
-                   Neo4j
+Episode-1 ─Evidence→ A1
+Episode-2 ─Evidence→ A1
 ```
 
-MAGI Memo 作为 Host Agent 可接入的 MCP 记忆模块，对外暴露一组稳定工具。
+结果是系统中仍只有一个 Atom，`support_count` 增加，可以回溯多个 Episode；不产生演化关系，也不修改任何时间字段。同 owner 的活跃 Atom在标准化文本和 `invalid_at` 完全一致时，会走无需 LLM 的本地快速路径。
 
-第一版工具名不加 `magi_` 前缀，因为 MCP server 本身已经代表 MAGI Memo：
+### 2. INDEPENDENT：相关但不同的事实
 
 ```text
-search     协商式记忆搜索
-ingest     写入新记忆
-update     更新已有记忆、实体、路径或关系
-forget     软删除 / 失效标记
-reflect    内部反思、整理、冲突合并
-status     查看 MAGI Memo 状态
-trace      查看运行时追踪
+已有 A1：周航喜欢推理小说
+新增 N1：周航加入了推理社
 ```
 
-Host Agent 不需要知道 MAGI 内部如何启动三个子 Agent，也不需要知道 LightRAG 用了什么 query mode、Neo4j 跑了什么 Cypher、RAG-Anything 如何解析多模态内容。
+两者都属于“周航”，也可能具有很高的语义相似度，但表达的是不同事实。系统会创建 N1、保留 A1，让两者都参与当前 description；二者各自保留 Evidence 和时间区间，不建立 Atom 演化关系。
 
-这些都属于 MAGI Memo 内部实现。
+“独立”不等于完全无关，而是新事实无法被旧事实吸收，也不需要改变旧事实的状态。它同时是安全降级结果：模型输出非法 decision、目标不在 allow-list、目标跨 owner 或调用失败时，系统宁可保留新事实，也不会错误覆盖历史。
 
-MAGI Memo 内部包含三个同层级子 Agent：
+### 3. REFINEMENT：知识表示变得更精确
 
 ```text
-CASPER·3
-MELCHIOR·1
-BALTHASAR·2
+已有 A1：周航曾担任推理社社长
+新增 N1：周航于 2023 年至 2024 年担任明州大学推理社社长
 ```
 
-它们共享：
+N1 没有否定 A1，而是补充了组织、时间和角色边界。系统会：
+
+1. 新建 N1 并保存本次 Evidence；
+2. 建立 `N1 → A1 REFINEMENT`；
+3. 设置 `A1.expired_at = 当前系统时间`；
+4. 保持 `A1.invalid_at` 不变。
+
+旧陈述在现实世界中并没有变成错误，只是作为知识表示不够精确。从现在起，当前图谱描述采用 N1，不再重复物化 A1。旧 Atom 仍然保留，可用于审计、Evidence 回溯和演化链查询。
+
+因此，`REFINEMENT` 是知识版本替换，只操作系统时间，不是现实状态变化。
+
+### 4. TEMPORAL_SUCCESSOR：现实状态后来发生变化
 
 ```text
-Shared Blackboard
-Neo4j graph instance
-LightRAG / RAG-Anything memory backend
-MAGI Query Protocol
-GraphPatch proposal format
+A1：周航居住在北京
+    valid_at = 2022-01-01
+    invalid_at = null
+
+N1：周航于 2024-03-01 搬到上海居住
+    valid_at = 2024-03-01
 ```
 
-但它们各自拥有独立的：
+这是同一属性“居住地”的后续状态。系统形成两个不重叠的现实有效区间：
 
 ```text
-system prompt
-tool handle
-filesystem workspace
-AGENT.md
-working memory
-search policy
-decision policy
+A1 北京：[2022-01-01, 2024-03-01)
+N1 上海：[2024-03-01, ...)
 ```
 
-三贤者不是三个数据库，不是三个 Python class，也不是三个普通 retriever，而是三个围绕同一记忆底座工作的专业记忆子 Agent。
+提交时会：
 
-在 Pi-style sub-agent 范式下，每个子 Agent 的核心认知逻辑主要由其独立 workspace 中的 `AGENT.md` 描述。
+- 新建 N1；
+- 设置 `A1.invalid_at = 2024-03-01`；
+- 设置 `A1.expired_at = 本次写入的系统时间`；
+- 建立 `N1 → A1 TEMPORAL_SUCCESSOR`。
 
-这些 `AGENT.md` 不应该继承通用 coding agent 的偏好，而应该定义：
+状态转变时间优先采用模型给出的 `target_invalid_at`，没有时采用新 Atom 的 `valid_at`；系统还会验证该时间不早于旧 Atom 的 `valid_at`。
+
+这里 `invalid_at` 表示北京居住状态何时在现实中结束，`expired_at` 表示 MAGI 何时获知并处理这次变化。这是双时间最典型的使用场景。
+
+### 5. CONTRADICTION：重叠时间内的不兼容主张
 
 ```text
-记忆角色
-协商边界
-输出格式
-工具权限
-停止原则
-禁止事项
+已有 A1：周航出生于 1990 年
+新增 N1：周航出生于 1991 年
 ```
 
-例如：
+两者不能同时为真，但系统不能仅凭一次模型判断擅自删除旧来源。默认行为是：
 
-```text
-CASPER/AGENT.md    定义直觉激活风格；
-MELCHIOR/AGENT.md  定义图谱分析风格；
-BALTHASAR/AGENT.md 定义全局裁决风格。
-```
+- 新建 N1，同时保留 A1；
+- 两者的 `invalid_at` 和 `expired_at` 默认都不变；
+- 建立 `N1 → A1 CONTRADICTION`；
+- 分别保留双方 Evidence。
 
----
+这表示 MAGI 已知两个主张互相冲突，但暂时不知道哪个可靠。召回时可以把冲突双方、时间与来源一起交给模型，而不是提前抹掉信息。
 
-## 5. 三贤者的新定义
-
-### 5.1 CASPER·3：Intuition / 直觉
-
-CASPER 负责快速激活。
-
-它的工作不是完整解释，也不是深度图谱分析，而是快速回答：
-
-```text
-这次 query 最像什么？
-哪些原始记忆被激活？
-哪些实体种子被激活？
-哪些关键词或近期记忆值得注意？
-有没有明显应该交给 MELCHIOR 深挖的入口？
-```
-
-CASPER 可以调用：
-
-```text
-LightRAG naive mode
-LightRAG hybrid / mix mode 的轻量查询
-关键词检索
-语义向量检索
-entity seed extraction
-recent memory lookup
-```
-
-CASPER 的认知风格应该是：
-
-```text
-快
-短
-局部
-直觉式
-不做最终裁决
-```
-
-它的输出应该极简，因为输出大概率会被其他 Agent 继续消费：
+只有 Episode 明确表达纠正、撤回，或新来源可证明更权威时，模型才能返回 `supersedes_target=true`。此时系统仍保留旧 Atom 与 Evidence，但会设置旧 `expired_at`；只有存在可靠的现实结束时间时，才同时设置旧 `invalid_at`。
 
 ```json
 {
-  "agent": "CASPER",
-  "type": "activation_result",
-  "memory_hits": ["mem_001", "mem_014"],
-  "entity_seeds": ["MAGI Memo", "LightRAG", "RAG-Anything"],
-  "note": "当前问题主要激活图谱底座选型和多 Agent 记忆协商方向。"
+  "decision": "CONTRADICTION",
+  "supersedes_target": true,
+  "target_invalid_at": "2026-08-24T10:00:00Z"
 }
 ```
 
-CASPER 可以是小模型或低成本 Agent。
+如果只是两个来源说法不同，没有明确的纠正、撤回或权威依据，就必须保持 `supersedes_target=false`。
 
-它的价值不在于“更聪明”，而在于快速激活候选空间。
+### 最容易混淆的三组区别
 
----
-
-### 5.2 MELCHIOR·1：Analysis / 分析
-
-MELCHIOR 负责深入图谱搜索和关系分析。
-
-它的工作不是替代 Neo4j，也不是构建完整世界图谱，而是在被激活的记忆范围上回答：
-
-```text
-这些实体之间有什么关系？
-是否存在关系路径？
-是否存在主题簇？
-是否存在冲突？
-是否存在项目演化脉络？
-哪些关系有证据支撑？
-哪些关系值得进入 MCC？
-哪些更新值得形成 GraphPatch？
-```
-
-MELCHIOR 可以调用：
-
-```text
-LightRAG local mode
-LightRAG global mode
-LightRAG mix mode
-Neo4j Cypher query
-graph traversal
-entity neighborhood search
-relation / path / community search
-```
-
-它的认知风格应该是：
-
-```text
-结构化
-证据驱动
-关系敏感
-路径敏感
-不直接写图
-```
-
-示例输出：
-
-```json
-{
-  "agent": "MELCHIOR",
-  "type": "relation_result",
-  "paths": [
-    {
-      "from": "MAGI Memo",
-      "to": "LightRAG",
-      "relation": "candidate_memory_backend",
-      "evidence": ["mem_014"]
-    }
-  ],
-  "note": "LightRAG 更适合作为动态图谱记忆底座，而不是完整替代 MAGI 协商层。"
-}
-```
-
-MELCHIOR 只能提出 GraphPatch proposal。
-
-它不应该直接提交最终写入。
-
----
-
-### 5.3 BALTHASAR·2：Judgment / 判断
-
-BALTHASAR 是三 Agent 记忆系统的 leader。
-
-它掌握更完整的全局信息，包括：
-
-```text
-Global.md
-User profile
-长期偏好
-项目方向
-当前任务目标
-Blackboard 当前状态
-CASPER / MELCHIOR 的结果
-预算与停止条件
-```
-
-BALTHASAR 负责：
-
-```text
-判断是否需要启动协商；
-决定先问 CASPER 还是 MELCHIOR；
-选择 LightRAG query mode；
-控制协商轮次；
-判断信息是否足够；
-裁决 GraphPatch 是否允许提交；
-构造最终 MCC；
-向 Host Agent 返回记忆结果。
-```
-
-BALTHASAR 的职责确实很重。
-
-但这是系统定义决定的，因为只有它掌握最完整的全局信息和最终任务目标。
-
-工程上要避免的问题不是“让 BALTHASAR 变轻”，而是避免它变成一个不可调试的大 prompt。
-
-因此后续应将 BALTHASAR 拆成固定步骤：
-
-```text
-Global Check
-Gap Formulation
-Agent Routing
-Candidate Judge
-Stop Decision
-MCC Builder
-Commit Approval
-```
-
-这样 BALTHASAR 仍然是全局判断者，但每一步都有清晰输入输出，可以日志化、测试和替换。
-
----
-
-## 6. Shared Blackboard
-
-Blackboard 是三个子 Agent 的共享消息空间。
-
-它像一个群聊空间，但不应该只是自然语言聊天记录，而应该是结构化 message buffer。
-
-它负责记录：
-
-```text
-Agent 消息
-MQP 请求
-检索结果
-关系分析
-GraphPatch proposal
-冲突候选
-停止信号
-MCC 草稿
-提交结果
-失败记录
-```
-
-一个最小消息结构可以是：
-
-```json
-{
-  "message_id": "bb_001",
-  "session_id": "session_001",
-  "round": 1,
-  "from_agent": "BALTHASAR",
-  "to_agent": "CASPER",
-  "type": "query",
-  "payload": {
-    "intent": "activate_memory",
-    "query": "比较 Neo4j GraphRAG、LightRAG 和 RAG-Anything 对 MAGI Memo 的适配性"
-  },
-  "priority": 0.82,
-  "ttl": 2,
-  "created_at": "2026-07-27T00:00:00Z"
-}
-```
-
-Blackboard 的关键价值：
-
-1. 支持 Agent 间直接交互；
-2. 支持同层级协商，而不是只有下级向上级汇报；
-3. 支持回放和调试；
-4. 支持去重和轮次控制；
-5. 支持异步执行；
-6. 支持后续评估协商质量。
-
----
-
-## 7. 记忆底座选型
-
-当前倾向：
-
-```text
-LightRAG       = 主文本 / 图谱记忆底座
-RAG-Anything  = 多模态摄入与多模态 RAG 扩展
-Neo4j         = 图数据库实例
-Blackboard    = 三 Agent 协商消息层
-MAGI Runtime  = 调度、协议、裁决与提交层
-```
-
-MAGI Memo 不应该把自己绑定成某个后端的 wrapper。
-
-但在当前阶段，需要一个确定的实例对象来推动工程设计，因此可以先选：
-
-```text
-Neo4j 作为共享图数据库实例；
-LightRAG 作为主要图谱 RAG 底座；
-RAG-Anything 作为多模态 ingestion / retrieval 扩展。
-```
-
-### 7.1 LightRAG
-
-LightRAG 适合作为 MAGI Memo 的核心记忆后端，因为它关注：
-
-```text
-轻量图谱 RAG
-向量 + 图谱双层检索
-多种 query mode
-较低查询成本
-增量更新
-Neo4j graph storage
-文档删除与局部重建
-```
-
-LightRAG 的 query mode 可以自然映射到三贤者：
-
-```text
-naive / hybrid / mix  → CASPER 快速激活
-local / global / mix  → MELCHIOR 关系分析
-mode selection        → BALTHASAR 判断调度
-```
-
-这里的关键是：
-
-```text
-LightRAG 提供能力；
-MAGI Memo 决定谁在什么时候以什么意图调用这些能力。
-```
-
-### 7.2 RAG-Anything
-
-RAG-Anything 更适合作为多模态入口，而不是单独替代 MAGI Memo。
-
-它负责：
-
-```text
-PDF
-Office documents
-images
-tables
-equations
-charts
-multimodal parsing
-multimodal content indexing
-VLM-enhanced query
-```
-
-在 MAGI Memo 中，它可以作为 ingestion layer：
-
-```text
-raw multimodal data
-  ↓
-RAG-Anything parsing / analysis
-  ↓
-LightRAG indexing
-  ↓
-Neo4j graph storage
-  ↓
-MAGI agents search / analysis / judgment
-```
-
-### 7.3 Neo4j
-
-Neo4j 是当前确定的图数据库实例。
-
-三个 Agent 可以共享同一个 Neo4j，但应通过不同工具句柄和不同权限策略访问。
-
-建议原则：
-
-```text
-CASPER: 读为主，轻量检索
-MELCHIOR: 读为主，深度图查询
-BALTHASAR: 读 + 审批写入
-Commit Service: 唯一真正写入方
-```
-
-这样可以避免多个 Agent 直接并发写图造成状态混乱。
-
----
-
-## 8. MQP：MAGI Query Protocol
-
-MQP 的定位也随新架构发生变化。
-
-它不再只是“检索 query 的 JSON 格式”，而应该被定义为：
-
-```text
-MAGI 子 Agent 之间交换记忆任务、证据、疑问、结果和提交请求的协议。
-```
-
-如果没有 MQP，系统会退化成：
-
-```text
-三个 Agent 各查各的；
-最后把结果拼接给 Host Agent。
-```
-
-而有了 MQP，系统才真正变成：
-
-```text
-一个记忆 Agent 发现缺口；
-将缺口翻译成结构化消息；
-另一个记忆 Agent 根据自己的工具和视角补全；
-BALTHASAR 判断这些结果是否足够；
-必要时继续协商；
-最终形成 MCC 或 GraphPatch。
-```
-
-当前不急于完整设计 MQP。
-
-第一阶段只需要最小可运行结构：
-
-```json
-{
-  "id": "mqp_001",
-  "round": 1,
-  "from": "BALTHASAR",
-  "to": "CASPER",
-  "intent": "activate_memory",
-  "query": "用户当前讨论 MAGI Memo 的新架构版本",
-  "basis": ["host_query"],
-  "budget": {
-    "top_k": 5,
-    "ttl": 2
-  }
-}
-```
-
-后续再逐步加入：
-
-```text
-expected_response
-constraints
-risk_control
-information_gap
-deduplicate_against
-confidence_policy
-commit_policy
-```
-
-MQP intent 可以先保留有限枚举：
-
-```text
-activate_memory       激活记忆
-find_evidence         查找证据
-expand_relation       扩展关系
-expand_subgraph       扩展子图
-resolve_conflict      解决冲突
-judge_answerability   判断是否足够回答
-propose_graph_patch   提出图更新
-approve_commit        审批提交
-build_mcc             构造共识上下文
-stop                  停止协商
-```
-
----
-
-## 9. MCP 对外工具
-
-MAGI Memo 第一版以 MCP server 的形式对外暴露工具。
-
-工具名保持简洁：
-
-```text
-search
-ingest
-update
-forget
-reflect
-status
-trace
-```
-
-这些工具不是 LightRAG 或 Neo4j 的直接透传，而是 MAGI Memo 的稳定外部语义。
-
-### 9.1 search
-
-`search` 是 MAGI Memo 最核心的能力。
-
-它通过 CASPER、MELCHIOR、BALTHASAR 三个子 Agent 实现协商机制的记忆搜索。
-
-它不是简单 top-k retrieval，而是：
-
-```text
-Host Agent query
-  ↓
-BALTHASAR 判断搜索意图与预算
-  ↓
-CASPER 快速激活记忆、实体和关键词
-  ↓
-MELCHIOR 搜索图谱路径、关系和结构证据
-  ↓
-BALTHASAR 裁决哪些内容进入上下文
-  ↓
-返回 MCC
-```
-
-`search` 可以返回：
-
-```text
-结构化 MCC
-memory ids
-激活实体
-graph 搜索路径
-关系证据
-不确定性
-回答指导
-可选 trace id
-```
-
-Host Agent 可以根据这些结构化信息继续判断下一步是否需要 `update`、`forget` 或再次 `search`。
-
-### 9.2 ingest
-
-`ingest` 负责写入新记忆。
-
-它配合 LightRAG 后端和 Neo4j 实例完成确定性写入。
-
-MAGI Memo 默认假设 Host Agent 已经决定“这条内容应该被记住”。
-
-因此，`ingest` 前的价值判断不属于 MAGI Memo 默认职责：
-
-```text
-ingest 前是否值得记住 → Host Agent 决定；
-ingest 如何可靠写入   → MAGI Memo 决定；
-ingest 后是否整理反思 → MAGI Memo 可选触发。
-```
-
-输入可以来自：
-
-```text
-conversation
-note
-file
-webpage
-code
-image
-PDF / Office document
-其他多模态资产
-```
-
-内部流程可以是：
-
-```text
-Host Agent ingest
-  ↓
-MAGI ingest service
-  ↓
-raw memory / episode registry
-  ↓
-RAG-Anything parsing if multimodal
-  ↓
-LightRAG indexing
-  ↓
-LightRAG / Neo4j backend stores chunks, entities, relations
-  ↓
-Blackboard ingest event
-  ↓
-optional post-ingest policy
-```
-
-第一版 `ingest` 的目标是可靠写入，而不是每次都启动三贤者协商。
-
-BALTHASAR 不应该成为每条写入的门卫。它只在写入后根据策略判断是否需要进一步动作：
-
-```text
-no action
-quick review
-trigger reflect
-ask CASPER re-activate related memories
-ask MELCHIOR inspect graph relations
-propose / approve GraphPatch
-```
-
-复杂的实体合并、关系合并、偏好抽取和冲突判断可以交给后续 `reflect`。
-
-如果 Host Agent 希望在写入前先判断是否值得记忆，应显式调用 `search` 或未来的 judge 类流程，而不是让 `ingest` 默认承担该判断。
-
-### 9.3 update
-
-`update` 负责更新已有记忆、实体、关系或路径解释。
-
-这里保留 `update` 这个外部工具名，因为它对 Host Agent 更自然。
-
-但 MAGI Memo 内部不应该把 update 理解为“直接修改数据库”。
-
-更安全的实现是：
-
-```text
-Host Agent update request
-  ↓
-MemoryPatch / GraphPatch proposal
-  ↓
-Blackboard
-  ↓
-BALTHASAR approval if needed
-  ↓
-Commit Service
-  ↓
-LightRAG / Neo4j update
-```
-
-`update` 适用于：
-
-```text
-修正某条记忆；
-补充某条记忆的 metadata；
-合并两个实体；
-更新关系描述；
-给关系增加证据；
-标记某条路径解释更可靠；
-将用户纠正转化为新的记忆版本。
-```
-
-Host Agent 可以根据 `search` 返回的结构化信息发起 update。
-
-例如 `search` 返回：
-
-```text
-memory_id
-activated_entities
-graph_paths
-relation_ids
-uncertainties
-```
-
-Host Agent 可以据此决定具体更新哪条记忆、哪个实体、哪条关系或哪条路径解释。
-
-第一阶段 `update` 暂不承担删除语义。
-
-从 LightRAG 后端角度看，`update` 的实现需要谨慎分层：
-
-```text
-entity / relation update:
-可以优先实现，适合映射到 GraphPatch。
-
-memory metadata update:
-可以优先实现，适合在 MAGI 自己的 memory registry 中维护。
-
-document-level content update:
-不建议第一版承诺直接原地更新。
-更稳的策略是生成新版本，必要时让旧版本失效，再重新 ingest。
-```
-
-原因是文档内容一旦变化，chunk、embedding、实体、关系、路径证据都可能变化。
-
-因此，第一版的 `update` 更适合表达：
-
-```text
-受控 patch
-版本化修正
-关系补充
-实体合并
-证据追加
-```
-
-而不是任意覆盖原始文档。
-
-### 9.4 forget
-
-`forget` 负责软删除、失效标记、降权或遗忘策略。
-
-它可以配合 `update` 使用，但不建议合并进 `update` 作为同一个对外工具。
-
-第一版保持：
-
-```text
-update = 修改 / 补充 / 合并
-forget = 失效 / 隐藏 / 降权 / 软删除
-```
-
-二者内部都可以表示为 patch，但对 Host Agent 来说意图和风险不同。未来如果支持 hard delete，`forget` 也需要单独的确认和审计策略。
-
-内部实现上，`forget` 可以复用 `update` 的 MemoryPatch / GraphPatch 管线。
-
-例如：
-
-```json
-{
-  "target": "memory:mem_001",
-  "policy": "soft",
-  "patch": {
-    "valid": false,
-    "invalid_reason": "user_requested_forget",
-    "invalid_at": "2026-07-28T00:00:00Z"
-  }
-}
-```
-
-第一版默认只做 soft forget。
-
-hard delete 可以后续再作为高风险选项设计。
-
-第一版可以这样实现：
-
-```text
-forget(memory_id)
-  ↓
-MemoryPatch(valid=false)
-  ↓
-Commit Service
-  ↓
-MAGI registry / Neo4j edge property 标记失效
-  ↓
-search 时默认过滤无效记忆
-```
-
-等系统稳定后，再考虑真正调用 LightRAG / Neo4j 的 hard delete。
-
-### 9.5 reflect
-
-`reflect` 是 MAGI Memo 的内部反思和整理能力。
-
-这个名字很适合当前架构，因为三贤者会围绕一批记忆反复协商、弹回、修正和收敛。
-
-`reflect` 适用于：
-
-```text
-整理最近记忆；
-提取稳定偏好；
-发现重复实体；
-发现冲突记忆；
-合并关系；
-生成 Global.md 更新候选；
-生成 GraphPatch proposal；
-发现值得长期保留的主题。
-```
-
-它不是普通搜索，而是主动整理。
-
-一个典型流程：
-
-```text
-BALTHASAR 选择反思范围
-  ↓
-CASPER 激活相关记忆集合
-  ↓
-MELCHIOR 分析实体、关系、冲突和演化路径
-  ↓
-BALTHASAR 判断哪些整理值得提交
-  ↓
-GraphPatch / MCC / reflection report
-```
-
-### 9.6 status
-
-`status` 用于查看 MAGI Memo 状态。
-
-它可以返回：
-
-```text
-MCP server 状态
-LightRAG 状态
-Neo4j 连接状态
-RAG-Anything 状态
-Blackboard 状态
-当前 workspace
-pending ingest jobs
-pending GraphPatch
-最近一次错误
-```
-
-### 9.7 trace
-
-`trace` 用于查看运行时追踪。
-
-它主要服务调试和评估。
-
-输入通常是：
-
-```text
-session_id
-trace_id
-message_id
-```
-
-输出可以包括：
-
-```text
-Blackboard 消息
-CASPER 输出
-MELCHIOR 输出
-BALTHASAR 裁决
-LightRAG query mode
-Neo4j 查询摘要
-GraphPatch 状态
-MCC 构造过程
-```
-
-`trace` 不一定给普通 Host Agent 高频调用，但它对于调试 MAGI Memo 是否真的产生了有效协商非常重要。
-
----
-
-## 10. MCC：MAGI Consensus Context
-
-MCC 仍然是 MAGI Memo 给 Host Agent 的主要输出之一。
-
-但它不只是 RAG context，而是：
-
-```text
-三 Agent 协商后的记忆共识包。
-```
-
-普通 RAG context 通常是：
-
-```text
-top-k chunk 拼接
-```
-
-而 MCC 应该是：
-
-```text
-经过直觉激活、图谱分析、全局判断后形成的上下文包。
-```
-
-它应该包含：
-
-1. 已确认事实；
-2. 关键证据；
-3. 关系解释；
-4. 冲突与不确定性；
-5. 用户长期偏好；
-6. 当前回答指导；
-7. 不应过度推断的边界；
-8. 可选 GraphPatch 结果。
-
-示例：
-
-```json
-{
-  "mcc_id": "mcc_001",
-  "status": "consensus_reached",
-  "query": "MAGI Memo 当前架构如何定位？",
-  "confirmed_context": [
-    "MAGI Memo 当前更适合定义为面向 Agent 的多子 Agent 记忆协商模块。",
-    "LightRAG 倾向作为核心文本和图谱记忆底座。",
-    "RAG-Anything 倾向作为多模态摄入层。",
-    "Neo4j 是共享图数据库实例。"
-  ],
-  "remaining_uncertainties": [
-    "MQP schema 尚未详细设计。",
-    "三 Agent 的具体系统提示词与工具权限尚未确定。",
-    "GraphPatch 的事务模型和冲突策略尚未确定。"
-  ],
-  "answering_guidance": [
-    "不要把 MAGI Memo 描述成单一 RAG 后端。",
-    "强调 MAGI 的价值在多 Agent 记忆协商与确定性写入。"
-  ]
-}
-```
-
----
-
-## 11. GraphPatch 与确定性提交
-
-三个 Agent 不应该随意直接修改 Neo4j。
-
-LightRAG 基础索引写入由 LightRAG 自己负责。
-
-MAGI 子 Agent 主动提出的更新、合并、修正、失效和高层关系调整，应该先形成 GraphPatch proposal。
-
-示例：
-
-```json
-{
-  "patch_id": "patch_001",
-  "op": "merge_relation",
-  "source": "MAGI Memo",
-  "target": "LightRAG",
-  "relation": "uses_as_memory_backend",
-  "evidence": ["mem_001", "bb_014"],
-  "confidence": 0.78,
-  "proposed_by": "MELCHIOR",
-  "requires_approval": true
-}
-```
-
-Commit Service 负责：
-
-```text
-schema validation
-idempotency check
-conflict detection
-BALTHASAR approval
-Neo4j transaction
-commit log
-blackboard notification
-```
-
-这让 MAGI Memo 可以保持：
-
-```text
-Agentic reasoning
-Deterministic writing
-Auditable memory update
-```
-
----
-
-## 12. 并发与一致性原则
-
-MAGI Memo 会存在多个 Agent 同时读写候选消息、同时读取 Neo4j、同时提出 GraphPatch 的情况。
-
-因此需要明确：
-
-```text
-Blackboard 可以并发写入；
-Neo4j 读可以并发；
-LightRAG 基础索引写入由 LightRAG 管线负责；
-MAGI 主动 patch 写入必须收敛到 Commit Service；
-GraphPatch 必须幂等；
-Entity / Memory / Relation 必须有唯一 ID；
-重要写入必须可回滚或可标记失效；
-不要物理删除重要记忆，优先 soft delete / invalid_at / superseded_by。
-```
-
-Neo4j 自身提供事务、锁和约束能力，但 MAGI Memo 不应该把全部一致性责任都丢给数据库。
-
-系统层应该主动控制：
-
-```text
-single writer
-commit queue
-version field
-idempotency key
-unique constraint
-append-only audit log
-```
-
----
-
-## 13. 收敛机制
-
-收敛机制是 MAGI Memo 能否真正可用的关键。
-
-如果没有收敛机制，三个子 Agent 之间的消息交换会产生 query explosion，导致时延、成本和状态复杂度失控。
-
-当前阶段，收敛机制主要服务 `search`。
-
-`reflect` 未来也需要收敛机制，但它的目标不是回答当前问题，而是整理记忆、合并冲突、生成候选更新。因此 `reflect` 的收敛规则应该在其设计展开后单独细化。
-
-### 13.1 BALTHASAR-led 协商状态机
-
-`search` 的第一版状态机可以保持简单：
-
 ```text
-Host Agent search
-  ↓
-BALTHASAR Global Check
-  ↓
-Enough?
-  ├── Yes → Build MCC directly
-  └── No  → Send MQP to CASPER / MELCHIOR
-              ↓
-          CASPER Activation
-              ↓
-          Blackboard
-              ↓
-          MELCHIOR Relation Analysis
-              ↓
-          Blackboard
-              ↓
-          BALTHASAR Batch Judge
-              ↓
-          Enough?
-              ├── Yes → MCC / Stop
-              └── No  → Continue until budget limit
-```
-
-`search` 默认只生成 MCC，不默认写入。
+DUPLICATE：没有新增事实，只增加来源。
+REFINEMENT：新增了实质精度，需要一个新 Atom 替换当前知识表示。
 
-如果 `search` 过程中发现明显需要更新的事实、关系或失效记忆，可以返回 candidate patch，但是否调用 `update` 或 `forget` 应交给 Host Agent 或后续策略决定。
+REFINEMENT：我们现在知道得更准确了。
+TEMPORAL_SUCCESSOR：现实世界后来发生了变化。
 
-### 13.2 局部停止与全局停止
-
-CASPER 可以局部停止：
-
-```text
-没有足够新召回内容；
-召回结果重复；
-top-k 分数低；
-query novelty 低；
-已达到召回预算。
+TEMPORAL_SUCCESSOR：两个说法位于不同时间，可以先后成立。
+CONTRADICTION：两个说法在重叠时间范围内无法同时成立。
 ```
 
-MELCHIOR 可以局部停止：
-
-```text
-没有足够相关实体；
-子图扩展增益低；
-关系路径置信度低；
-max_hop / max_nodes 达到上限；
-图扩展没有带来新的有效关系。
-```
+例如“2023 年住北京，2024 年住上海”是 `TEMPORAL_SUCCESSOR`；“同一时期一个来源说住北京，另一个说住上海”才是 `CONTRADICTION`。
 
-BALTHASAR 负责全局停止：
+整体原则是：
 
-```text
-已经足以回答；
-轮次达到限制；
-时间 / token / query 预算达到限制；
-剩余不确定性无法继续解决；
-candidate MQP 的潜力不足；
-MCC 草稿已经稳定。
-```
+> 能复用 Evidence 就不复制 Atom；能保留历史就不删除；只有现实状态确实结束时才写 `invalid_at`；只有旧版本不再参与当前物化时才写 `expired_at`。
 
-### 13.3 Candidate Pool + Batch Gate
+对应实现见 [`src/magi_core/memory/adapter.py`](./src/magi_core/memory/adapter.py)，模型的实体与 Atom 裁决约束见 [`src/magi_core/prompt.py`](./src/magi_core/prompt.py)，批量 allow-list 校验与失败降级见 [`src/magi_core/memory/decisions.py`](./src/magi_core/memory/decisions.py)。
 
-MAGI Memo 不应该让 BALTHASAR 对每个候选逐个判断。
+## 存储与一致性
 
-更合适的方式是：
+每个 Workspace 拥有独立的记录层和投影命名空间：
 
-```text
-cheap expansion
-  ↓
-candidate pool
-  ↓
-cheap heuristic filtering
-  ↓
-batch package
-  ↓
-BALTHASAR batch judge
-  ↓
-top-N MQP routing
-```
+- **SQLite** 保存 Episode、Atom、Evidence、演化、实体/关系注册表、别名、embedding、删除备份与 projection outbox；
+- **Neo4j** 保存实体节点、有语义的关系边、当前物化描述与 `atom_ids`；
+- **LightRAG storage** 保存文本块、向量、KV、缓存和文档处理状态。
 
-这可以将 LLM 调用次数从：
+SQLite 是事实源。跨存储不假装拥有分布式强事务，而是通过 owner revision、幂等重投、版本栅栏、指数退避和启动 reconcile 达成最终一致。
 
-```text
-O(number of candidates)
-```
+## Python API
 
-降低为：
+推荐通过 `MagiAPI` 管理生命周期，而不是让调用方直接管理 Core 和各存储：
 
-```text
-O(number of batches)
-```
+```python
+import asyncio
+from datetime import datetime, timezone
 
-### 13.4 Frontier Budget
+from interface import Episode, EpisodeKind, MagiAPI
+from magi_core import MagiCore
 
-每轮只允许扩展有限数量的 frontier：
 
-```text
-max_frontier_per_round = N
-```
+def build_engine(ragstore, workspace_id):
+    return MagiCore(
+        working_dir=str(ragstore),
+        workspace=workspace_id,
+        llm_model_func=my_llm_model,
+        embedding_func=my_embedding_model,
+        graph_storage="Neo4JStorage",
+    )
 
-无论候选池有多大，真正进入下一轮的 MQP、实体或子图都必须受限。
 
-这类似 beam search。
+async def main():
+    api = MagiAPI.build(
+        workspace_home="./magi-data",
+        workspace_id="personal",
+        core_factory=build_engine,
+    )
+    await api.init()
+    handle = await api.open(owner="example-agent")
 
-### 13.5 待细化：search 与 reflect 的不同收敛目标
+    try:
+        episode = Episode(
+            id="conversation-2026-08-24-001",
+            kind=EpisodeKind.CONVERSATION,
+            content="用户决定将 MAGI Memo 作为长期记忆服务。",
+            reference_at=datetime.now(timezone.utc),
+            source_uri="conversation://2026-08-24/001",
+        )
+        await handle.ingest(episode)
+        result = await handle.search(
+            "用户如何定位 MAGI Memo？",
+            mode="mix",
+            enable_rerank=True,
+        )
+        print(result)
+    finally:
+        await handle.close()
+        await api.finalize()
 
-`search` 的收敛目标是：
 
-```text
-足够回答当前 Host Agent query；
-返回结构化 MCC；
-控制轮次、延迟和 token 成本。
+asyncio.run(main())
 ```
 
-`reflect` 的收敛目标会不同：
+生命周期是：
 
 ```text
-找出值得整理的记忆；
-发现重复、冲突、过期或稳定偏好；
-生成候选 MemoryPatch / GraphPatch；
-避免过度整理和无意义合并。
+build → init → open → ingest/search/status → close → finalize
 ```
-
-因此，`reflect` 不应该直接复用 `search` 的 answerability checklist。它需要自己的 reflection budget、整理范围和提交策略。
-
----
 
-## 14. 架构中仍然巧妙的点
+`index` / `query` 仅作为一期兼容别名保留。直接实例化 `MagiCore` 的底层调用方仍必须显式执行 `await core.initialize_storages()`。
 
-### 14.1 图谱压力被释放
+## REST API 与 WebUI
 
-MAGI Memo 不要求图谱承担所有职责。
+FastAPI 服务同时承载 WebUI 与公开 API。常用接口包括：
 
-LightRAG / Neo4j 负责提供图谱能力，但最终判断、收敛和写入裁决不完全压在图谱算法上。
+| 类别              | 接口                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------- |
+| Workspace         | `GET/POST /workspaces`、`POST /workspaces/{id}/activate`、`DELETE /workspaces/{id}` |
+| 原始写入          | `POST /documents/upload`、`POST /documents/text`、`POST /documents/texts`           |
+| 已抽取写入        | `POST /memory/ingest/extracted`                                                         |
+| 生成式查询        | `POST /query`、`POST /query/stream`                                                   |
+| 结构化召回        | `POST /query/data`                                                                      |
+| Memory inspection | `GET /memory/overview`、`/memory/episodes`、`/memory/atoms`                         |
+| 主动探索原语      | `POST /memory/explore/expand`、`POST /memory/explore/evidence`                        |
+| 图谱              | `GET /graphs` 与 `/graph/*`                                                           |
+| 管线状态          | `GET /documents/pipeline_status`                                                        |
 
-这避免了传统重型 GraphRAG 的几个压力：
+WebUI 当前提供：
 
-```text
-重型 community summary
-全局图谱压缩
-大规模关系总结
-频繁重建索引
-查询时复杂子图解释
-```
+- Episode 上传、文本写入、扫描、队列与错误状态；
+- Episode、Atom、Evidence、Entity、Relation 与演化详情；
+- 语义图可视化和普通检索控制台；
+- Workspace 创建、切换与受控删除；
+- Runtime 状态和近期日志。
 
-### 14.2 三贤者不再是三个后端，而是三个 Agent
+具体请求 schema 以运行中的 `/docs` 为准。
 
-这是新版本最重要的转向。
+## DeepSeek Harness 集成
 
-如果三贤者只是：
+[`sages/dsh/magi-memo`](./sages/dsh/magi-memo/) 是当前主力 Harness 接入：一个本地 Cordis plugin 通过 REST 调用 MAGI Memo，并向 DSH 注册记忆工具。
 
-```text
-CASPER = vector search
-MELCHIOR = graph search
-BALTHASAR = LLM judge
-```
+对模型可见的主要工具包括：
 
-那它们很容易被一个强大的图谱数据库或 GraphRAG 框架吞掉。
+- `magi_memory_write_episode`
+- `magi_memory_write_extracted`
+- `magi_memory_recall`
+- `magi_memory_explore`
+- `magi_workspace_create`
+- `magi_workspace_activate`
 
-但如果三贤者是：
+在 DSH Session 中可动态切换：
 
 ```text
-CASPER = 快速激活记忆空间的子 Agent
-MELCHIOR = 深入解释关系结构的子 Agent
-BALTHASAR = 调度、裁决和全局收敛的子 Agent
+/memory auto
+/memory manual
+/memory explore
+/memory off
+/memory
 ```
-
-那么即使它们共享同一个 Neo4j 实例，系统设计仍然成立。
 
-区别不在底层数据库，而在认知角色、工具权限、工作空间和协商协议。
+- `auto`：每轮执行 Recall Gate 与 Write Gate，但不机械强制工具调用；
+- `manual`：仅在用户明确要求时读写记忆；
+- `explore`：允许在隐藏图关系可能重要时启动一个隔离 Explorer；
+- `off`：禁止记忆召回与写入。
 
-### 14.3 同层级协商比单向汇报更有意思
+模式由 DSH Session log 持久化，恢复或 fork 后仍然有效；Agent 无权自行切换模式。Workspace 的创建和激活同样要求用户明确授权。
 
-很多多 Agent 系统是：
+启动 DSH Web profile：
 
-```text
-worker → supervisor
-worker → supervisor
-worker → supervisor
+```bash
+cd sages/dsh
+pnpm dsh web --patch ./magi-memo/cordis.yml
 ```
 
-MAGI Memo 希望支持：
-
-```text
-CASPER → MELCHIOR
-MELCHIOR → CASPER
-BALTHASAR → CASPER
-BALTHASAR → MELCHIOR
-CASPER / MELCHIOR → Blackboard → BALTHASAR
-```
+默认访问 [http://127.0.0.1:3080](http://127.0.0.1:3080)。完整配置、工具边界和验证命令见 [`sages/dsh/magi-memo/README.md`](./sages/dsh/magi-memo/README.md) 与 [`doc/dsh-magi-memo-plugin.md`](./doc/dsh-magi-memo-plugin.md)。
 
-这让记忆系统不只是下级交付结果，而是形成短促、可约束、可回放的协商过程。
+## MAGI 三贤者现在代表什么
 
-### 14.4 确定性写入保护 Agentic 推理
+MAGI 的命名仍然保留，但在 **Memo** 中代表三条能力研究线，而不是三个常驻人格 Agent：
 
-多 Agent 推理可以是开放的，但记忆写入不能是开放的。
+| 研究线           | 当前含义                                                          |
+| ---------------- | ----------------------------------------------------------------- |
+| CASPER / 直觉    | 让外部 Harness 低开销、可靠地调用基础记忆检索，并持续优化召回效率 |
+| MELCHIOR / 分析  | 受预算约束的主动图谱探索、Evidence 下钻与后续多 Explorer 研究     |
+| BALTHASAR / 判断 | Neo4j/GDS 社区聚类、Reflect、主题识别与带证据血缘的层次摘要       |
 
-因此需要：
+人格、群聊、投票、Blackboard、MQP、MCC 和通用 Agent 状态机属于未来 **MAGI Sys**，不应被描述为 MAGI Memo 的现有功能。
 
-```text
-开放协商
-确定提交
-```
+## 项目阶段与路线图
 
-GraphPatch 和 Commit Service 正是这个边界。
+### 已完成
 
----
+1. **一期：LightRAG + Neo4j 记忆基座**
 
-## 15. 工作计划
+   - 保留成熟的抽取、图谱、向量、文档队列和五种检索模式；
+   - 完成 `magi_core` 命名与工程边界迁移。
+2. **二期：Episode / Atom Memory Core 与 Runtime**
 
-MAGI Memo 将按照“先验证记忆基座，再构建多 Agent 协商，最后完成外部接入”的顺序推进。
+   - Episode、Atom、Evidence、实体/关系注册表与双时间；
+   - 实体消歧、五类 Atom 演化、删除备份与可靠 projection outbox；
+   - `MagiAPI`、多 Handle、Workspace 生命周期、REST 与新版 WebUI。
 
-每个阶段都应形成可运行、可观察、可验证的结果，再进入下一阶段。
+### 当前主线
 
-### 15.1 阶段一：复现 LightRAG 与 Neo4j 记忆基座
+3. **三期：DSH 主动图谱检索与 Reflect**
+   - DSH plugin 与 Session 级记忆模式；
+   - 主动检索 v1：单 Explorer 的 `mix → expand → evidence` 闭环；
+   - 主动检索 v2：冷热启动、自动 query rewrite、自适应多 Explorer；
+   - Neo4j/GDS 社区聚类、Reflect 与证据可追溯的摘要。
 
-首先复现 LightRAG，并将 Neo4j 配置为其图存储实例。
+### 明确不在当前范围
 
-这一阶段需要：
+- 三个常驻人格 Sage 与通用多 Agent 群聊；
+- Blackboard、MQP、MCC 和协商 Session；
+- Memo 自身成为一个完整的 Agent Harness；
+- 让只读 Explorer 直接修改记忆或图谱；
+- 把社区摘要替代为 Atom 事实源。
 
-1. 跑通 LightRAG 的安装、初始化、写入与查询；
-2. 验证 Neo4j storage 的接入方式和数据结构；
-3. 检查 naive、local、global、hybrid、mix 等 query mode 的实际接口与返回结果；
-4. 验证实体、关系、文档的新增、更新、合并和删除能力；
-5. 明确 LightRAG、Neo4j 实例、连接句柄、工作目录和存储后端的生命周期；
-6. 记录版本、配置、限制和已知问题，为后续封装稳定 adapter。
+这些边界让 Memo 专注于一件事：成为可解释、可演化、可被不同 Agent 系统复用的长期记忆层。
 
-阶段目标是得到一条最小端到端链路：
+## 仓库结构
 
 ```text
-Memory input
-  ↓
-LightRAG
-  ↓
-Neo4j
-  ↓
-Query / Graph inspection
+MAGI-Memo/
+├── src/
+│   ├── interface/            # 稳定的 MagiAPI / MagiHandle
+│   ├── magi_runtime/         # 生命周期、Handle、Workspace、BackendBundle
+│   ├── magi_core/            # 记忆语义、管线、存储、检索与 FastAPI
+│   └── webui/                # React 19 + TypeScript + Vite
+├── sages/dsh/
+│   └── magi-memo/            # DSH Cordis plugin 与主动检索编排
+├── doc/                      # 阶段设计、验收、快速开始与存储手册
+├── tests/                    # 后端统一测试树
+├── scripts/                  # 测试、环境与发布工具
+├── env.example               # 完整配置模板
+└── server                    # 本地服务入口
 ```
-
-### 15.2 阶段二：动态记忆、GraphPatch 与 Commit Service
-
-在记忆基座可用后，实现个人记忆的持续写入、更新、修正和失效。
-
-这一阶段需要：
 
-1. 设计 Memory、Entity、Relation、Evidence 等基础对象及其稳定 ID；
-2. 验证 LightRAG 对动态图谱更新的实际支持；
-3. 根据 LightRAG 与 Neo4j 的实现决定 forget 使用失效标记、后端删除或组合策略；
-4. 设计 GraphPatch schema 与 patch 生命周期；
-5. 实现 Commit Service，统一控制对图谱基座和存储后端的修改；
-6. 加入 schema validation、幂等、版本检查、冲突检测、事务、并发控制和审计日志；
-7. 验证重复提交、并发提交、失败恢复和重启后的状态一致性。
+## 进一步阅读
 
-阶段目标是让开放的 Agent 推理只能提出修改建议，所有真实写入都通过受控提交完成。
+- [`doc/memory-core-quickstart.md`](./doc/memory-core-quickstart.md)：Memory Core 使用方式
+- [`doc/phase2-completion-and-phase3-handoff.md`](./doc/phase2-completion-and-phase3-handoff.md)：二期架构与三期交接
+- [`doc/phase3-mag25-active-graph-retrieval-design.md`](./doc/phase3-mag25-active-graph-retrieval-design.md)：主动图谱检索设计
+- [`doc/dsh-magi-memo-plugin.md`](./doc/dsh-magi-memo-plugin.md)：DSH plugin 的工具与安全边界
+- [`doc/magi-storage-schema-manual.md`](./doc/magi-storage-schema-manual.md)：SQLite / Neo4j / VDB 存储模型
+- [`AGENTS.md`](./AGENTS.md)：仓库架构、并发契约与开发约定
 
-### 15.3 阶段三：接入 Pi Agent 与封装 MAGI Core
+`doc/phase*` 中的阶段文档保留了设计演进背景；当历史设计与代码冲突时，以当前代码、测试和本 README 的“状态”标记为准。
 
-在记忆读写稳定后，接入 Pi Agent，并解决现有 TypeScript 生态与 Python 记忆基座之间可能存在的兼容问题。
+## 开发与验证
 
-候选方案包括：
+后端测试：
 
-```text
-编写 TNI 兼容层；
-将记忆基座或 MAGI Core 封装为 extension；
-改用支持 Python 的 Cubi Pi。
-```
+```bash
+# 全部测试
+./scripts/test.sh tests
 
-这一阶段需要完成：
+# 相关子集
+./scripts/test.sh tests/memory tests/interface tests/api
 
-1. 三个 Agent 的创建、启动、停止、恢复和异常处理；
-2. Agent 句柄、模型、工具权限和预算的分配；
-3. CASPER、MELCHIOR、BALTHASAR 独立 workspace 与文件系统边界；
-4. 各自 `AGENT.md`、system prompt、工具策略和停止原则；
-5. Shared Blackboard 的实现；
-6. 将 MQP 定义为 Blackboard 中的标准事件协议；
-7. MCC、GraphPatch、trace 与协商 session 的封装；
-8. 将多 Agent 状态机设计为可配置、可替换、可测试的独立模块；
-9. 优先实现共享群聊式 Blackboard，同时保留点对点调用作为可比较的通信方案。
-
-阶段目标是形成统一的 MAGI Core：
-
-```text
-MAGI Core
-  ├── Agent Runtime
-  ├── Memory Backend
-  ├── Blackboard / MQP
-  ├── State Machine
-  ├── MCC Builder
-  ├── GraphPatch
-  └── Trace
+# 静态检查
+ruff check .
 ```
 
-### 15.4 阶段四：验证多 Agent 核心检索机制
+WebUI：
 
-使用 LoCoMo 中的一段对话数据写入 MAGI Memo，并运行默认协商机制。
-
-重点验证：
-
-1. CASPER 能否快速激活相关记忆；
-2. MELCHIOR 能否发现有效实体、关系和演化路径；
-3. BALTHASAR 能否正确判断信息缺口、控制预算并生成 MCC；
-4. Blackboard / MQP 是否产生了真正有价值的协商，而不是重复传递信息；
-5. 系统能否在有限轮次、token、查询次数和时间预算内停止；
-6. 最终证据、冲突、不确定性和回答指导是否可靠。
-
-收敛机制应作为独立实验变量。可以比较：
-
-```text
-固定顺序状态机
-动态路由状态机
-共享群聊协商
-点对点协商
-规则驱动停止
-prompt 内生停止
+```bash
+cd src/webui
+bun test
+bun run lint
+bun run build
 ```
-
-同时记录检索质量、证据质量、协商轮次、工具调用、token 成本和端到端时延。必要时优化并行度、候选池、batch gate 和 frontier budget。
 
-### 15.5 阶段五：MCP Server、外部 Agent 与 TUI
+DSH plugin：
 
-基础能力验证通过后，将 MAGI Memo 封装为 MCP server，并正式接入 Codex 等 Host Agent。
-
-这一阶段需要：
-
-1. 实现 `search`、`ingest`、`update`、`forget`、`reflect`、`status` 和 `trace`；
-2. 定义稳定的输入输出 schema、错误语义和兼容策略；
-3. 验证外部 Agent 调用、长任务、取消、重试和并发 session；
-4. 制作 MAGI Memo TUI，将 Blackboard 事件、三贤者状态、协商轮次和最终裁决可视化；
-5. TUI 的视觉语言和协商节奏可以参考 EVA 中的 MAGI System，但显示层应与 MAGI Core 解耦。
-
-阶段目标是让 Host Agent 无需了解内部实现，也能稳定调用一个可观察的 Agentic Memory Council。
-
-### 15.6 阶段六：完善 Reflect
-
-在 `search` 状态机稳定后，单独设计 `reflect` 的目标、预算和收敛机制。
-
-重点包括：
-
-```text
-近期记忆整理
-重复实体与关系合并
-冲突和过期信息发现
-稳定偏好提取
-Global.md 更新候选
-MemoryPatch / GraphPatch 生成
-自动提交与人工审批边界
+```bash
+cd sages/dsh
+node node_modules/typescript/bin/tsc -p magi-memo/tsconfig.check.json
+node --import tsx --test magi-memo/tests/*.test.ts
+node --import tsx scripts/run-oxlint.ts magi-memo
 ```
 
-`reflect` 不直接复用 `search` 的 answerability 规则，而应拥有独立、可配置的状态机。
+外部服务测试必须使用 mock；真实 Neo4j、LLM 或其他集成测试按标记与环境变量显式启用。Bug 修复应同时增加回归测试。
 
-### 15.7 后续迭代
+## 来源与致谢
 
-完成基础架构后，再根据实验结果逐步加入：
-
-```text
-RAG-Anything 多模态 ingestion
-更丰富的 MCP 能力
-更成熟的评估集与 benchmark
-更多收敛策略
-缓存与成本优化
-安全、权限与隐私策略
-长期记忆和用户模型
-LoRA / Engram 等实验性记忆范式
-```
+MAGI Memo 直接演化自 [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG)，保留并继续维护其经过验证的抽取、知识图谱、向量检索、存储后端与 API 基础。项目当前的 Episode / Atom 记忆语义、Runtime / Workspace、可靠投影、WebUI 改造和 Agent Harness 接入建立在这套基座之上。
 
-MAGI Memo 的目标不是一次性完成所有记忆能力，而是在可运行、可追踪和可验证的基础上持续演化。
+MAGI 的命名灵感来自《新世纪福音战士》中的 MAGI System；本项目与相关版权方没有隶属或背书关系。

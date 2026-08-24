@@ -3,14 +3,12 @@ import { IconChevronDownOutline14, Menu } from '@deepseek-ai/dsh-client-ui-primi
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { MemoryMode, MemoryModeInjected } from './index.ts'
+import { MEMORY_MODES, type MemoryMode, type MemoryModeInjected } from './index.ts'
 import css from './MemoryModeSelect.module.css'
 
 export type MemoryModeSelectProps = PropsRuntime<'conversation.input.memory'>
   & InjectFace<MemoryModeInjected>
   & PropsLocale<'memoryMode'>
-
-const MODES: readonly MemoryMode[] = ['auto', 'manual', 'off']
 
 export function MemoryModeSelect({ useProjection, locked, setMode, t }: MemoryModeSelectProps) {
   const mode = useProjection('magiMemoryMode')
@@ -24,7 +22,7 @@ export function MemoryModeSelect({ useProjection, locked, setMode, t }: MemoryMo
 
   if (mode === undefined) return null
   const displayed = pending ?? mode
-  const items: MenuEntry[] = MODES.map(value => ({ id: value, label: t(`mode.${value}`) }))
+  const items: MenuEntry[] = MEMORY_MODES.map(value => ({ id: value, label: t(`mode.${value}`) }))
 
   const choose = (value: string): void => {
     setOpen(false)

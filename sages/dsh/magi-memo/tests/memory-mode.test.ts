@@ -10,6 +10,7 @@ function events(...rows: Array<Record<string, unknown>>): SessionEvent[] {
 test('parses supported memory modes only', () => {
   assert.equal(parseMemoryMode(' AUTO '), 'auto')
   assert.equal(parseMemoryMode('manual'), 'manual')
+  assert.equal(parseMemoryMode('explore'), 'explore')
   assert.equal(parseMemoryMode('off'), 'off')
   assert.equal(parseMemoryMode('active'), undefined)
   assert.equal(parseMemoryMode('sometimes'), undefined)
@@ -62,4 +63,11 @@ test('restores the former active spelling as auto from existing logs', () => {
 test('manual and off prompts prohibit proactive memory use', () => {
   assert.match(memoryModePrompt('manual'), /only when the user explicitly asks/)
   assert.match(memoryModePrompt('off'), /Do not call magi_memory_recall/)
+})
+
+test('explore mode delegates active retrieval through one composite tool', () => {
+  const prompt = memoryModePrompt('explore')
+  assert.match(prompt, /magi_memory_explore once/)
+  assert.match(prompt, /one isolated active-retrieval Sub-Agent/)
+  assert.match(prompt, /Never call magi_memory_expand or magi_memory_evidence directly/)
 })

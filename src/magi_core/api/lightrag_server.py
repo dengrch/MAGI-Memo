@@ -144,7 +144,7 @@ class ExtractedEntityRequest(BaseModel):
     name: str = Field(min_length=1)
     aliases: list[str] = Field(default_factory=list)
     entity_type: str | None = None
-    atoms: list[ExtractedAtomRequest] = Field(min_length=1)
+    atoms: list[ExtractedAtomRequest] = Field(default_factory=list)
 
 
 class ExtractedRelationRequest(BaseModel):
@@ -160,7 +160,7 @@ class ExtractedIngestRequest(BaseModel):
     reference_at: datetime | None = None
     source_uri: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    entities: list[ExtractedEntityRequest] = Field(min_length=1)
+    entities: list[ExtractedEntityRequest] = Field(default_factory=list)
     relations: list[ExtractedRelationRequest] = Field(default_factory=list)
     wait_for_completion: bool = True
 
@@ -2416,7 +2416,7 @@ def create_app(args):
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
-    app.include_router(create_memory_routes(memory_db, api_key))
+    app.include_router(create_memory_routes(rag, memory_db, api_key))
 
     workspace_auth = get_combined_auth_dependency(api_key)
 

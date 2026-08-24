@@ -8,7 +8,7 @@ import { en, zh, type MemoryModeKey } from './locales.ts'
 
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionMap {
-    magiMemoryMode: 'auto' | 'manual' | 'off'
+    magiMemoryMode: MemoryMode
   }
 }
 
@@ -18,7 +18,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-export type MemoryMode = 'auto' | 'manual' | 'off'
+export const MEMORY_MODES = ['auto', 'manual', 'explore', 'off'] as const
+export type MemoryMode = typeof MEMORY_MODES[number]
 export interface MemoryModeInjected {
   setMode: (mode: MemoryMode) => Promise<string | null>
 }
@@ -31,7 +32,7 @@ export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind('memoryMode')
   ctx.inject(['commandUi'], (scope: ClientContext) => {
     const command = scope.get('commandUi') as CommandUiContract
-    const options: SelectOption[] = (['auto', 'manual', 'off'] as const).map(mode => ({
+    const options: SelectOption[] = MEMORY_MODES.map(mode => ({
       id: mode,
       label: t(`mode.${mode}`),
     }))
@@ -40,7 +41,7 @@ export function apply(ctx: ClientContext): void {
       available: () => true,
       ui: {
         kind: 'popupSelect',
-        options: async () => options,
+        options: () => Promise.resolve(options),
         onSelect: async (option, session) => {
           const result = await scope.remote.commands.execute(session.sessionId, `/memory ${option.id}`)
           if (!result.ok) throw new Error(`${result.error.message} (${result.error.code})`)

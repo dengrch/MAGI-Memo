@@ -4,6 +4,7 @@ export const zh = {
   'trigger.label': '记忆',
   'mode.auto': '自动',
   'mode.manual': '手动',
+  'mode.explore': '探索',
   'mode.off': '关闭',
   'error': '切换记忆模式失败',
 } satisfies Record<string, string>
@@ -16,6 +17,7 @@ export const en = {
   'trigger.label': 'Memory',
   'mode.auto': 'Auto',
   'mode.manual': 'Manual',
+  'mode.explore': 'Explore',
   'mode.off': 'Off',
   'error': 'Failed to change memory mode',
 } satisfies Record<MemoryModeKey, string>

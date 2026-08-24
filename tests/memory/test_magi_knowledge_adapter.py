@@ -60,6 +60,30 @@ class IndependentDecisions:
         }
 
 
+class RecordingIndependentDecisions(IndependentDecisions):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entity_requests: list[Any] = []
+
+    async def resolve_entities(self, **kwargs: Any) -> dict[str, EntityResolution]:
+        self.entity_requests = list(kwargs.get("requests") or [])
+        return await super().resolve_entities(**kwargs)
+
+
+class ContextSeparatingDecisions(RecordingIndependentDecisions):
+    async def resolve_entities(self, **kwargs: Any) -> dict[str, EntityResolution]:
+        resolutions = await super().resolve_entities(**kwargs)
+        for request in self.entity_requests:
+            if request.name == "Alice" and request.candidates:
+                resolutions[request.key] = EntityResolution(
+                    None,
+                    "Alice",
+                    1.0,
+                    "incident relationship describes a different Alice",
+                )
+        return resolutions
+
+
 class FakeEmbedding:
     embedding_dim = 3
     model_name = "fake-3d"
@@ -115,6 +139,343 @@ class FakeEngine:
 
 
 class MagiKnowledgeAdapterTests(unittest.TestCase):
+    def test_relation_only_endpoints_persist_without_entity_atoms(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                sqlite = SQLiteBackend(
+                    Path(temporary) / "memory.sqlite3", "workspace-a"
+                )
+                await sqlite.initialize()
+                engine = FakeEngine()
+                decisions = RecordingIndependentDecisions()
+                adapter = MagiKnowledgeAdapter(sqlite, decision_provider=decisions)
+                reference = datetime(2026, 8, 5, tzinfo=timezone.utc)
+                episode = Episode(
+                    id="episode-relation-only",
+                    content="Alice became a member of MAGI.",
+                    reference_at=reference,
+                )
+                await sqlite.put_episode(episode)
+                nodes = {
+                    name: [
+                        {
+                            "entity_name": name,
+                            "entity_type": entity_type,
+                            "aliases": [],
+                            "description": "",
+                            "atom_payload": None,
+                            "source_id": "chunk-relation-only",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                            "magi_endpoint_only": True,
+                        }
+                    ]
+                    for name, entity_type in (
+                        ("Alice", "person"),
+                        ("MAGI", "organization"),
+                    )
+                }
+                edges = {
+                    ("Alice", "MAGI"): [
+                        {
+                            "src_id": "Alice",
+                            "tgt_id": "MAGI",
+                            "description": "Alice became a member of MAGI.",
+                            "keywords": "membership",
+                            "weight": 1.0,
+                            "atom_payload": {
+                                "predicate": "member_of",
+                                "valid_at": reference.isoformat(),
+                            },
+                            "source_id": "chunk-relation-only",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                }
+
+                merge = AsyncMock()
+                with patch(
+                    "magi_core.memory.adapter.merge_nodes_and_edges",
+                    new=merge,
+                ):
+                    await adapter.commit(
+                        [(nodes, edges)],
+                        KnowledgeCommitContext(
+                            rag=engine,
+                            doc_id=episode.id,
+                            file_path="episode.txt",
+                        ),
+                    )
+
+                alice = await sqlite.find_entity_exact("Alice")
+                magi = await sqlite.find_entity_exact("MAGI")
+                self.assertIsNotNone(alice)
+                self.assertIsNotNone(magi)
+                self.assertEqual(await sqlite.list_owner_atoms(alice.id), [])
+                self.assertEqual(await sqlite.list_owner_atoms(magi.id), [])
+                relation_id = stable_relation_id("workspace-a", alice.id, magi.id)
+                relation_atoms = await sqlite.list_owner_atoms(relation_id)
+                self.assertEqual(len(relation_atoms), 1)
+                relation_atom = relation_atoms[0]
+                self.assertEqual(relation_atom.subject_entity_id, alice.id)
+                self.assertEqual(relation_atom.object_entity_id, magi.id)
+                self.assertEqual(relation_atom.valid_at, reference)
+                memory = await sqlite.get_atom_memory(relation_atom.id)
+                self.assertEqual(memory.evidence[0].episode_id, episode.id)
+                self.assertEqual(
+                    memory.evidence[0].quote,
+                    "Alice became a member of MAGI.",
+                )
+
+                contexts = {
+                    request.name: request.atom_texts
+                    for request in decisions.entity_requests
+                }
+                self.assertEqual(
+                    contexts,
+                    {
+                        "Alice": ("Alice became a member of MAGI.",),
+                        "MAGI": ("Alice became a member of MAGI.",),
+                    },
+                )
+                projected_nodes = merge.await_args.kwargs["chunk_results"][0][0]
+                self.assertEqual(projected_nodes["Alice"][0]["description"], "")
+                self.assertTrue(
+                    projected_nodes["Alice"][0]["magi_endpoint_only"]
+                )
+                self.assertEqual(
+                    engine.chunk_entity_relation_graph.nodes["Alice"]["atom_ids"],
+                    [],
+                )
+                self.assertNotIn(
+                    "magi_endpoint_only",
+                    engine.chunk_entity_relation_graph.nodes["Alice"],
+                )
+
+                deletion = await sqlite.backup_and_delete_episode(episode.id)
+                self.assertIsNotNone(deletion)
+                overview = await sqlite.memory_overview()
+                self.assertEqual(overview["entities"], 0)
+                self.assertEqual(overview["relations"], 0)
+                self.assertEqual(overview["atoms"], 0)
+                await sqlite.finalize()
+
+        asyncio.run(scenario())
+
+    def test_relation_only_endpoint_reuses_existing_entity_without_copying_atoms(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                sqlite = SQLiteBackend(
+                    Path(temporary) / "memory.sqlite3", "workspace-a"
+                )
+                await sqlite.initialize()
+                engine = FakeEngine()
+                adapter = MagiKnowledgeAdapter(
+                    sqlite, decision_provider=IndependentDecisions()
+                )
+                existing = await sqlite.put_entity(
+                    EntityRecord(
+                        id="entity-alice",
+                        workspace_id="workspace-a",
+                        canonical_name="Alice",
+                        entity_type="person",
+                    )
+                )
+                history_episode = Episode(
+                    id="episode-history", content="Alice is an architect."
+                )
+                await sqlite.put_episode(history_episode)
+                existing_atom = AtomRecord(
+                    id="atom-alice-history",
+                    workspace_id="workspace-a",
+                    owner_id=existing.id,
+                    content="Alice is an architect.",
+                    valid_at=None,
+                )
+                await sqlite.put_atom(
+                    existing_atom,
+                    AtomEvidence(
+                        atom_id=existing_atom.id,
+                        episode_id=history_episode.id,
+                    ),
+                )
+
+                episode = Episode(id="episode-reuse", content="Alice joined MAGI.")
+                await sqlite.put_episode(episode)
+
+                def endpoint(name: str, entity_type: str) -> dict[str, Any]:
+                    return {
+                        "entity_name": name,
+                        "entity_type": entity_type,
+                        "aliases": [],
+                        "description": "",
+                        "atom_payload": None,
+                        "source_id": "chunk-reuse",
+                        "file_path": "episode.txt",
+                        "timestamp": 1,
+                        "magi_endpoint_only": True,
+                    }
+                nodes = {
+                    "Alice": [endpoint("Alice", "person")],
+                    "MAGI": [endpoint("MAGI", "organization")],
+                }
+                edges = {
+                    ("Alice", "MAGI"): [
+                        {
+                            "src_id": "Alice",
+                            "tgt_id": "MAGI",
+                            "description": "Alice joined MAGI.",
+                            "keywords": "membership",
+                            "weight": 1.0,
+                            "atom_payload": {"predicate": "member_of"},
+                            "source_id": "chunk-reuse",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                }
+
+                with patch(
+                    "magi_core.memory.adapter.merge_nodes_and_edges",
+                    new=AsyncMock(),
+                ):
+                    await adapter.commit(
+                        [(nodes, edges)],
+                        KnowledgeCommitContext(
+                            rag=engine,
+                            doc_id=episode.id,
+                            file_path="episode.txt",
+                        ),
+                    )
+
+                resolved = await sqlite.find_entity_exact("Alice")
+                self.assertEqual(resolved.id, existing.id)
+                self.assertEqual(
+                    [atom.id for atom in await sqlite.list_owner_atoms(existing.id)],
+                    [existing_atom.id],
+                )
+                self.assertNotIn(
+                    "magi_endpoint_only",
+                    engine.chunk_entity_relation_graph.nodes["Alice"],
+                )
+                await sqlite.finalize()
+
+        asyncio.run(scenario())
+
+    def test_relation_only_same_name_can_stay_distinct_using_incident_context(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                sqlite = SQLiteBackend(
+                    Path(temporary) / "memory.sqlite3", "workspace-a"
+                )
+                await sqlite.initialize()
+                existing = await sqlite.put_entity(
+                    EntityRecord(
+                        id="entity-existing-alice",
+                        workspace_id="workspace-a",
+                        canonical_name="Alice",
+                        entity_type="software",
+                    )
+                )
+                history = Episode(
+                    id="episode-existing-alice",
+                    content="Alice is a deployment tool.",
+                )
+                await sqlite.put_episode(history)
+                old_atom = AtomRecord(
+                    id="atom-existing-alice",
+                    workspace_id="workspace-a",
+                    owner_id=existing.id,
+                    content="Alice is a deployment tool.",
+                    valid_at=None,
+                )
+                await sqlite.put_atom(
+                    old_atom,
+                    AtomEvidence(atom_id=old_atom.id, episode_id=history.id),
+                )
+
+                decisions = ContextSeparatingDecisions()
+                adapter = MagiKnowledgeAdapter(sqlite, decision_provider=decisions)
+                engine = FakeEngine()
+                episode = Episode(
+                    id="episode-different-alice",
+                    content="Alice joined MAGI as a researcher.",
+                )
+                await sqlite.put_episode(episode)
+
+                def endpoint(name: str, entity_type: str) -> dict[str, Any]:
+                    return {
+                        "entity_name": name,
+                        "entity_type": entity_type,
+                        "aliases": [],
+                        "description": "",
+                        "atom_payload": None,
+                        "source_id": "chunk-different-alice",
+                        "file_path": "episode.txt",
+                        "timestamp": 1,
+                        "magi_endpoint_only": True,
+                    }
+
+                nodes = {
+                    "Alice": [endpoint("Alice", "person")],
+                    "MAGI": [endpoint("MAGI", "organization")],
+                }
+                edges = {
+                    ("Alice", "MAGI"): [
+                        {
+                            "src_id": "Alice",
+                            "tgt_id": "MAGI",
+                            "description": "Alice joined MAGI as a researcher.",
+                            "keywords": "employment",
+                            "weight": 1.0,
+                            "atom_payload": {"predicate": "joined"},
+                            "source_id": "chunk-different-alice",
+                            "file_path": "episode.txt",
+                            "timestamp": 1,
+                        }
+                    ]
+                }
+                with patch(
+                    "magi_core.memory.adapter.merge_nodes_and_edges",
+                    new=AsyncMock(),
+                ):
+                    await adapter.commit(
+                        [(nodes, edges)],
+                        KnowledgeCommitContext(
+                            rag=engine,
+                            doc_id=episode.id,
+                            file_path="episode.txt",
+                        ),
+                    )
+
+                alice_candidates = await sqlite.search_entity_names("Alice")
+                alice_ids = {candidate.object_id for candidate in alice_candidates}
+                self.assertIn(existing.id, alice_ids)
+                self.assertEqual(len(alice_ids), 2)
+                new_alice_id = next(item for item in alice_ids if item != existing.id)
+                magi = await sqlite.find_entity_exact("MAGI")
+                relation_id = stable_relation_id(
+                    "workspace-a", new_alice_id, magi.id
+                )
+                relation_atoms = await sqlite.list_owner_atoms(relation_id)
+                self.assertEqual(len(relation_atoms), 1)
+                self.assertEqual(relation_atoms[0].subject_entity_id, new_alice_id)
+                request = next(
+                    item for item in decisions.entity_requests if item.name == "Alice"
+                )
+                self.assertEqual(
+                    request.atom_texts,
+                    ("Alice joined MAGI as a researcher.",),
+                )
+                await sqlite.finalize()
+
+        asyncio.run(scenario())
+
     def test_resolved_owner_does_not_collapse_distinct_atom_ids(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:
@@ -485,7 +846,9 @@ class MagiKnowledgeAdapterTests(unittest.TestCase):
                 await commit_episode("episode-b")
                 node = engine.chunk_entity_relation_graph.nodes["Alice"]
                 self.assertEqual(node["entity_id"], "Alice")
-                entity_id = node["magi_entity_id"]
+                entity = await sqlite.find_entity_exact("Alice")
+                entity_id = entity.id
+                self.assertEqual(node["magi_entity_id"], entity_id)
                 atoms = await sqlite.list_owner_atoms(entity_id)
                 self.assertEqual(len(atoms), 1)
                 self.assertEqual(atoms[0].support_count, 2)

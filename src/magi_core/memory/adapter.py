@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Sequence
 from uuid import uuid4
@@ -65,6 +67,15 @@ def _score(value: Any) -> float | None:
     if value is None:
         return None
     return min(1.0, max(0.0, float(value)))
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnerDescriptionState:
+    """One internally consistent owner-summary projection snapshot."""
+
+    description: str
+    atoms: list[AtomRecord]
+    checkpoint_revision: int | None
 
 
 class MagiKnowledgeAdapter:
@@ -228,6 +239,511 @@ class MagiKnowledgeAdapter:
                         result["applied"] += 1
         return result
 
+    async def _owner_description_state(
+        self,
+        rag: Any,
+        *,
+        owner_id: str,
+        description_type: str,
+        description_name: str,
+    ) -> _OwnerDescriptionState:
+        """Materialize one owner from a durable checkpoint plus pending delta."""
+
+        atoms: list[AtomRecord] = []
+        current_atoms: list[AtomRecord] = []
+        active_ids: list[str] = []
+        atom_by_id: dict[str, AtomRecord] = {}
+        global_config = rag._build_global_config()
+        prompt_version = "magi-owner-summary-checkpoint-v1"
+        model_identity = json.dumps(
+            (global_config.get("llm_cache_identities") or {}).get("extract")
+            or {"model": global_config.get("llm_model_name")},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        delta_atom_threshold = max(
+            1,
+            int(
+                global_config.get(
+                    "magi_summary_delta_atom_threshold",
+                    global_config.get("force_llm_summary_on_merge", 8),
+                )
+            ),
+        )
+        delta_token_threshold = max(
+            1,
+            int(
+                global_config.get(
+                    "magi_summary_delta_token_threshold",
+                    global_config.get("summary_max_tokens", 1200),
+                )
+            ),
+        )
+        description_budget = max(
+            1,
+            int(
+                global_config.get(
+                    "magi_summary_description_token_budget",
+                    global_config.get("summary_context_size", 12000),
+                )
+            ),
+        )
+        rebuild_interval = max(
+            1,
+            int(global_config.get("magi_summary_full_rebuild_interval", 8)),
+        )
+
+        def state(
+            description: str,
+            checkpoint_row: dict[str, Any] | None,
+        ) -> _OwnerDescriptionState:
+            return _OwnerDescriptionState(
+                description=description,
+                atoms=atoms,
+                checkpoint_revision=(
+                    int(checkpoint_row["summary_revision"])
+                    if checkpoint_row is not None
+                    else None
+                ),
+            )
+
+        def token_count(parts: Sequence[str]) -> int:
+            tokenizer = global_config.get("tokenizer")
+            if tokenizer is None:
+                return sum(len(part.split()) for part in parts)
+            return sum(len(tokenizer.encode(part)) for part in parts)
+
+        async def summarize(
+            parts: list[str],
+            *,
+            cache_identity: dict[str, Any],
+        ) -> tuple[str, bool, bool]:
+            required = (
+                "tokenizer",
+                "summary_context_size",
+                "summary_max_tokens",
+                "force_llm_summary_on_merge",
+            )
+            if not all(key in global_config for key in required):
+                return (
+                    GRAPH_FIELD_SEP.join(part for part in parts if part),
+                    False,
+                    True,
+                )
+            summary_stats: dict[str, Any] = {
+                "lineage_valid": True,
+                "llm_calls": 0,
+            }
+            description, llm_was_used = await _handle_entity_relation_summary(
+                description_type,
+                description_name,
+                parts,
+                GRAPH_FIELD_SEP,
+                global_config,
+                getattr(rag, "llm_response_cache", None),
+                summary_cache_identity=cache_identity,
+                summary_stats=summary_stats,
+            )
+            return (
+                description,
+                llm_was_used,
+                bool(summary_stats["lineage_valid"]),
+            )
+
+        def checkpoint_hash(checkpoint: dict[str, Any] | None) -> str | None:
+            if checkpoint is None:
+                return None
+            summary = str(checkpoint.get("checkpoint_summary") or "")
+            return hashlib.sha256(summary.encode("utf-8")).hexdigest()
+
+        def updated_metrics(
+            checkpoint: dict[str, Any] | None,
+            *,
+            mode: str,
+            input_tokens: int,
+            saved_tokens: int,
+            llm_was_used: bool,
+        ) -> dict[str, Any]:
+            metrics = dict((checkpoint or {}).get("metrics") or {})
+            metrics[f"{mode}_compaction_count"] = int(
+                metrics.get(f"{mode}_compaction_count", 0)
+            ) + 1
+            if llm_was_used:
+                metrics[f"{mode}_llm_call_count"] = int(
+                    metrics.get(f"{mode}_llm_call_count", 0)
+                ) + 1
+            metrics["last_input_tokens"] = input_tokens
+            metrics["total_input_tokens"] = int(
+                metrics.get("total_input_tokens", 0)
+            ) + input_tokens
+            metrics["last_saved_tokens"] = saved_tokens
+            metrics["total_saved_tokens"] = int(
+                metrics.get("total_saved_tokens", 0)
+            ) + saved_tokens
+            metrics["last_lineage_valid"] = True
+            metrics["rebuild_required"] = False
+            return metrics
+
+        async def record_lineage_failure(
+            *,
+            checkpoint: dict[str, Any] | None,
+            expected_revision: int | None,
+            mode: str,
+            visible_description: str,
+        ) -> _OwnerDescriptionState | None:
+            metrics = dict((checkpoint or {}).get("metrics") or {})
+            metrics["last_lineage_valid"] = False
+            metrics["rebuild_required"] = mode == "rebuild"
+            reason = f"lineage_validation_failed:{mode}"
+            if checkpoint is None:
+                checkpoint_summary = ""
+                covered_ids: list[str] = []
+                pending_ids = active_ids
+                compaction_count = 0
+                last_compacted_at = None
+            else:
+                checkpoint_summary = str(checkpoint["checkpoint_summary"])
+                covered_ids = list(checkpoint["covered_atom_ids"])
+                pending_ids = list(checkpoint["pending_atom_ids"])
+                compaction_count = int(
+                    checkpoint["incremental_compaction_count"]
+                )
+                last_compacted_at = checkpoint["last_compacted_at"]
+            updated = await self.sqlite.compare_and_set_owner_summary_checkpoint(
+                owner_id,
+                expected_revision=expected_revision,
+                checkpoint_summary=checkpoint_summary,
+                covered_atom_ids=covered_ids,
+                pending_atom_ids=pending_ids,
+                prompt_version=prompt_version,
+                model_identity=model_identity,
+                incremental_compaction_count=compaction_count,
+                last_compacted_at=last_compacted_at,
+                reason=reason,
+                metrics=metrics,
+            )
+            if not updated:
+                return None
+            return state(
+                visible_description,
+                {
+                    "summary_revision": (
+                        1 if expected_revision is None else expected_revision + 1
+                    ),
+                    "covered_atom_ids": covered_ids,
+                    "pending_atom_ids": pending_ids,
+                    "incremental_compaction_count": compaction_count,
+                    "last_reason": reason,
+                    "last_compacted_at": last_compacted_at,
+                    "metrics": metrics,
+                },
+            )
+
+        def raw_active_description() -> str:
+            return GRAPH_FIELD_SEP.join(
+                atom.presentation() for atom in current_atoms
+            )
+
+        async def active_snapshot_is_current() -> bool:
+            latest_atoms = await self.sqlite.list_owner_atoms(owner_id)
+            return [
+                atom.id for atom in latest_atoms if atom.expired_at is None
+            ] == active_ids
+
+        for _ in range(4):
+            atoms = await self.sqlite.list_owner_atoms(owner_id)
+            current_atoms = [atom for atom in atoms if atom.expired_at is None]
+            active_ids = [atom.id for atom in current_atoms]
+            atom_by_id = {atom.id: atom for atom in current_atoms}
+            checkpoint = await self.sqlite.get_owner_summary_checkpoint(owner_id)
+            expected_revision = (
+                int(checkpoint["summary_revision"])
+                if checkpoint is not None
+                else None
+            )
+            rebuild_reason: str | None = None
+            if checkpoint is None:
+                rebuild_reason = "missing_checkpoint"
+            elif (checkpoint.get("metrics") or {}).get("rebuild_required"):
+                rebuild_reason = "lineage_validation_failed"
+            elif (
+                checkpoint["prompt_version"] != prompt_version
+                or checkpoint["model_identity"] != model_identity
+            ):
+                rebuild_reason = "summary_identity_changed"
+            else:
+                covered = set(checkpoint["covered_atom_ids"])
+                if covered.difference(active_ids):
+                    rebuild_reason = "covered_atom_removed"
+
+            if rebuild_reason is not None:
+                presentations = [atom.presentation() for atom in current_atoms]
+                try:
+                    rebuilt, llm_was_used, lineage_valid = await summarize(
+                        presentations,
+                        cache_identity={
+                            "summary_schema": prompt_version,
+                            "mode": "rebuild",
+                            "reason": rebuild_reason,
+                            "previous_revision": expected_revision,
+                            "previous_checkpoint_hash": checkpoint_hash(checkpoint),
+                            "active_atom_ids": active_ids,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "LLMmrg(rebuild) failed: %s | active=%d, reason=%s",
+                        owner_id,
+                        len(active_ids),
+                        rebuild_reason,
+                    )
+                    if not await active_snapshot_is_current():
+                        continue
+                    return state(raw_active_description(), checkpoint)
+                if not await active_snapshot_is_current():
+                    continue
+                if not lineage_valid:
+                    failed_state = await record_lineage_failure(
+                        checkpoint=checkpoint,
+                        expected_revision=expected_revision,
+                        mode="rebuild",
+                        visible_description=raw_active_description(),
+                    )
+                    if failed_state is not None:
+                        return failed_state
+                    continue
+                compacted_at = utc_now().isoformat()
+                metrics = updated_metrics(
+                    checkpoint,
+                    mode="rebuild",
+                    input_tokens=token_count(presentations),
+                    saved_tokens=0,
+                    llm_was_used=llm_was_used,
+                )
+                updated = await self.sqlite.compare_and_set_owner_summary_checkpoint(
+                    owner_id,
+                    expected_revision=expected_revision,
+                    checkpoint_summary=rebuilt,
+                    covered_atom_ids=active_ids,
+                    pending_atom_ids=(),
+                    prompt_version=prompt_version,
+                    model_identity=model_identity,
+                    incremental_compaction_count=0,
+                    last_compacted_at=compacted_at,
+                    reason=f"rebuild:{rebuild_reason}",
+                    metrics=metrics,
+                )
+                if updated:
+                    action = "LLMmrg" if llm_was_used else "Summary checkpointed"
+                    logger.info(
+                        "%s(rebuild): %s | active=%d, reason=%s, input_tokens=%d",
+                        action,
+                        owner_id,
+                        len(active_ids),
+                        rebuild_reason,
+                        metrics["last_input_tokens"],
+                    )
+                    return state(
+                        rebuilt,
+                        {
+                            "summary_revision": (
+                                1
+                                if expected_revision is None
+                                else expected_revision + 1
+                            ),
+                            "covered_atom_ids": active_ids,
+                            "pending_atom_ids": [],
+                            "incremental_compaction_count": 0,
+                            "last_reason": f"rebuild:{rebuild_reason}",
+                            "last_compacted_at": compacted_at,
+                            "metrics": metrics,
+                        },
+                    )
+                continue
+
+            covered_ids = list(checkpoint["covered_atom_ids"])
+            covered = set(covered_ids)
+            prior_pending = set(checkpoint["pending_atom_ids"])
+            pending_set = prior_pending.intersection(active_ids)
+            pending_set.update(
+                atom_id
+                for atom_id in active_ids
+                if atom_id not in covered and atom_id not in prior_pending
+            )
+            pending_ids = [atom_id for atom_id in active_ids if atom_id in pending_set]
+            if pending_ids != checkpoint["pending_atom_ids"]:
+                if not await active_snapshot_is_current():
+                    continue
+                updated = await self.sqlite.compare_and_set_owner_summary_checkpoint(
+                    owner_id,
+                    expected_revision=expected_revision,
+                    checkpoint_summary=str(checkpoint["checkpoint_summary"]),
+                    covered_atom_ids=covered_ids,
+                    pending_atom_ids=pending_ids,
+                    prompt_version=prompt_version,
+                    model_identity=model_identity,
+                    incremental_compaction_count=int(
+                        checkpoint["incremental_compaction_count"]
+                    ),
+                    last_compacted_at=checkpoint["last_compacted_at"],
+                    reason="pending_delta_updated",
+                    metrics=checkpoint.get("metrics"),
+                )
+                if not updated:
+                    continue
+                checkpoint = {
+                    **checkpoint,
+                    "pending_atom_ids": pending_ids,
+                    "summary_revision": expected_revision + 1,
+                    "last_reason": "pending_delta_updated",
+                }
+                expected_revision += 1
+
+            checkpoint_summary = str(checkpoint["checkpoint_summary"] or "")
+            pending_presentations = [
+                atom_by_id[atom_id].presentation() for atom_id in pending_ids
+            ]
+            materialized_parts = [
+                part for part in (checkpoint_summary, *pending_presentations) if part
+            ]
+            materialized = GRAPH_FIELD_SEP.join(materialized_parts)
+            if not pending_ids:
+                if not await active_snapshot_is_current():
+                    continue
+                logger.info(
+                    "Summary reused: %s | covered=%d, delta=0",
+                    owner_id,
+                    len(covered_ids),
+                )
+                return state(checkpoint_summary, checkpoint)
+
+            pending_tokens = token_count(pending_presentations)
+            should_compact = (
+                len(pending_ids) >= delta_atom_threshold
+                or pending_tokens >= delta_token_threshold
+                or token_count(materialized_parts) >= description_budget
+            )
+            if not should_compact:
+                if not await active_snapshot_is_current():
+                    continue
+                logger.info(
+                    "Summary pending: %s | covered=%d, delta=%d",
+                    owner_id,
+                    len(covered_ids),
+                    len(pending_ids),
+                )
+                return state(materialized, checkpoint)
+
+            compaction_count = int(checkpoint["incremental_compaction_count"])
+            do_full_rebuild = compaction_count + 1 >= rebuild_interval
+            reason = (
+                "periodic_full_rebuild" if do_full_rebuild else "delta_threshold"
+            )
+            summary_inputs = (
+                [atom.presentation() for atom in current_atoms]
+                if do_full_rebuild
+                else materialized_parts
+            )
+            try:
+                compacted, llm_was_used, lineage_valid = await summarize(
+                    summary_inputs,
+                    cache_identity={
+                        "summary_schema": prompt_version,
+                        "mode": "rebuild" if do_full_rebuild else "delta",
+                        "reason": reason,
+                        "previous_revision": expected_revision,
+                        "previous_checkpoint_hash": hashlib.sha256(
+                            checkpoint_summary.encode("utf-8")
+                        ).hexdigest(),
+                        "pending_atom_ids": pending_ids,
+                        "active_atom_ids": active_ids if do_full_rebuild else [],
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "LLMmrg(%s) failed: %s | delta=%d",
+                    "rebuild" if do_full_rebuild else "delta",
+                    owner_id,
+                    len(pending_ids),
+                )
+                if not await active_snapshot_is_current():
+                    continue
+                return state(materialized, checkpoint)
+            if not await active_snapshot_is_current():
+                continue
+            if not lineage_valid:
+                failed_state = await record_lineage_failure(
+                    checkpoint=checkpoint,
+                    expected_revision=expected_revision,
+                    mode="rebuild" if do_full_rebuild else "delta",
+                    visible_description=(
+                        raw_active_description() if do_full_rebuild else materialized
+                    ),
+                )
+                if failed_state is not None:
+                    return failed_state
+                continue
+            compacted_at = utc_now().isoformat()
+            full_active_tokens = token_count(
+                [atom.presentation() for atom in current_atoms]
+            )
+            input_tokens = token_count(summary_inputs)
+            metrics = updated_metrics(
+                checkpoint,
+                mode="rebuild" if do_full_rebuild else "delta",
+                input_tokens=input_tokens,
+                saved_tokens=(
+                    0 if do_full_rebuild else max(0, full_active_tokens - input_tokens)
+                ),
+                llm_was_used=llm_was_used,
+            )
+            updated = await self.sqlite.compare_and_set_owner_summary_checkpoint(
+                owner_id,
+                expected_revision=expected_revision,
+                checkpoint_summary=compacted,
+                covered_atom_ids=active_ids,
+                pending_atom_ids=(),
+                prompt_version=prompt_version,
+                model_identity=model_identity,
+                incremental_compaction_count=(
+                    0 if do_full_rebuild else compaction_count + 1
+                ),
+                last_compacted_at=compacted_at,
+                reason=reason,
+                metrics=metrics,
+            )
+            if updated:
+                action = "LLMmrg" if llm_was_used else "Summary checkpointed"
+                logger.info(
+                    "%s(%s): %s | checkpoint_revision=%d, delta=%d, "
+                    "input_tokens=%d, saved_tokens=%d",
+                    action,
+                    "rebuild" if do_full_rebuild else "delta",
+                    owner_id,
+                    expected_revision,
+                    len(pending_ids),
+                    metrics["last_input_tokens"],
+                    metrics["last_saved_tokens"],
+                )
+                return state(
+                    compacted,
+                    {
+                        "summary_revision": expected_revision + 1,
+                        "covered_atom_ids": active_ids,
+                        "pending_atom_ids": [],
+                        "incremental_compaction_count": (
+                            0 if do_full_rebuild else compaction_count + 1
+                        ),
+                        "last_reason": reason,
+                        "last_compacted_at": compacted_at,
+                        "metrics": metrics,
+                    },
+                )
+
+        atoms = await self.sqlite.list_owner_atoms(owner_id)
+        current_atoms = [atom for atom in atoms if atom.expired_at is None]
+        return state(raw_active_description(), None)
+
     async def _owner_description(
         self,
         rag: Any,
@@ -236,17 +752,48 @@ class MagiKnowledgeAdapter:
         description_type: str,
         description_name: str,
     ) -> tuple[str, list[AtomRecord]]:
-        atoms = await self.sqlite.list_owner_atoms(owner_id)
-        current_atoms = [atom for atom in atoms if atom.expired_at is None]
-        description, _ = await _handle_entity_relation_summary(
-            description_type,
-            description_name,
-            [atom.presentation() for atom in current_atoms],
-            GRAPH_FIELD_SEP,
-            rag._build_global_config(),
-            getattr(rag, "llm_response_cache", None),
+        """Compatibility wrapper for callers that only need text and Atoms."""
+
+        result = await self._owner_description_state(
+            rag,
+            owner_id=owner_id,
+            description_type=description_type,
+            description_name=description_name,
         )
-        return description, atoms
+        return result.description, result.atoms
+
+    async def _projection_description_state(
+        self,
+        rag: Any,
+        *,
+        owner_id: str,
+        description_type: str,
+        description_name: str,
+    ) -> _OwnerDescriptionState:
+        """Read a current checkpoint snapshot without exposing its revision to KG."""
+
+        state = await self._owner_description_state(
+            rag,
+            owner_id=owner_id,
+            description_type=description_type,
+            description_name=description_name,
+        )
+        for _ in range(3):
+            checkpoint = await self.sqlite.get_owner_summary_checkpoint(owner_id)
+            current_revision = (
+                int(checkpoint["summary_revision"])
+                if checkpoint is not None
+                else None
+            )
+            if current_revision == state.checkpoint_revision:
+                return state
+            state = await self._owner_description_state(
+                rag,
+                owner_id=owner_id,
+                description_type=description_type,
+                description_name=description_name,
+            )
+        return state
 
     async def _project_entity_record(
         self,
@@ -254,12 +801,14 @@ class MagiKnowledgeAdapter:
         entity: EntityRecord,
     ) -> None:
         graph = rag.chunk_entity_relation_graph
-        description, atoms = await self._owner_description(
+        summary_state = await self._projection_description_state(
             rag,
             owner_id=entity.id,
             description_type="entity",
             description_name=entity.canonical_name,
         )
+        description = summary_state.description
+        atoms = summary_state.atoms
         provenance = await self.sqlite.get_owner_provenance(entity.id)
         source_id = GRAPH_FIELD_SEP.join(provenance["source_ids"])
         file_path = GRAPH_FIELD_SEP.join(provenance["file_paths"]) or "unknown_source"
@@ -267,11 +816,11 @@ class MagiKnowledgeAdapter:
         node = {
             **existing,
             "entity_id": entity.canonical_name,
+            "magi_entity_id": entity.id,
             "entity_type": entity.entity_type or existing.get("entity_type", "UNKNOWN"),
             "description": description,
             "source_id": source_id or existing.get("source_id", ""),
             "file_path": file_path,
-            "magi_entity_id": entity.id,
             "atom_ids": [atom.id for atom in atoms],
         }
         await graph.upsert_node(entity.canonical_name, node_data=node)
@@ -313,12 +862,14 @@ class MagiKnowledgeAdapter:
         source, target = sorted(
             (relation.entity_a_name, relation.entity_b_name)
         )
-        description, atoms = await self._owner_description(
+        summary_state = await self._projection_description_state(
             rag,
             owner_id=relation.id,
             description_type="relation",
             description_name=f"{source} -> {target}",
         )
+        description = summary_state.description
+        atoms = summary_state.atoms
         provenance = await self.sqlite.get_owner_provenance(relation.id)
         source_id = GRAPH_FIELD_SEP.join(provenance["source_ids"])
         file_path = GRAPH_FIELD_SEP.join(provenance["file_paths"]) or "unknown_source"
@@ -328,12 +879,12 @@ class MagiKnowledgeAdapter:
             **existing,
             "src_id": source,
             "tgt_id": target,
+            "magi_relation_id": relation.id,
             "description": description,
             "keywords": keywords or existing.get("keywords", ""),
             "weight": existing.get("weight", 1.0),
             "source_id": source_id or existing.get("source_id", ""),
             "file_path": file_path,
-            "magi_relation_id": relation.id,
             "atom_ids": [atom.id for atom in atoms],
         }
         await graph.upsert_edge(source, target, edge_data=edge)
@@ -666,8 +1217,18 @@ class MagiKnowledgeAdapter:
         *,
         engine: Any,
         all_nodes: dict[str, list[dict[str, Any]]],
+        all_edges: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, EntityRecord], dict[str, np.ndarray]]:
         names = list(all_nodes)
+        incident_relation_texts: dict[str, list[str]] = defaultdict(list)
+        for (source, target), records in (all_edges or {}).items():
+            texts = [
+                str(record.get("description") or "").strip()
+                for record in records
+                if str(record.get("description") or "").strip()
+            ]
+            incident_relation_texts[source].extend(texts)
+            incident_relation_texts[target].extend(texts)
         aliases_by_name = {
             name: self._episode_aliases(name, all_nodes[name]) for name in names
         }
@@ -692,6 +1253,13 @@ class MagiKnowledgeAdapter:
                 model_name=model_name,
             )
             candidates_by_name[name] = candidates
+            entity_atom_texts = [
+                str(item.get("description") or "").strip()
+                for item in all_nodes[name]
+                if item.get("magi_endpoint_only") is not True
+                and str(item.get("description") or "").strip()
+            ]
+            resolution_texts = entity_atom_texts or incident_relation_texts[name]
             requests.append(
                 EntityResolutionRequest(
                     key=name,
@@ -702,9 +1270,11 @@ class MagiKnowledgeAdapter:
                         if all_nodes[name]
                         else None
                     ),
-                    atom_texts=tuple(
-                        item.get("description", "") for item in all_nodes[name]
-                    ),
+                    # A relation-only entity still needs semantic context for
+                    # disambiguation.  Supplying its incident Relationship Atom
+                    # text prevents an exact-name candidate from being selected
+                    # solely because the endpoint container owns no Entity Atom.
+                    atom_texts=tuple(dict.fromkeys(resolution_texts)),
                     candidates=tuple(candidates),
                 )
             )
@@ -909,6 +1479,250 @@ class MagiKnowledgeAdapter:
             None,
         )
 
+    def _in_batch_candidates(
+        self,
+        *,
+        prior: Sequence[tuple[AtomRecord, np.ndarray]],
+        vector: np.ndarray,
+    ) -> tuple[CandidateMatch, ...]:
+        """Return a bounded, owner-local view of earlier Atoms in this Episode."""
+
+        if len(prior) <= self.atom_full_context_limit:
+            selected = [(atom, 1.0, "in_batch_owner_full_context") for atom, _ in prior]
+        else:
+            vector_norm = float(np.linalg.norm(vector))
+            scored: list[tuple[AtomRecord, float, str]] = []
+            for atom, candidate_vector in prior:
+                denominator = vector_norm * float(np.linalg.norm(candidate_vector))
+                score = (
+                    float(np.dot(vector, candidate_vector) / denominator)
+                    if denominator
+                    else 0.0
+                )
+                if score >= self.atom_similarity_threshold:
+                    scored.append((atom, score, "in_batch_owner_embedding"))
+            scored.sort(key=lambda item: item[1], reverse=True)
+            selected = scored[: self.atom_candidate_limit]
+            selected_ids = {atom.id for atom, _, _ in selected}
+            for atom, _ in prior[-4:]:
+                if atom.id not in selected_ids:
+                    selected.append((atom, 0.0, "in_batch_recent"))
+                    selected_ids.add(atom.id)
+        return tuple(
+            CandidateMatch(
+                object_id=atom.id,
+                score=score,
+                text=atom.presentation(),
+                match_kind=match_kind,
+            )
+            for atom, score, match_kind in selected
+        )
+
+    @staticmethod
+    def _validate_in_batch_resolution(
+        *,
+        atom: AtomRecord,
+        resolution: AtomClassification | None,
+        allowed_targets: set[str],
+        atoms_by_id: dict[str, AtomRecord],
+    ) -> AtomClassification:
+        if not isinstance(resolution, AtomClassification) or not isinstance(
+            resolution.decision, AtomDecision
+        ):
+            return AtomClassification(
+                decision=AtomDecision.INDEPENDENT,
+                reason="missing or invalid in-batch decision",
+            )
+        if resolution.decision is AtomDecision.INDEPENDENT:
+            return replace(resolution, matched_atom_id=None)
+        matched_id = resolution.matched_atom_id
+        matched = atoms_by_id.get(matched_id or "")
+        if (
+            matched_id not in allowed_targets
+            or matched is None
+            or matched.owner_id != atom.owner_id
+        ):
+            return AtomClassification(
+                decision=AtomDecision.INDEPENDENT,
+                confidence=0.0,
+                reason="invalid or cross-owner in-batch target",
+            )
+        return resolution
+
+    async def _resolve_in_batch_atoms(
+        self,
+        *,
+        provider: MemoryDecisionProvider,
+        atom_inputs: Sequence[
+            tuple[str, Any, dict[str, Any], AtomRecord, AtomEvidence]
+        ],
+        vectors: Sequence[np.ndarray],
+        recent_episodes: Sequence[dict[str, Any]],
+    ) -> tuple[
+        list[int],
+        dict[str, list[AtomEvidence]],
+        dict[str, AtomClassification],
+    ]:
+        """Collapse batch duplicates and classify later owner-local Atoms.
+
+        Input order is the stable representative policy.  Every semantic
+        request may target only an earlier Atom from the same owner, preventing
+        cycles and cross-owner matches while still allowing all five decisions.
+        """
+
+        grouped: dict[str, list[int]] = defaultdict(list)
+        atoms_by_id = {item[3].id: item[3] for item in atom_inputs}
+        vector_by_id = {
+            item[3].id: vector for item, vector in zip(atom_inputs, vectors)
+        }
+        for index, item in enumerate(atom_inputs):
+            grouped[item[3].owner_id].append(index)
+
+        unique_indices: list[int] = []
+        evidence_by_representative: dict[str, list[AtomEvidence]] = {}
+        for indices in grouped.values():
+            exact_representatives: dict[tuple[str, datetime | None], str] = {}
+            for index in indices:
+                atom = atom_inputs[index][3]
+                evidence = atom_inputs[index][4]
+                exact_key = (atom.normalized_content, atom.invalid_at)
+                representative_id = exact_representatives.get(exact_key)
+                if representative_id is not None:
+                    evidence_by_representative[representative_id].append(evidence)
+                    continue
+                exact_representatives[exact_key] = atom.id
+                unique_indices.append(index)
+                evidence_by_representative[atom.id] = [evidence]
+        unique_indices.sort()
+
+        requests: list[AtomResolutionRequest] = []
+        allowed_by_atom: dict[str, set[str]] = {}
+        prior_by_owner: dict[str, list[tuple[AtomRecord, np.ndarray]]] = defaultdict(
+            list
+        )
+        owner_summaries: dict[str, str | None] = {}
+        for index in unique_indices:
+            atom = atom_inputs[index][3]
+            prior = prior_by_owner[atom.owner_id]
+            if prior:
+                candidates = self._in_batch_candidates(
+                    prior=prior,
+                    vector=vector_by_id[atom.id],
+                )
+                if candidates:
+                    if atom.owner_id not in owner_summaries:
+                        owner_summaries[atom.owner_id] = (
+                            await self.sqlite.get_owner_summary(atom.owner_id)
+                        )
+                    requests.append(
+                        AtomResolutionRequest(
+                            atom=atom,
+                            candidates=candidates,
+                            owner_summary=owner_summaries[atom.owner_id],
+                        )
+                    )
+                    allowed_by_atom[atom.id] = {
+                        candidate.object_id for candidate in candidates
+                    }
+            prior.append((atom, vector_by_id[atom.id]))
+
+        resolutions: dict[str, AtomClassification] = {}
+        if requests:
+            try:
+                resolutions = await provider.resolve_atoms(
+                    requests=requests,
+                    recent_episodes=recent_episodes,
+                )
+            except Exception as exc:
+                logger.warning("In-batch Atom resolution failed safely: %s", exc)
+
+        canonical_id = {atom_id: atom_id for atom_id in atoms_by_id}
+        final_indices: list[int] = []
+        evolution_by_representative: dict[str, AtomClassification] = {}
+        for index in unique_indices:
+            atom = atom_inputs[index][3]
+            allowed_targets = allowed_by_atom.get(atom.id)
+            if not allowed_targets:
+                final_indices.append(index)
+                continue
+            resolution = self._validate_in_batch_resolution(
+                atom=atom,
+                resolution=resolutions.get(atom.id),
+                allowed_targets=allowed_targets,
+                atoms_by_id=atoms_by_id,
+            )
+            matched_id = resolution.matched_atom_id
+            if matched_id is not None:
+                matched_id = canonical_id.get(matched_id, matched_id)
+                resolution = replace(resolution, matched_atom_id=matched_id)
+            if (
+                resolution.decision is AtomDecision.DUPLICATE
+                and matched_id is not None
+            ):
+                canonical_id[atom.id] = matched_id
+                evidence_by_representative[matched_id].extend(
+                    evidence_by_representative.pop(atom.id)
+                )
+                continue
+            final_indices.append(index)
+            if resolution.decision is not AtomDecision.INDEPENDENT:
+                evolution_by_representative[atom.id] = resolution
+
+        return (
+            final_indices,
+            evidence_by_representative,
+            evolution_by_representative,
+        )
+
+    async def _apply_atom_evolution(
+        self,
+        *,
+        source: AtomRecord,
+        target: AtomRecord,
+        resolution: AtomClassification,
+    ) -> None:
+        """Apply one validated evolution between two already-persisted Atoms."""
+
+        decision = resolution.decision
+        if (
+            source.id == target.id
+            or source.owner_id != target.owner_id
+            or decision in (AtomDecision.INDEPENDENT, AtomDecision.DUPLICATE)
+        ):
+            return
+        await self.sqlite.add_atom_evolution(
+            source.id,
+            target.id,
+            decision.name,
+            metadata={
+                "confidence": resolution.confidence,
+                "reason": resolution.reason,
+            },
+        )
+        system_time = utc_now()
+        if decision is AtomDecision.REFINEMENT:
+            await self.sqlite.expire_atom(target.id, expired_at=system_time)
+        elif decision is AtomDecision.TEMPORAL_SUCCESSOR:
+            transition = resolution.target_invalid_at or source.valid_at
+            if transition is not None and (
+                target.valid_at is None or transition >= target.valid_at
+            ):
+                await self.sqlite.set_atom_invalid_at(
+                    target.id,
+                    invalid_at=transition,
+                )
+            await self.sqlite.expire_atom(target.id, expired_at=system_time)
+        elif decision is AtomDecision.CONTRADICTION and resolution.supersedes_target:
+            transition = resolution.target_invalid_at
+            if transition is not None and (
+                target.valid_at is None or transition >= target.valid_at
+            ):
+                await self.sqlite.set_atom_invalid_at(
+                    target.id,
+                    invalid_at=transition,
+                )
+            await self.sqlite.expire_atom(target.id, expired_at=system_time)
+
     async def _apply_atom_resolution(
         self,
         *,
@@ -950,40 +1764,11 @@ class MagiKnowledgeAdapter:
         if matched is None or decision is AtomDecision.INDEPENDENT:
             return stored
 
-        await self.sqlite.add_atom_evolution(
-            stored.id,
-            matched.id,
-            decision.name,
-            metadata={
-                "confidence": resolution.confidence,
-                "reason": resolution.reason,
-            },
+        await self._apply_atom_evolution(
+            source=stored,
+            target=matched,
+            resolution=replace(resolution, decision=decision),
         )
-        system_time = utc_now()
-        if decision is AtomDecision.REFINEMENT:
-            # The old claim may remain historically true, but the more precise
-            # Atom replaces it in MAGI's current materialized projection.
-            await self.sqlite.expire_atom(matched.id, expired_at=system_time)
-        elif decision is AtomDecision.TEMPORAL_SUCCESSOR:
-            transition = resolution.target_invalid_at or stored.valid_at
-            if transition is not None and (
-                matched.valid_at is None or transition >= matched.valid_at
-            ):
-                await self.sqlite.set_atom_invalid_at(
-                    matched.id,
-                    invalid_at=transition,
-                )
-            await self.sqlite.expire_atom(matched.id, expired_at=system_time)
-        elif decision is AtomDecision.CONTRADICTION and resolution.supersedes_target:
-            transition = resolution.target_invalid_at
-            if transition is not None and (
-                matched.valid_at is None or transition >= matched.valid_at
-            ):
-                await self.sqlite.set_atom_invalid_at(
-                    matched.id,
-                    invalid_at=transition,
-                )
-            await self.sqlite.expire_atom(matched.id, expired_at=system_time)
         return stored
 
     async def commit(
@@ -1051,12 +1836,14 @@ class MagiKnowledgeAdapter:
         }
         if missing_endpoints:
             raise ValueError(
-                "MAGI relationships require extracted entity Atom containers "
+                "MAGI relationships require extracted entity containers "
                 f"for every endpoint; missing {sorted(missing_endpoints)!r}"
             )
 
         entities, _ = await self._resolve_entities(
-            engine=context.rag, all_nodes=all_nodes
+            engine=context.rag,
+            all_nodes=all_nodes,
+            all_edges=all_edges,
         )
         atom_inputs: list[
             tuple[str, Any, dict[str, Any], AtomRecord, AtomEvidence]
@@ -1065,6 +1852,8 @@ class MagiKnowledgeAdapter:
         for extracted_name, records in all_nodes.items():
             entity = entities[extracted_name]
             for record_index, record in enumerate(records):
+                if record.get("magi_endpoint_only") is True:
+                    continue
                 payload = record.get("atom_payload")
                 if not isinstance(payload, dict):
                     raise ValueError(
@@ -1160,9 +1949,24 @@ class MagiKnowledgeAdapter:
             context.rag, [item[3].content for item in atom_inputs]
         )
         model_name = self._embedding_model(context.rag)
+        provider = self.decision_provider or LLMMemoryDecisionProvider(context.rag)
+        recent_episodes = await self.sqlite.recent_episode_context(limit=4)
+        (
+            representative_indices,
+            evidence_by_representative,
+            in_batch_evolutions,
+        ) = await self._resolve_in_batch_atoms(
+            provider=provider,
+            atom_inputs=atom_inputs,
+            vectors=vectors,
+            recent_episodes=recent_episodes,
+        )
+
         resolution_requests: list[AtomResolutionRequest] = []
         atom_resolutions: dict[str, AtomClassification] = {}
-        for item, vector in zip(atom_inputs, vectors):
+        for index in representative_indices:
+            item = atom_inputs[index]
+            vector = vectors[index]
             atom = item[3]
             request, local_resolution = await self._atom_resolution_request(
                 atom=atom,
@@ -1174,34 +1978,104 @@ class MagiKnowledgeAdapter:
             else:
                 resolution_requests.append(request)
 
-        provider = self.decision_provider or LLMMemoryDecisionProvider(context.rag)
         if resolution_requests:
-            atom_resolutions.update(
-                await provider.resolve_atoms(
-                    requests=resolution_requests,
-                    recent_episodes=await self.sqlite.recent_episode_context(limit=4),
+            try:
+                atom_resolutions.update(
+                    await provider.resolve_atoms(
+                        requests=resolution_requests,
+                        recent_episodes=recent_episodes,
+                    )
                 )
+            except Exception as exc:
+                logger.warning(
+                    "Stored-history Atom resolution failed safely: %s",
+                    exc,
+                )
+        for request in resolution_requests:
+            resolution = atom_resolutions.get(request.atom.id)
+            if not isinstance(resolution, AtomClassification) or not isinstance(
+                resolution.decision, AtomDecision
+            ):
+                continue
+            allowed_targets = {
+                candidate.object_id for candidate in request.candidates
+            }
+            if resolution.decision is AtomDecision.INDEPENDENT:
+                atom_resolutions[request.atom.id] = replace(
+                    resolution,
+                    matched_atom_id=None,
+                )
+            elif resolution.matched_atom_id not in allowed_targets:
+                atom_resolutions[request.atom.id] = AtomClassification(
+                    decision=AtomDecision.INDEPENDENT,
+                    confidence=0.0,
+                    reason="invalid stored-history target",
+                )
+
+        stored_by_representative: dict[str, AtomRecord] = {}
+        for index in representative_indices:
+            item = atom_inputs[index]
+            vector = vectors[index]
+            atom = item[3]
+            evidences = evidence_by_representative[atom.id]
+            stored = await self._apply_atom_resolution(
+                engine=context.rag,
+                atom=atom,
+                vector=vector,
+                evidence=evidences[0],
+                resolution=atom_resolutions.get(
+                    atom.id,
+                    AtomClassification(
+                        decision=AtomDecision.INDEPENDENT,
+                        reason="missing stored-history batch decision",
+                    ),
+                ),
             )
+            for evidence in evidences[1:]:
+                stored = await self.sqlite.add_atom_evidence(
+                    stored.id,
+                    replace(evidence, atom_id=stored.id),
+                )
+            stored_by_representative[atom.id] = stored
+
+        for atom_id, resolution in in_batch_evolutions.items():
+            source = stored_by_representative[atom_id]
+            target = stored_by_representative.get(resolution.matched_atom_id or "")
+            if target is not None:
+                await self._apply_atom_evolution(
+                    source=source,
+                    target=target,
+                    resolution=resolution,
+                )
         projected_nodes: dict[str, list[dict[str, Any]]] = defaultdict(list)
         projected_edges: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         touched_nodes: dict[str, str] = {}
         touched_edges: dict[tuple[str, str], str] = {}
 
-        for item, vector in zip(atom_inputs, vectors):
-            kind, owner, record, atom, evidence = item
-            stored = await self._apply_atom_resolution(
-                engine=context.rag,
-                atom=atom,
-                vector=vector,
-                evidence=evidence,
-                resolution=atom_resolutions.get(
-                    atom.id,
-                    AtomClassification(
-                        decision=AtomDecision.INDEPENDENT,
-                        reason="missing batch decision",
-                    ),
-                ),
+        for extracted_name, records in all_nodes.items():
+            if not records or any(
+                record.get("magi_endpoint_only") is not True for record in records
+            ):
+                continue
+            entity = entities[extracted_name]
+            template = records[0]
+            projected_nodes[entity.canonical_name].append(
+                {
+                    **template,
+                    "entity_name": entity.canonical_name,
+                    "entity_type": entity.entity_type
+                    or template.get("entity_type")
+                    or "UNKNOWN",
+                    "description": "",
+                    "magi_endpoint_only": True,
+                }
             )
+            touched_nodes[entity.canonical_name] = entity.id
+
+        for index in representative_indices:
+            item = atom_inputs[index]
+            kind, owner, record, atom, evidence = item
+            stored = stored_by_representative[atom.id]
             projected = {
                 **record,
                 "description": stored.presentation(),
@@ -1227,40 +2101,59 @@ class MagiKnowledgeAdapter:
             limit=max(1, len(touched_owner_ids)),
         )
 
-        # Materialize every Atom for touched owners, not only this Episode's
-        # delta. The LightRAG merge then summarizes Atom presentations rather
-        # than recursively merging an older summary with new facts.
+        # Materialize one checkpoint+delta description per touched owner. The
+        # SQLite Atom layer remains authoritative; graph merge receives one
+        # already-compacted projection row and therefore performs no second
+        # full-history LLM merge.
         for canonical_name, entity_id in touched_nodes.items():
-            template = projected_nodes[canonical_name][0]
-            atoms = [
-                atom
-                for atom in await self.sqlite.list_owner_atoms(entity_id)
-                if atom.expired_at is None
-            ]
-            projected_nodes[canonical_name] = [
-                {
-                    **template,
-                    "description": atom.presentation(),
-                    "atom_id": atom.id,
-                    "magi_atom_order": index,
-                }
-                for index, atom in enumerate(atoms)
-            ]
+            templates = projected_nodes[canonical_name]
+            template = next(
+                (
+                    item
+                    for item in templates
+                    if item.get("magi_endpoint_only") is not True
+                ),
+                templates[0],
+            )
+            summary_state = await self._projection_description_state(
+                context.rag,
+                owner_id=entity_id,
+                description_type="Entity",
+                description_name=canonical_name,
+            )
+            description = summary_state.description
+            if description:
+                projected_nodes[canonical_name] = [
+                    {
+                        **template,
+                        "description": description,
+                        "magi_atom_order": 0,
+                        "magi_endpoint_only": False,
+                    }
+                ]
+            else:
+                projected_nodes[canonical_name] = [
+                    {
+                        **template,
+                        "description": "",
+                        "magi_endpoint_only": True,
+                    }
+                ]
         for pair, relation_id in touched_edges.items():
             template = projected_edges[pair][0]
-            atoms = [
-                atom
-                for atom in await self.sqlite.list_owner_atoms(relation_id)
-                if atom.expired_at is None
-            ]
+            summary_state = await self._projection_description_state(
+                context.rag,
+                owner_id=relation_id,
+                description_type="Relation",
+                description_name=f"{pair[0]} -> {pair[1]}",
+            )
+            description = summary_state.description
             projected_edges[pair] = [
                 {
                     **template,
-                    "description": atom.presentation(),
-                    "atom_id": atom.id,
-                    "magi_atom_order": index,
+                    "description": description,
+                    "magi_atom_order": 0,
                 }
-                for index, atom in enumerate(atoms)
             ]
 
         merge_config = context.rag._build_global_config()

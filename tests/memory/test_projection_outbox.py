@@ -341,6 +341,7 @@ class ProjectionOutboxTests(unittest.TestCase):
                     reconciled, {"processed": 3, "applied": 3, "failed": 0}
                 )
                 edge = rag.chunk_entity_relation_graph.edges[("Alice", "Bob")]
+                self.assertEqual(edge["magi_relation_id"], relation.id)
                 self.assertEqual(edge["atom_ids"], [relation_atom.id])
                 self.assertIn("Alice knows Bob.", edge["description"])
                 self.assertEqual(len(rag.relationships_vdb.records), 1)

@@ -50,11 +50,29 @@ def extracted_payload_to_chunk_results(
             raise ValueError(f"duplicate extracted entity name {name!r}")
         normalized_names[normalized] = name
         atoms = row.get("atoms")
-        if not isinstance(atoms, list) or not atoms:
-            raise ValueError(f"extracted entity {name!r} has no Atoms")
+        if not isinstance(atoms, list):
+            raise TypeError(f"Atoms for extracted entity {name!r} must be a list")
         aliases = row.get("aliases") or []
         if not isinstance(aliases, list):
             raise TypeError(f"aliases for entity {name!r} must be a list")
+        if not atoms:
+            nodes[name].append(
+                {
+                    "entity_name": name,
+                    "entity_type": str(row.get("entity_type") or "UNKNOWN"),
+                    "aliases": [
+                        str(alias).strip()
+                        for alias in aliases
+                        if str(alias).strip()
+                    ],
+                    "description": "",
+                    "atom_payload": None,
+                    "source_id": source_id,
+                    "file_path": file_path,
+                    "timestamp": now,
+                    "magi_endpoint_only": True,
+                }
+            )
         for atom in atoms:
             if not isinstance(atom, dict):
                 raise TypeError(f"Atom for entity {name!r} must be an object")
@@ -115,5 +133,19 @@ def extracted_payload_to_chunk_results(
                     "timestamp": now,
                 }
             )
+
+    referenced_endpoints = {endpoint for pair in edges for endpoint in pair}
+    unsupported = [
+        name
+        for name, records in nodes.items()
+        if records
+        and all(record.get("magi_endpoint_only") is True for record in records)
+        and name not in referenced_endpoints
+    ]
+    if unsupported:
+        raise ValueError(
+            "entities without Entity Atoms must be endpoints of a valid "
+            f"relationship; unsupported {unsupported!r}"
+        )
 
     return [(dict(nodes), dict(edges))]

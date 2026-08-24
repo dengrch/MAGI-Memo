@@ -359,7 +359,7 @@ class AtomClassification:
 
 @dataclass(frozen=True, slots=True)
 class AtomResolutionRequest:
-    """One new Atom and the only stored Atoms it may resolve against."""
+    """One new Atom and the only owner-local Atoms it may resolve against."""
 
     atom: AtomRecord
     candidates: tuple[CandidateMatch, ...]
@@ -410,7 +410,14 @@ class ExtractedAtom:
 
 @dataclass(frozen=True, slots=True)
 class ExtractedEntity:
-    """One extracted entity and the Atoms owned by it."""
+    """One extracted entity and the Atoms owned by it.
+
+    ``atoms`` may be empty when the entity is only an endpoint of a valid
+    :class:`ExtractedRelation`.  The relation Atom is the factual owner in
+    that case; :class:`ExtractedMemory` also synthesizes this container when a
+    caller submits only the relation endpoint name.  Callers must not invent an
+    entity Atom merely to satisfy a container shape.
+    """
 
     name: str
     atoms: tuple[ExtractedAtom, ...]
@@ -420,8 +427,6 @@ class ExtractedEntity:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("extracted entity name must not be empty")
-        if not self.atoms:
-            raise ValueError("each extracted entity must own at least one Atom")
         object.__setattr__(
             self,
             "aliases",
@@ -468,36 +473,55 @@ class ExtractedMemory:
     """
 
     episode: Episode
-    entities: tuple[ExtractedEntity, ...]
+    entities: tuple[ExtractedEntity, ...] = ()
     relations: tuple[ExtractedRelation, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.entities:
-            raise ValueError("extracted memory must contain at least one entity")
         by_name: dict[str, ExtractedEntity] = {}
         for entity in self.entities:
             key = normalize_name(entity.name)
             if key in by_name:
                 raise ValueError(f"duplicate extracted entity name {entity.name!r}")
             by_name[key] = entity
+
+        synthesized: list[ExtractedEntity] = []
         for relation in self.relations:
-            missing = [
-                name
-                for name in (relation.source, relation.target)
-                if normalize_name(name) not in by_name
-            ]
-            if missing:
-                raise ValueError(
-                    "every relation endpoint must have an extracted entity "
-                    f"container; missing {missing!r}"
-                )
+            for name in (relation.source, relation.target):
+                key = normalize_name(name)
+                if key in by_name:
+                    continue
+                entity = ExtractedEntity(name=name, atoms=())
+                synthesized.append(entity)
+                by_name[key] = entity
+        if synthesized:
+            object.__setattr__(self, "entities", self.entities + tuple(synthesized))
+        if not self.entities:
+            raise ValueError(
+                "extracted memory must contain an entity or a relationship"
+            )
+        referenced_entities = {
+            normalize_name(name)
+            for relation in self.relations
+            for name in (relation.source, relation.target)
+        }
+        unsupported = [
+            entity.name
+            for entity in self.entities
+            if not entity.atoms
+            and normalize_name(entity.name) not in referenced_entities
+        ]
+        if unsupported:
+            raise ValueError(
+                "entities without Entity Atoms must be endpoints of a valid "
+                f"relationship; unsupported {unsupported!r}"
+            )
 
     @classmethod
     def create(
         cls,
         *,
         episode: Episode,
-        entities: Sequence[ExtractedEntity],
+        entities: Sequence[ExtractedEntity] = (),
         relations: Sequence[ExtractedRelation] = (),
     ) -> "ExtractedMemory":
         return cls(episode, tuple(entities), tuple(relations))

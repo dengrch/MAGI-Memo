@@ -1,6 +1,6 @@
 """SQLite schema migrations for the local memory record store."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -185,9 +185,60 @@ CREATE INDEX IF NOT EXISTS idx_projection_outbox_retry
     ON projection_outbox(workspace_id, status, next_attempt_at, updated_at);
 """
 
+MIGRATION_5 = """
+ALTER TABLE atom_evidence RENAME TO atom_evidence_v4;
+
+CREATE TABLE atom_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    atom_id TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    quote TEXT,
+    span_start INTEGER NOT NULL DEFAULT -1,
+    span_end INTEGER NOT NULL DEFAULT -1,
+    extraction_revision TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(atom_id) REFERENCES atoms(atom_id),
+    FOREIGN KEY(episode_id) REFERENCES episodes(episode_id)
+);
+CREATE INDEX idx_atom_evidence_atom ON atom_evidence(atom_id);
+CREATE INDEX idx_atom_evidence_episode ON atom_evidence(episode_id);
+
+INSERT INTO atom_evidence(
+    evidence_id, atom_id, episode_id, quote, span_start, span_end,
+    extraction_revision, created_at
+)
+SELECT
+    'legacy-' || lower(hex(randomblob(16))), atom_id, episode_id, quote,
+    span_start, span_end, extraction_revision, created_at
+FROM atom_evidence_v4;
+
+DROP TABLE atom_evidence_v4;
+"""
+
+MIGRATION_6 = """
+CREATE TABLE IF NOT EXISTS owner_summary_checkpoints (
+    workspace_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    checkpoint_summary TEXT NOT NULL DEFAULT '',
+    covered_atom_ids_json TEXT NOT NULL DEFAULT '[]',
+    pending_atom_ids_json TEXT NOT NULL DEFAULT '[]',
+    summary_revision INTEGER NOT NULL DEFAULT 0,
+    prompt_version TEXT NOT NULL,
+    model_identity TEXT NOT NULL,
+    incremental_compaction_count INTEGER NOT NULL DEFAULT 0,
+    last_compacted_at TEXT,
+    last_reason TEXT,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, owner_id)
+);
+"""
+
 MIGRATIONS = (
     (1, MIGRATION_1),
     (2, MIGRATION_2),
     (3, MIGRATION_3),
     (4, MIGRATION_4),
+    (5, MIGRATION_5),
+    (6, MIGRATION_6),
 )

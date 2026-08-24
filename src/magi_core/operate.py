@@ -360,6 +360,8 @@ async def _handle_entity_relation_summary(
     separator: str,
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    summary_cache_identity: dict[str, Any] | None = None,
+    summary_stats: dict[str, Any] | None = None,
 ) -> tuple[str, bool]:
     """Handle entity relation description summary using map-reduce approach.
 
@@ -407,8 +409,17 @@ async def _handle_entity_relation_summary(
         # Tokenize each description once; the chunk-building pass below
         # reuses these counts instead of re-encoding the same strings.
         desc_token_counts = []
+        json_wrapper_tokens = len(
+            tokenizer.encode(
+                json.dumps({"Description": ""}, ensure_ascii=False)
+            )
+        )
         for i, desc in enumerate(current_list, start=1):
-            tokens = len(tokenizer.encode(desc))
+            # The prompt sends each description as a JSONL object. Budget the
+            # serialized representation here as well; counting raw prose only
+            # can form a chunk that later gets truncated by
+            # ``truncate_list_by_token_size`` and loses Atom lineage.
+            tokens = len(tokenizer.encode(desc)) + json_wrapper_tokens
             desc_token_counts.append(tokens)
             total_tokens += tokens
             await _cooperative_yield(i, every=32)
@@ -439,6 +450,8 @@ async def _handle_entity_relation_summary(
                     current_list,
                     global_config,
                     llm_response_cache,
+                    summary_cache_identity,
+                    summary_stats,
                 )
                 return final_summary, True  # LLM was used for final summarization
 
@@ -498,6 +511,8 @@ async def _handle_entity_relation_summary(
                     chunk,
                     global_config,
                     llm_response_cache,
+                    summary_cache_identity,
+                    summary_stats,
                 )
                 new_summaries.append(summary)
                 llm_was_used = True  # Mark that LLM was used in reduce phase
@@ -512,6 +527,8 @@ async def _summarize_descriptions(
     description_list: list[str],
     global_config: dict,
     llm_response_cache: BaseKVStorage | None = None,
+    summary_cache_identity: dict[str, Any] | None = None,
+    summary_stats: dict[str, Any] | None = None,
 ) -> str:
     """Helper function to summarize a list of descriptions using LLM.
 
@@ -568,13 +585,21 @@ async def _summarize_descriptions(
     use_prompt = prompt_template.format(**context_base)
 
     # Use LLM function with cache (higher priority for summary generation)
+    llm_cache_identity = get_llm_cache_identity(global_config, "extract")
+    if summary_cache_identity:
+        llm_cache_identity = {
+            **llm_cache_identity,
+            "summary_context": summary_cache_identity,
+        }
     summary, _ = await use_llm_func_with_cache(
         use_prompt,
         use_llm_func,
         llm_response_cache=llm_response_cache,
         cache_type="summary",
-        llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+        llm_cache_identity=llm_cache_identity,
     )
+    if summary_stats is not None:
+        summary_stats["llm_calls"] = int(summary_stats.get("llm_calls", 0)) + 1
 
     # The LLM response is the only description path that bypasses
     # extraction-time sanitization; control chars / surrogates left here
@@ -597,6 +622,8 @@ async def _summarize_descriptions(
     if source_lineage:
         summary_lineage = set(lineage_pattern.findall(summary))
         if summary_lineage != source_lineage:
+            if summary_stats is not None:
+                summary_stats["lineage_valid"] = False
             logger.warning(
                 "Summary lineage mismatch for %s %s: expected %d Atom tags, got %d; "
                 "keeping the original Atom descriptions",
@@ -931,9 +958,30 @@ async def _process_json_extraction_result(
 
             if magi_memory_enabled:
                 atom_payloads = entity_data.get("atoms", [])
-                if not isinstance(atom_payloads, list) or not atom_payloads:
+                if not isinstance(atom_payloads, list):
                     logger.warning(
-                        f"{chunk_key}: MAGI entity '{entity_name}' has no atoms"
+                        f"{chunk_key}: MAGI entity '{entity_name}' has an invalid "
+                        "Entity Atoms field in the current extraction container"
+                    )
+                    continue
+                if not atom_payloads:
+                    logger.warning(
+                        f"{chunk_key}: MAGI entity '{entity_name}' has no Entity "
+                        "Atoms in the current extraction container; retaining it "
+                        "as a relationship endpoint candidate"
+                    )
+                    maybe_nodes[truncated_name].append(
+                        {
+                            "entity_name": truncated_name,
+                            "entity_type": entity_type,
+                            "aliases": aliases,
+                            "description": "",
+                            "source_id": chunk_key,
+                            "file_path": file_path,
+                            "timestamp": timestamp,
+                            "atom_payload": None,
+                            "magi_endpoint_only": True,
+                        }
                     )
                     continue
             else:
@@ -1027,7 +1075,7 @@ async def _process_json_extraction_result(
                 logger.warning(
                     f"{chunk_key}: MAGI relationship '{source}' ~ '{target}' "
                     "was skipped because one or both endpoints have no valid "
-                    "entity Atom container"
+                    "entity container in the current extraction"
                 )
                 continue
 
@@ -1071,6 +1119,21 @@ async def _process_json_extraction_result(
                 f"{chunk_key}: Failed to process relationship from JSON result: {e}"
             )
             continue
+
+    if magi_memory_enabled:
+        referenced_endpoints = {
+            endpoint for pair in maybe_edges for endpoint in pair
+        }
+        for entity_name in list(maybe_nodes):
+            records = maybe_nodes[entity_name]
+            if (
+                records
+                and all(
+                    record.get("magi_endpoint_only") is True for record in records
+                )
+                and entity_name not in referenced_endpoints
+            ):
+                del maybe_nodes[entity_name]
 
     return dict(maybe_nodes), dict(maybe_edges)
 
@@ -2329,6 +2392,9 @@ async def _merge_nodes_then_upsert(
         status_logger = PipelineStatusLogger(pipeline_status)
     timing_start = time.perf_counter()
     try:
+        endpoint_only = bool(nodes_data) and all(
+            item.get("magi_endpoint_only") is True for item in nodes_data
+        )
         already_entity_types = []
         already_source_ids = []
         already_description = []
@@ -2491,7 +2557,7 @@ async def _merge_nodes_then_upsert(
             description_list, already_fragment = _combine_descriptions_dedup(
                 already_description, sorted_descriptions
             )
-        if not description_list:
+        if not description_list and not endpoint_only:
             fallback_description = f"Entity {entity_name}"
             logger.warning(
                 f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`"
@@ -2507,14 +2573,17 @@ async def _merge_nodes_then_upsert(
                     )
 
         # 8. Get summary description an LLM usage status
-        description, llm_was_used = await _handle_entity_relation_summary(
-            "Entity",
-            entity_name,
-            description_list,
-            GRAPH_FIELD_SEP,
-            global_config,
-            llm_response_cache,
-        )
+        if endpoint_only and not description_list:
+            description, llm_was_used = "", False
+        else:
+            description, llm_was_used = await _handle_entity_relation_summary(
+                "Entity",
+                entity_name,
+                description_list,
+                GRAPH_FIELD_SEP,
+                global_config,
+                llm_response_cache,
+            )
 
         # 9. Build file_path within MAX_FILE_PATHS
         file_paths_list = []

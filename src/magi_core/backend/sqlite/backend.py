@@ -10,7 +10,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -21,6 +21,8 @@ from magi_core.backend.sqlite.migrations import (
     MIGRATION_2,
     MIGRATION_3,
     MIGRATION_4,
+    MIGRATION_5,
+    MIGRATION_6,
 )
 from magi_core.memory import (
     AtomEvidence,
@@ -43,6 +45,20 @@ def _utc_now() -> str:
 
 def _parse_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _evidence_id(evidence: AtomEvidence) -> str:
+    identity = "\x1f".join(
+        (
+            evidence.atom_id,
+            evidence.episode_id,
+            str(evidence.span_start),
+            str(evidence.span_end),
+            evidence.extraction_revision or "",
+            evidence.quote or "",
+        )
+    )
+    return "evidence-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 class SQLiteBackend:
@@ -189,6 +205,27 @@ class SQLiteBackend:
                 "VALUES (?, ?)",
                 (4, _utc_now()),
             )
+            migration_5_applied = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 5"
+            ).fetchone()
+            if migration_5_applied is None:
+                connection.executescript(MIGRATION_5)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (5, _utc_now()),
+                )
+            connection.executescript(MIGRATION_6)
+            self._ensure_column(
+                connection,
+                "owner_summary_checkpoints",
+                "metrics_json",
+                "TEXT NOT NULL DEFAULT '{}'",
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
+                (6, _utc_now()),
+            )
             self._prune_orphan_projection_owners(connection)
 
     def _prune_orphan_projection_owners(self, connection: sqlite3.Connection) -> None:
@@ -229,6 +266,18 @@ class SQLiteBackend:
             ).fetchall()
         ]
         if not orphan_entity_ids:
+            connection.execute(
+                """
+                DELETE FROM owner_summary_checkpoints
+                WHERE workspace_id = ?
+                  AND owner_id NOT IN (
+                      SELECT entity_id FROM entity_registry WHERE workspace_id = ?
+                      UNION
+                      SELECT relation_id FROM relation_registry WHERE workspace_id = ?
+                  )
+                """,
+                (self.workspace_id, self.workspace_id, self.workspace_id),
+            )
             return
         placeholders = ",".join("?" for _ in orphan_entity_ids)
         params = (self.workspace_id, *orphan_entity_ids)
@@ -252,6 +301,18 @@ class SQLiteBackend:
             f"DELETE FROM entity_registry WHERE workspace_id = ? "
             f"AND entity_id IN ({placeholders})",
             params,
+        )
+        connection.execute(
+            """
+            DELETE FROM owner_summary_checkpoints
+            WHERE workspace_id = ?
+              AND owner_id NOT IN (
+                  SELECT entity_id FROM entity_registry WHERE workspace_id = ?
+                  UNION
+                  SELECT relation_id FROM relation_registry WHERE workspace_id = ?
+              )
+            """,
+            (self.workspace_id, self.workspace_id, self.workspace_id),
         )
 
     @staticmethod
@@ -1046,11 +1107,12 @@ class SQLiteBackend:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO atom_evidence(
-                    atom_id, episode_id, quote, span_start, span_end,
+                    evidence_id, atom_id, episode_id, quote, span_start, span_end,
                     extraction_revision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    _evidence_id(replace(evidence, atom_id=atom_id)),
                     atom_id,
                     evidence.episode_id,
                     evidence.quote,
@@ -1106,11 +1168,12 @@ class SQLiteBackend:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO atom_evidence(
-                    atom_id, episode_id, quote, span_start, span_end,
+                    evidence_id, atom_id, episode_id, quote, span_start, span_end,
                     extraction_revision, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    _evidence_id(replace(evidence, atom_id=atom_id)),
                     atom_id,
                     evidence.episode_id,
                     evidence.quote,
@@ -1246,6 +1309,160 @@ class SQLiteBackend:
             return None
         value = row["summary_cited"]
         return str(value) if value else None
+
+    async def get_owner_summary_checkpoint(
+        self, owner_id: str
+    ) -> dict[str, Any] | None:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._get_owner_summary_checkpoint_sync,
+            owner_id,
+        )
+
+    def _get_owner_summary_checkpoint_sync(
+        self, owner_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM owner_summary_checkpoints "
+                "WHERE workspace_id = ? AND owner_id = ?",
+                (self.workspace_id, owner_id),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["covered_atom_ids"] = json.loads(
+            result.pop("covered_atom_ids_json") or "[]"
+        )
+        result["pending_atom_ids"] = json.loads(
+            result.pop("pending_atom_ids_json") or "[]"
+        )
+        result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
+        return result
+
+    async def compare_and_set_owner_summary_checkpoint(
+        self,
+        owner_id: str,
+        *,
+        expected_revision: int | None,
+        checkpoint_summary: str,
+        covered_atom_ids: Sequence[str],
+        pending_atom_ids: Sequence[str],
+        prompt_version: str,
+        model_identity: str,
+        incremental_compaction_count: int,
+        last_compacted_at: str | None,
+        reason: str,
+        metrics: Mapping[str, Any] | None = None,
+    ) -> bool:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._compare_and_set_owner_summary_checkpoint_sync,
+            owner_id,
+            expected_revision,
+            checkpoint_summary,
+            tuple(dict.fromkeys(covered_atom_ids)),
+            tuple(dict.fromkeys(pending_atom_ids)),
+            prompt_version,
+            model_identity,
+            incremental_compaction_count,
+            last_compacted_at,
+            reason,
+            dict(metrics) if metrics is not None else None,
+        )
+
+    def _compare_and_set_owner_summary_checkpoint_sync(
+        self,
+        owner_id: str,
+        expected_revision: int | None,
+        checkpoint_summary: str,
+        covered_atom_ids: Sequence[str],
+        pending_atom_ids: Sequence[str],
+        prompt_version: str,
+        model_identity: str,
+        incremental_compaction_count: int,
+        last_compacted_at: str | None,
+        reason: str,
+        metrics: Mapping[str, Any] | None,
+    ) -> bool:
+        now = _utc_now()
+        covered_json = json.dumps(list(covered_atom_ids), ensure_ascii=False)
+        pending_json = json.dumps(list(pending_atom_ids), ensure_ascii=False)
+        metrics_json = (
+            json.dumps(dict(metrics), ensure_ascii=False, sort_keys=True)
+            if metrics is not None
+            else None
+        )
+        with self._connect() as connection:
+            if expected_revision is None:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO owner_summary_checkpoints(
+                        workspace_id, owner_id, checkpoint_summary,
+                        covered_atom_ids_json, pending_atom_ids_json,
+                        summary_revision, prompt_version, model_identity,
+                        incremental_compaction_count, last_compacted_at,
+                        last_reason, metrics_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.workspace_id,
+                        owner_id,
+                        checkpoint_summary,
+                        covered_json,
+                        pending_json,
+                        prompt_version,
+                        model_identity,
+                        incremental_compaction_count,
+                        last_compacted_at,
+                        reason,
+                        metrics_json or "{}",
+                        now,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE owner_summary_checkpoints
+                    SET checkpoint_summary = ?, covered_atom_ids_json = ?,
+                        pending_atom_ids_json = ?, summary_revision = ?,
+                        prompt_version = ?, model_identity = ?,
+                        incremental_compaction_count = ?, last_compacted_at = ?,
+                        last_reason = ?,
+                        metrics_json = COALESCE(?, metrics_json), updated_at = ?
+                    WHERE workspace_id = ? AND owner_id = ?
+                      AND summary_revision = ?
+                    """,
+                    (
+                        checkpoint_summary,
+                        covered_json,
+                        pending_json,
+                        expected_revision + 1,
+                        prompt_version,
+                        model_identity,
+                        incremental_compaction_count,
+                        last_compacted_at,
+                        reason,
+                        metrics_json,
+                        now,
+                        self.workspace_id,
+                        owner_id,
+                        expected_revision,
+                    ),
+                )
+        return cursor.rowcount == 1
+
+    async def delete_owner_summary_checkpoint(self, owner_id: str) -> None:
+        self._require_initialized()
+        await asyncio.to_thread(self._delete_owner_summary_checkpoint_sync, owner_id)
+
+    def _delete_owner_summary_checkpoint_sync(self, owner_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM owner_summary_checkpoints "
+                "WHERE workspace_id = ? AND owner_id = ?",
+                (self.workspace_id, owner_id),
+            )
 
     async def get_owner_provenance(self, owner_id: str) -> dict[str, list[str]]:
         """Return stable source ids and file paths for graph materialization."""
@@ -1936,6 +2153,11 @@ class SQLiteBackend:
                     f"AND relation_id IN ({placeholders})",
                     (self.workspace_id, *orphan_relation_ids),
                 )
+                connection.execute(
+                    f"DELETE FROM owner_summary_checkpoints "
+                    f"WHERE workspace_id = ? AND owner_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_relation_ids),
+                )
 
             # An entity is removable only when it owns no Atom and is no
             # longer an endpoint of a surviving relation.  This preserves
@@ -1976,6 +2198,11 @@ class SQLiteBackend:
                 connection.execute(
                     f"DELETE FROM entity_registry WHERE workspace_id = ? "
                     f"AND entity_id IN ({placeholders})",
+                    (self.workspace_id, *orphan_entity_ids),
+                )
+                connection.execute(
+                    f"DELETE FROM owner_summary_checkpoints "
+                    f"WHERE workspace_id = ? AND owner_id IN ({placeholders})",
                     (self.workspace_id, *orphan_entity_ids),
                 )
 
@@ -2065,6 +2292,10 @@ class SQLiteBackend:
                 "DELETE FROM workspace_settings WHERE workspace_id = ?",
                 (self.workspace_id,),
             )
+            connection.execute(
+                "DELETE FROM owner_summary_checkpoints WHERE workspace_id = ?",
+                (self.workspace_id,),
+            )
 
     def _list_episode_ids_sync(self) -> list[str]:
         with self._connect() as connection:
@@ -2093,6 +2324,22 @@ class SQLiteBackend:
             payload = json.loads(backup["payload_json"])
 
             def insert_row(table: str, row: dict[str, Any]) -> None:
+                if table == "atom_evidence" and "evidence_id" not in row:
+                    row = {
+                        "evidence_id": _evidence_id(
+                            AtomEvidence(
+                                atom_id=str(row["atom_id"]),
+                                episode_id=str(row["episode_id"]),
+                                quote=row.get("quote"),
+                                span_start=int(row.get("span_start", -1)),
+                                span_end=int(row.get("span_end", -1)),
+                                extraction_revision=row.get("extraction_revision"),
+                                created_at=_parse_time(row.get("created_at"))
+                                or datetime.now(timezone.utc),
+                            )
+                        ),
+                        **row,
+                    }
                 columns = list(row)
                 placeholders = ",".join("?" for _ in columns)
                 connection.execute(

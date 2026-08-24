@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from magi_core.backend.sqlite import SQLiteBackend
+from magi_core.backend.sqlite.migrations import MIGRATION_1, SCHEMA_VERSION
 from magi_core.memory.adapter import MagiKnowledgeAdapter
 from magi_core.memory import (
     AtomEvidence,
@@ -25,6 +27,111 @@ from magi_core.memory import (
 
 
 class MemoryModelsAndSQLiteTests(unittest.TestCase):
+    def test_initialize_migrates_v4_evidence_without_loss(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "memory.sqlite3"
+                now = datetime.now(timezone.utc).isoformat()
+                with sqlite3.connect(path) as connection:
+                    connection.executescript(MIGRATION_1)
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) "
+                        "VALUES (?, ?)",
+                        (4, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO episodes(
+                            episode_id, workspace_id, kind, content, content_hash,
+                            reference_at, metadata_json, status, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "episode-v4",
+                            "workspace-a",
+                            "document",
+                            "Alice likes tea.",
+                            "content-hash",
+                            now,
+                            "{}",
+                            "indexed",
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO atoms(
+                            atom_id, workspace_id, kind, owner_kind, owner_id,
+                            content, normalized_hash, fingerprint,
+                            relation_keywords_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "atom-v4",
+                            "workspace-a",
+                            "entity_fact",
+                            "entity",
+                            "entity-alice",
+                            "Alice likes tea.",
+                            "normalized-hash",
+                            "fingerprint-v4",
+                            "[]",
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO atom_evidence(
+                            atom_id, episode_id, quote, span_start, span_end,
+                            extraction_revision, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "atom-v4",
+                            "episode-v4",
+                            "Alice likes tea.",
+                            -1,
+                            -1,
+                            "chunk-v4",
+                            now,
+                        ),
+                    )
+
+                backend = SQLiteBackend(path, "workspace-a")
+                await backend.initialize()
+                memory = await backend.get_atom_memory("atom-v4")
+                self.assertEqual(len(memory.evidence), 1)
+                self.assertEqual(memory.evidence[0].extraction_revision, "chunk-v4")
+                await backend.finalize()
+
+                with sqlite3.connect(path) as connection:
+                    columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(atom_evidence)"
+                        ).fetchall()
+                    }
+                    checkpoint_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(owner_summary_checkpoints)"
+                        ).fetchall()
+                    }
+                    version = connection.execute(
+                        "SELECT max(version) FROM schema_migrations"
+                    ).fetchone()[0]
+                    checkpoint_table = connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'owner_summary_checkpoints'"
+                    ).fetchone()
+                self.assertIn("evidence_id", columns)
+                self.assertIn("metrics_json", checkpoint_columns)
+                self.assertIsNotNone(checkpoint_table)
+                self.assertEqual(version, SCHEMA_VERSION)
+
+        asyncio.run(scenario())
+
     def test_memory_workbench_views_are_paginated_and_evidence_aware(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:
@@ -125,6 +232,59 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_same_episode_chunk_evidence_has_stable_distinct_identity(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                backend = SQLiteBackend(
+                    Path(temporary) / "memory.sqlite3", "workspace-a"
+                )
+                await backend.initialize()
+                episode = Episode(
+                    id="episode-multi-chunk",
+                    content="The same fact appeared in two chunks.",
+                )
+                await backend.put_episode(episode)
+                atom = AtomRecord(
+                    id="atom-multi-chunk",
+                    workspace_id="workspace-a",
+                    owner_id="entity-alice",
+                    content="Alice likes tea.",
+                    valid_at=None,
+                )
+                await backend.put_atom(
+                    atom,
+                    AtomEvidence(
+                        atom_id=atom.id,
+                        episode_id=episode.id,
+                        quote="Alice likes tea.",
+                        extraction_revision="chunk-a",
+                    ),
+                )
+                chunk_b = AtomEvidence(
+                    atom_id=atom.id,
+                    episode_id=episode.id,
+                    quote="Alice enjoys tea.",
+                    extraction_revision="chunk-b",
+                )
+                await backend.add_atom_evidence(atom.id, chunk_b)
+                await backend.add_atom_evidence(atom.id, chunk_b)
+
+                memory = await backend.get_atom_memory(atom.id)
+                self.assertEqual(len(memory.evidence), 2)
+                self.assertEqual(
+                    {item.extraction_revision for item in memory.evidence},
+                    {"chunk-a", "chunk-b"},
+                )
+                self.assertEqual(memory.atom.support_count, 1)
+
+                deletion = await backend.backup_and_delete_episode(episode.id)
+                await backend.restore_episode_backup(deletion["backup_id"])
+                restored = await backend.get_atom_memory(atom.id)
+                self.assertEqual(len(restored.evidence), 2)
+                await backend.finalize()
+
+        asyncio.run(scenario())
+
     def test_hard_delete_removes_orphan_projection_owners_and_restores_them(
         self,
     ) -> None:
@@ -182,6 +342,24 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                         AtomEvidence(atom_id=atom.id, episode_id=episode.id),
                     )
 
+                for owner_id, atom_id in (
+                    (alice_id, "atom-alice"),
+                    (relation_id, "atom-relation"),
+                ):
+                    created = await backend.compare_and_set_owner_summary_checkpoint(
+                        owner_id,
+                        expected_revision=None,
+                        checkpoint_summary=f"summary for {owner_id}",
+                        covered_atom_ids=[atom_id],
+                        pending_atom_ids=[],
+                        prompt_version="test-v1",
+                        model_identity="test-model",
+                        incremental_compaction_count=0,
+                        last_compacted_at=None,
+                        reason="test",
+                    )
+                    self.assertTrue(created)
+
                 before = await backend.memory_overview()
                 self.assertEqual(before["entities"], 2)
                 self.assertEqual(before["relations"], 1)
@@ -194,6 +372,12 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 self.assertEqual(after["entities"], 0)
                 self.assertEqual(after["relations"], 0)
                 self.assertEqual(await backend.search_entity_names("Alice"), [])
+                self.assertIsNone(
+                    await backend.get_owner_summary_checkpoint(alice_id)
+                )
+                self.assertIsNone(
+                    await backend.get_owner_summary_checkpoint(relation_id)
+                )
 
                 await backend.restore_episode_backup(deletion["backup_id"])
                 restored = await backend.memory_overview()
@@ -201,6 +385,15 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
                 self.assertEqual(restored["atoms"], 2)
                 self.assertEqual(restored["entities"], 2)
                 self.assertEqual(restored["relations"], 1)
+                # Checkpoints are derived materializations. Restore rebuilds
+                # them from authoritative Atom records instead of reviving a
+                # summary that may no longer match the active model/prompt.
+                self.assertIsNone(
+                    await backend.get_owner_summary_checkpoint(alice_id)
+                )
+                self.assertIsNone(
+                    await backend.get_owner_summary_checkpoint(relation_id)
+                )
                 await backend.finalize()
 
         asyncio.run(scenario())

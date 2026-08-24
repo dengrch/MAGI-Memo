@@ -145,6 +145,34 @@ def test_combine_descriptions_dedup_drops_empty_after_sanitize():
 
 @pytest.mark.offline
 @pytest.mark.asyncio
+async def test_endpoint_only_node_does_not_fabricate_entity_description():
+    graph = _MemGraph()
+    cfg = _config()
+    await _merge_nodes_then_upsert(
+        "ALICE",
+        [
+            {
+                "entity_name": "ALICE",
+                "entity_type": "person",
+                "description": "",
+                "source_id": "chunk-relation-only",
+                "file_path": "doc1.txt",
+                "timestamp": 1,
+                "magi_endpoint_only": True,
+            }
+        ],
+        graph,
+        None,
+        cfg,
+    )
+
+    assert graph.nodes["ALICE"]["description"] == ""
+    assert graph.nodes["ALICE"]["entity_type"] == "person"
+    assert "magi_endpoint_only" not in graph.nodes["ALICE"]
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
 async def test_node_reprocess_with_dirty_char_does_not_accumulate():
     """Round-trip twin of the helper test (aligns with #3373 test #2): a
     re-extracted description with an XML-illegal control char must dedup against
@@ -229,6 +257,41 @@ async def test_node_merge_keeps_distinct_descriptions():
     assert len(frags) == 2
 
 
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_node_projection_does_not_persist_internal_summary_revision():
+    graph = _MemGraph()
+    graph.nodes["ALICE"] = {
+        "entity_type": "person",
+        "description": "new checkpoint summary",
+        "source_id": "chunk-new",
+        "file_path": "new.txt",
+        "magi_summary_revision": 3,
+    }
+    cfg = {**_config(), "magi_projection_replace": True}
+
+    result = await _merge_nodes_then_upsert(
+        "ALICE",
+        [
+            {
+                "entity_name": "ALICE",
+                "entity_type": "person",
+                "description": "stale checkpoint summary",
+                "source_id": "chunk-old",
+                "file_path": "old.txt",
+                "timestamp": 1,
+                "magi_summary_revision": 2,
+            }
+        ],
+        graph,
+        None,
+        cfg,
+    )
+
+    assert result["description"] == "stale checkpoint summary"
+    assert "magi_summary_revision" not in graph.nodes["ALICE"]
+
+
 # --- edge merge round-trip --------------------------------------------------
 
 
@@ -270,3 +333,45 @@ async def test_edge_reprocess_does_not_accumulate_description():
 
     assert counts == [1, 1, 1]
     assert _edge_fragments(graph, "ALICE", "ACME") == ["Alice works at Acme."]
+
+
+@pytest.mark.offline
+@pytest.mark.asyncio
+async def test_edge_projection_does_not_persist_internal_summary_revision():
+    graph = _MemGraph()
+    graph.nodes["ALICE"] = {"entity_type": "person", "description": "Alice"}
+    graph.nodes["ACME"] = {"entity_type": "organization", "description": "Acme"}
+    graph.edges[("ALICE", "ACME")] = {
+        "description": "new checkpoint summary",
+        "keywords": "employment",
+        "weight": 1.0,
+        "source_id": "chunk-new",
+        "file_path": "new.txt",
+        "magi_summary_revision": 5,
+    }
+    cfg = {**_config(), "magi_projection_replace": True}
+
+    result = await _merge_edges_then_upsert(
+        "ALICE",
+        "ACME",
+        [
+            {
+                "src_id": "ALICE",
+                "tgt_id": "ACME",
+                "description": "stale checkpoint summary",
+                "keywords": "employment",
+                "weight": 1.0,
+                "source_id": "chunk-old",
+                "file_path": "old.txt",
+                "timestamp": 1,
+                "magi_summary_revision": 4,
+            }
+        ],
+        graph,
+        None,
+        None,
+        cfg,
+    )
+
+    assert result["description"] == "stale checkpoint summary"
+    assert "magi_summary_revision" not in graph.edges[("ALICE", "ACME")]

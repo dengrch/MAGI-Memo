@@ -180,7 +180,14 @@ test('forwards already-extracted memory in the same request', async () => {
   await withServer((request, response, body) => {
     assert.equal(request.url, '/memory/ingest/extracted')
     seenBody = body
-    json(response, 200, { episode_ids: ['episode-1'], indexed_count: 1, skipped_count: 0, track_id: null })
+    json(response, 202, {
+      episode_ids: ['episode-1'],
+      indexed_count: 0,
+      skipped_count: 0,
+      track_id: 'ingest-extracted-1',
+      status: 'accepted',
+      completion: 'background',
+    })
   }, async (baseUrl) => {
     const client = new MagiClient({ baseUrl, timeoutMs: 1_000 })
     const payload = {
@@ -195,7 +202,14 @@ test('forwards already-extracted memory in the same request', async () => {
       relations: [],
     }
     const result = await client.writeExtracted(payload, new AbortController().signal)
-    assert.deepEqual(result, { episode_ids: ['episode-1'], indexed_count: 1, skipped_count: 0, track_id: null })
+    assert.deepEqual(result, {
+      episode_ids: ['episode-1'],
+      indexed_count: 0,
+      skipped_count: 0,
+      track_id: 'ingest-extracted-1',
+      status: 'accepted',
+      completion: 'background',
+    })
     const submitted = JSON.parse(seenBody)
     assert.deepEqual(submitted, {
       ...payload,
@@ -204,6 +218,37 @@ test('forwards already-extracted memory in the same request', async () => {
     })
     assert.match(submitted.reference_at, /^\d{4}-\d{2}-\d{2}T.*Z$/)
   })
+})
+
+test('forwards a relationship without explicit endpoint entities', async () => {
+  let seenBody = ''
+  await withServer((request, response, body) => {
+    assert.equal(request.url, '/memory/ingest/extracted')
+    seenBody = body
+    json(response, 202, {
+      episode_ids: ['episode-relation-only'],
+      indexed_count: 0,
+      skipped_count: 0,
+      track_id: 'ingest-extracted-relation-only',
+      status: 'accepted',
+      completion: 'background',
+    })
+  }, async (baseUrl) => {
+    const client = new MagiClient({ baseUrl, timeoutMs: 1_000 })
+    await client.writeExtracted({
+      content: 'Alice joined MAGI.',
+      relations: [{
+        source: 'Alice',
+        target: 'MAGI',
+        atoms: [{ content: 'Alice joined MAGI.', predicate: 'member_of' }],
+      }],
+    }, new AbortController().signal)
+  })
+
+  const submitted = JSON.parse(seenBody)
+  assert.deepEqual(submitted.entities, [])
+  assert.equal(submitted.relations[0].atoms.length, 1)
+  assert.equal(submitted.wait_for_completion, false)
 })
 
 test('maps recall options to structured query-data retrieval', async () => {
@@ -232,4 +277,73 @@ test('maps recall options to structured query-data retrieval', async () => {
     ll_keywords: ['Alice', 'status report'],
     enable_rerank: true,
   })
+})
+
+test('maps active expand and evidence while hiding MAGI stable ids', async () => {
+  const seen: Array<{ url: string | undefined; body: unknown }> = []
+  await withServer((request, response, body) => {
+    seen.push({ url: request.url, body: JSON.parse(body) })
+    if (request.url === '/memory/explore/expand') {
+      json(response, 200, {
+        status: 'complete',
+        exhausted: false,
+        results: [{
+          candidates: [{
+            entity: {
+              name: 'Bob',
+              description: '[atom-entity-secret] [status=pending; valid_at=2027-01-01T00:00:00Z] Bob studies MAGI.',
+              magi_entity_id: 'entity-secret',
+            },
+            relation: {
+              endpoints: ['Alice', 'Bob'],
+              description: 'Alice mentors Bob. [atom-relation-secret] [status=active]',
+              magi_relation_id: 'relation-secret',
+            },
+          }],
+        }],
+      })
+      return
+    }
+    json(response, 200, {
+      status: 'complete',
+      owners: [{ magi_owner_id: 'entity-secret', atoms: [{ content: 'Evidence' }] }],
+    })
+  }, async (baseUrl) => {
+    const client = new MagiClient({ baseUrl, timeoutMs: 1_000 })
+    const signal = new AbortController().signal
+    const expanded = await client.expand({
+      frontier: ['Alice'],
+      visit: { entities: ['Alice'], relations: [] },
+      maxCandidatesPerFrontier: 25,
+    }, signal)
+    const evidence = await client.evidence([
+      { entity: 'Alice' },
+      { relation: ['Bob', 'Alice'] },
+    ], signal)
+    assert.doesNotMatch(JSON.stringify(expanded), /entity-secret|relation-secret|magi_.*_id/)
+    assert.doesNotMatch(JSON.stringify(expanded), /\[atom-|\[status=|valid_at/)
+    assert.match(JSON.stringify(expanded), /Bob studies MAGI\./)
+    assert.match(JSON.stringify(expanded), /Alice mentors Bob\./)
+    assert.doesNotMatch(JSON.stringify(evidence), /entity-secret|magi_owner_id/)
+  })
+
+  assert.deepEqual(seen, [
+    {
+      url: '/memory/explore/expand',
+      body: {
+        frontier: ['Alice'],
+        visit: { entities: ['Alice'], relations: [] },
+        max_candidates_per_frontier: 25,
+      },
+    },
+    {
+      url: '/memory/explore/evidence',
+      body: {
+        owners: [
+          { entity: 'Alice' },
+          { relation: ['Bob', 'Alice'] },
+        ],
+      },
+    },
+  ])
 })

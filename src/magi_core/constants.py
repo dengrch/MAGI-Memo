@@ -35,6 +35,11 @@ DEFAULT_SUMMARY_MAX_TOKENS = 1200
 DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
+# MAGI owner-summary checkpoint/delta compaction defaults.
+DEFAULT_MAGI_SUMMARY_DELTA_ATOM_THRESHOLD = 8
+DEFAULT_MAGI_SUMMARY_DELTA_TOKEN_THRESHOLD = 1200
+DEFAULT_MAGI_SUMMARY_DESCRIPTION_TOKEN_BUDGET = 12000
+DEFAULT_MAGI_SUMMARY_FULL_REBUILD_INTERVAL = 8
 # Maximum token size allowed for entity extraction input context
 DEFAULT_MAX_EXTRACT_INPUT_TOKENS = 20480
 # Maximum token size for the per-chunk `---Section Context---` heading

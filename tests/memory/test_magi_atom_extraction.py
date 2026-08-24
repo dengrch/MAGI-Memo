@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from unittest.mock import patch
 
 from magi_core.operate import (
     _process_json_extraction_result,
@@ -79,7 +80,7 @@ class MagiAtomExtractionTests(unittest.TestCase):
         self.assertEqual(relation["atom_payload"]["predicate"], "member_of")
         self.assertNotIn("description", relation["atom_payload"])
 
-    def test_relation_without_entity_atom_container_is_rejected(self) -> None:
+    def test_relation_without_entity_container_is_rejected(self) -> None:
         payload = {
             "entities": [
                 {
@@ -112,6 +113,50 @@ class MagiAtomExtractionTests(unittest.TestCase):
             )
         )
         self.assertEqual(edges, {})
+
+    def test_relation_only_endpoint_container_is_retained_without_fake_atom(
+        self,
+    ) -> None:
+        payload = {
+            "entities": [
+                {"name": "Alice", "type": "Person", "atoms": []},
+                {"name": "MAGI", "type": "Organization", "atoms": []},
+            ],
+            "relationships": [
+                {
+                    "source": "Alice",
+                    "target": "MAGI",
+                    "keywords": "membership",
+                    "atoms": [
+                        {
+                            "predicate": "member_of",
+                            "content": "Alice is a member of MAGI.",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch("magi_core.operate.logger.warning") as warning:
+            nodes, edges = asyncio.run(
+                _process_json_extraction_result(
+                    json.dumps(payload),
+                    "chunk-relation-only",
+                    1,
+                    magi_memory_enabled=True,
+                )
+            )
+
+        self.assertEqual(nodes["Alice"][0]["description"], "")
+        self.assertIsNone(nodes["Alice"][0]["atom_payload"])
+        self.assertTrue(nodes["Alice"][0]["magi_endpoint_only"])
+        self.assertEqual(
+            edges[("Alice", "MAGI")][0]["description"],
+            "Alice is a member of MAGI.",
+        )
+        warning_text = "\n".join(str(call.args[0]) for call in warning.call_args_list)
+        self.assertIn("current extraction container", warning_text)
+        self.assertIn("relationship endpoint candidate", warning_text)
 
     def test_atom_citation_is_removed_only_from_embedding_text(self) -> None:
         graph_description = (
