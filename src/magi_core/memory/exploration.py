@@ -40,7 +40,7 @@ class _ResolvedEntity:
 
 
 class MemoryExplorer:
-    """Implement stateless one-hop expansion and owner evidence lookup.
+    """Implement stateless expansion, description, and evidence lookup.
 
     Entity names are the public addressing surface. Stable MAGI ids remain an
     internal validation mechanism and are included only in the raw Core result,
@@ -185,20 +185,16 @@ class MemoryExplorer:
                     raise ExplorationReadError(
                         f"one-hop edge {relation_pair!r} is missing materialized MAGI data"
                     )
-                endpoints, relation_id, edge, _record = relation
+                endpoints, _relation_id, edge, _record = relation
                 candidates.append(
                     {
                         "entity": {
                             "name": neighbor.name,
                             "entity_type": neighbor.graph.get("entity_type", "UNKNOWN"),
-                            "description": neighbor.graph.get("description", ""),
-                            "magi_entity_id": neighbor.stable_id,
                         },
                         "relation": {
                             "endpoints": list(endpoints),
                             "keywords": edge.get("keywords", ""),
-                            "description": edge.get("description", ""),
-                            "magi_relation_id": relation_id,
                         },
                     }
                 )
@@ -235,6 +231,51 @@ class MemoryExplorer:
             "available_count": total_available,
             "returned_count": total_returned,
             "results": results,
+        }
+
+    async def describe(self, owners: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        """Return materialized graph descriptions for name-addressed owners."""
+
+        found: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        for owner in owners:
+            if "entity" in owner:
+                name = _clean_name(str(owner["entity"]))
+                resolved = await self._resolve_entity(name)
+                if resolved is None:
+                    missing.append({"entity": name})
+                    continue
+                found.append(
+                    {
+                        "owner": {"type": "entity", "name": resolved.name},
+                        "entity_type": resolved.graph.get(
+                            "entity_type", "UNKNOWN"
+                        ),
+                        "description": resolved.graph.get("description", ""),
+                    }
+                )
+                continue
+
+            source, target = owner["relation"]
+            relation = await self._resolve_relation(source, target)
+            if relation is None:
+                missing.append(
+                    {"relation": list(_display_pair(source, target))}
+                )
+                continue
+            endpoints, _owner_id, edge, _record = relation
+            found.append(
+                {
+                    "owner": {"type": "relation", "name": list(endpoints)},
+                    "keywords": edge.get("keywords", ""),
+                    "description": edge.get("description", ""),
+                }
+            )
+
+        return {
+            "status": "partial" if missing else "complete",
+            "missing_owners": missing,
+            "owners": found,
         }
 
     async def evidence(self, owners: Sequence[dict[str, Any]]) -> dict[str, Any]:

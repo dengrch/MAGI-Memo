@@ -30,3 +30,23 @@ def test_runtime_log_errors_and_other_access_logs_are_retained() -> None:
 
     assert path_filter.filter(_access_record("GET", "/runtime/logs", 500)) is True
     assert path_filter.filter(_access_record("GET", "/runtime/status", 200)) is True
+
+
+def test_exploration_polling_is_filtered_but_errors_are_retained() -> None:
+    path_filter = LightragPathFilter()
+
+    assert path_filter.filter(_access_record("GET", "/memory/explore/traces", 200)) is False
+    assert (
+        path_filter.filter(
+            _access_record(
+                "GET",
+                "/memory/explore/traces/explore-1/events?after_seq=3",
+                200,
+            )
+        )
+        is False
+    )
+    assert (
+        path_filter.filter(_access_record("GET", "/memory/explore/traces", 500))
+        is True
+    )

@@ -12,3 +12,9 @@
         explorerChunkTopK: !!js Number(process.env.MAGI_MEMO_EXPLORER_CHUNK_TOP_K ?? 10)
         explorerMaxTokens: !!js Number(process.env.MAGI_MEMO_EXPLORER_MAX_TOKENS ?? 8192)
         explorerMaxCandidatesPerFrontier: !!js Number(process.env.MAGI_MEMO_EXPLORER_MAX_CANDIDATES_PER_FRONTIER ?? 50)
+        explorerWorkerMaxTokens: !!js Number(process.env.MAGI_MEMO_EXPLORER_WORKER_MAX_TOKENS ?? 4096)
+        explorerCoordinatorProvider: !!js process.env.MAGI_MEMO_EXPLORER_COORDINATOR_PROVIDER ?? 'csi-qwen-thinking'
+        explorerCoordinatorModel: !!js process.env.MAGI_MEMO_EXPLORER_COORDINATOR_MODEL ?? 'Qwen3.7-Plus'
+
+        explorerWorkerProvider: !!js process.env.MAGI_MEMO_EXPLORER_WORKER_PROVIDER ?? 'csi-qwen-fast'
+        explorerWorkerModel: !!js process.env.MAGI_MEMO_EXPLORER_WORKER_MODEL ?? 'Qwen3.7-Plus'

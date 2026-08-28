@@ -15,15 +15,39 @@ stable id 交互、多 Agent 和 path 输出等历史方案；实现的规范以
 
 ## 1.1 v1 实现结论（MAG-38）
 
-- Core 暴露 `POST /memory/explore/expand` 与 `POST /memory/explore/evidence`。
+- Core 暴露 `POST /memory/explore/expand`、`POST /memory/explore/describe` 与
+  `POST /memory/explore/evidence`。
 - Agent 只用实体名和无序关系端点名；Core 内部解析并校验 stable id，dsh 客户端在模型可见前移除 id。
-- `frontier` 只包含实体名。`expand(frontier, visit)` 完成一跳展开，并且仅当候选的邻居实体与关系端点对都在
-  `visit` 时过滤该候选；早期未选择的候选不会进入额外黑名单。
-- 唯一探索状态是结构化 `visit` 与语义 `findings`。没有 `seen`、`deferred`、`expanded` 或客户端 path 状态。
+- Agent 的 `expand` 参数只包含实体名 frontier。插件维护权威 `visit` 并在调用 Core 的
+  `expand(frontier, visit)` 时自动注入；仅当候选的邻居实体与关系端点对都已在 visit 时过滤该候选。
+- 三层渐进加载协议是唯一规范：`expand` 只返回名称／类型／端点／关系关键词；每个返回候选的轮次必须选择
+  一个非空的小集合并执行一次批量 `describe`。每个选中候选至少提供一个与问题匹配的 owner：连接事实优先关系
+  owner，节点身份／语境优先实体 owner，两侧语义都需要时才同时加载。成功 describe 的 owner 与描述由插件
+  自动提交到 `visit/findings`；`evidence` 只在描述仍留下查询所需歧义时按需调用，其精炼结论通过内部 note 工具
+  写回 findings。
+- 结构化 `visit` 与 `findings` 均由插件按 explorer 进程维护，同时记录已展开 frontier 和待 describe 状态。
+  Agent 不再把整份 visit 传给 expand，也不在 structured output 重复返回 findings；Core 仍保持无状态。
+- `expanded` 与 visit 解耦，记录本分支已经实际调用过 expand 的实体。任何曾出现在探索历史中的实体均可成为
+  frontier，包括未 describe 的 topology-only candidate；插件仅在请求时拒绝重复 expanded，不把完整集合注入 prompt。
 - `exhausted=true` 只表示所有 frontier 完整读取、去重后确实为空；缺失 frontier、截断与读取失败均显式区分。
 - dsh 新增可选 `/memory explore` 模式。复合工具先做 mix recall，再启动恰好一个隔离的 Explorer Sub-Agent；
-  child 只能调用 expand/evidence，主 Agent 只接收结构化 `visit + findings`。
-- 正常终止条件严格为：`(本轮 expand 确实为空或本轮一个都不选) AND 本轮不从历史 context 补选任何候选`。
+  child 只能调用 expand/describe/evidence/note，主 Agent 只接收插件快照中的 description-backed `findings`、探索 `report` 与完成状态。
+- `auto` 模式支持热启动升级：Host 先主动执行任意普通 recall 并判断其仍缺少必须沿图追踪的关系；插件按当前 Agent
+  与当前 turn 托管该次 recall 解析出的 visit/findings。随后 `magi_memory_explore(hot_start=true)` 直接复用 seeds，
+  不再重复 Mix，并在创建 s0 前通过 dsh 原生 approval 通道向用户请求一次许可。拒绝、取消或无交互通道均 fail closed，
+  且同一 turn 不重复弹窗。显式 `/memory explore` 未提供热启动 seeds 时仍保留冷启动 Mix 行为。
+- 单 Agent 与并发 worker 共用同一状态机。并发 s0 只做 subquery/frontier 调度和 findings 归并；每个 task 由 s0
+  显式附带该 subquery 所需的最小 `known_owners` 引用（允许为空），插件从 s0 权威 findings 中解析其 notes，禁止
+  模型复制或向所有 worker 广播完整状态。worker 使用插件克隆的 visit 独立执行
+  `expand → mandatory describe → optional evidence`，其新增 findings 在返回 delegate 结果前自动归并给 s0。本文后续关于“两工具方案”、“describe 可省略”或
+  “允许重复考虑旧 frontier”的文字仅保留为历史讨论，不再代表实现规范。
+- 跨批次去重以规范化后的 `subquery + frontier` task 为单位，而不是以 frontier 为单位。新一轮应优先使用 worker
+  返回的 description-backed 新实体；若累计 findings 暴露出确实不同的未决分支，也允许不同 subquery 复用核心
+  frontier。插件拒绝完全相同的 task，语义近似但换措辞的重复则由 s0 prompt 约束。
+- 不设置固定 worker 数、delegate 批次数、总 hop 或单 worker hop 预算。`expanded` 去重与 mandatory describe
+  维护流程正确性；s0 根据 findings 是否已经足够回答决定停止，并只为明确的未决逻辑分支继续委派。
+- 初始 mix 的 visit/findings 均进入插件权威状态；模型初始 prompt 只呈现 findings，不再重复呈现 visit 或单独构造
+  frontier。首轮 frontier 由 Agent 从 findings 中的实体 owner 与关系端点按问题动态选择。
 
 ## 2. 思考演进
 
@@ -521,7 +545,7 @@ MAG-25 Linear 工单描述当前是"基于 dsh 的并发主动图谱检索与 Su
 - 明确验收：对照评测（普通 mix vs sub-agent explore），看多跳召回、证据多样性、时延、token
 - 故事定性："agent 委托主动检索"——agent 选择委托、选择起点、选择预算、接收结构化结果
 
-**注意**：本 session 不修改 Linear 工单状态或描述。等用户确认方案后再单独操作。
+Linear 工单状态与描述只在用户明确授权时更新；本轮已获得用户授权，可在完成验收核对后同步 MAG-39/MAG-37。
 
 ## 8. 与其他工单的关系
 

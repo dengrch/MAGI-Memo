@@ -121,6 +121,10 @@ async def test_expand_filters_only_when_entity_and_relation_are_both_visited():
     candidates = result["results"][0]["candidates"]
     assert [candidate["entity"]["name"] for candidate in candidates] == ["Carol"]
     assert candidates[0]["relation"]["endpoints"] == ["Alice", "Carol"]
+    assert candidates[0] == {
+        "entity": {"name": "Carol", "entity_type": "PERSON"},
+        "relation": {"endpoints": ["Alice", "Carol"], "keywords": "knows"},
+    }
 
 
 @pytest.mark.asyncio
@@ -199,4 +203,37 @@ async def test_evidence_resolves_entity_and_unordered_relation_by_name():
     assert result["owners"][1]["owner"] == {
         "type": "relation",
         "name": ["Alice", "Bob"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_describe_progressively_loads_graph_descriptions_by_name():
+    explorer = MemoryExplorer(_Graph(), _MemoryDb())
+
+    result = await explorer.describe(
+        [
+            {"entity": "Alice"},
+            {"relation": ("Bob", "Alice")},
+            {"entity": "Missing"},
+        ]
+    )
+
+    assert result == {
+        "status": "partial",
+        "missing_owners": [{"entity": "Missing"}],
+        "owners": [
+            {
+                "owner": {"type": "entity", "name": "Alice"},
+                "entity_type": "PERSON",
+                "description": "Alice description",
+            },
+            {
+                "owner": {
+                    "type": "relation",
+                    "name": ["Alice", "Bob"],
+                },
+                "keywords": "works with",
+                "description": "Alice works with Bob",
+            },
+        ],
     }

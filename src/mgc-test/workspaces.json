@@ -1,0 +1,11 @@
+{
+  "schema": 2,
+  "active_workspace_id": "default",
+  "workspaces": [
+    {
+      "id": "default",
+      "root": "/Users/dengruochen/Desktop/MAGI-Memo/src/mgc-test",
+      "label": "Default"
+    }
+  ]
+}

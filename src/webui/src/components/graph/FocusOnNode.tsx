@@ -1,11 +1,12 @@
 import { useCamera, useSigma } from '@react-sigma/core'
 import { useEffect } from 'react'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 
 /**
  * Component that highlights a node and centers the camera on it.
  */
 const FocusOnNode = ({ node, move }: { node: string | null; move?: boolean }) => {
+  const graphStore = useGraphRuntimeStore()
   const sigma = useSigma()
   const { gotoNode } = useCamera()
 
@@ -28,7 +29,7 @@ const FocusOnNode = ({ node, move }: { node: string | null; move?: boolean }) =>
         sigma.setCustomBBox(null);
         sigma.getCamera().animate({ x: 0.5, y: 0.5, ratio: 1 }, { duration: 0 });
       }
-      useGraphStore.getState().setMoveToSelectedNode(false);
+      graphStore.getState().setMoveToSelectedNode(false);
     } else if (node && graph.hasNode(node)) {
       try {
         graph.setNodeAttribute(node, 'highlighted', true);
@@ -46,7 +47,7 @@ const FocusOnNode = ({ node, move }: { node: string | null; move?: boolean }) =>
         }
       }
     }
-  }, [node, move, sigma, gotoNode])
+  }, [node, move, sigma, gotoNode, graphStore])
 
   return null
 }

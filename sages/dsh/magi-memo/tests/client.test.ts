@@ -279,7 +279,7 @@ test('maps recall options to structured query-data retrieval', async () => {
   })
 })
 
-test('maps active expand and evidence while hiding MAGI stable ids', async () => {
+test('maps compact expand, progressive describe, and evidence while hiding MAGI stable ids', async () => {
   const seen: Array<{ url: string | undefined; body: unknown }> = []
   await withServer((request, response, body) => {
     seen.push({ url: request.url, body: JSON.parse(body) })
@@ -291,15 +291,26 @@ test('maps active expand and evidence while hiding MAGI stable ids', async () =>
           candidates: [{
             entity: {
               name: 'Bob',
-              description: '[atom-entity-secret] [status=pending; valid_at=2027-01-01T00:00:00Z] Bob studies MAGI.',
+              entity_type: 'PERSON',
               magi_entity_id: 'entity-secret',
             },
             relation: {
               endpoints: ['Alice', 'Bob'],
-              description: 'Alice mentors Bob. [atom-relation-secret] [status=active]',
+              keywords: 'mentors',
               magi_relation_id: 'relation-secret',
             },
           }],
+        }],
+      })
+      return
+    }
+    if (request.url === '/memory/explore/describe') {
+      json(response, 200, {
+        status: 'complete',
+        owners: [{
+          owner: { type: 'entity', name: 'Bob' },
+          description: '[atom-entity-secret] [status=pending; valid_at=2027-01-01T00:00:00Z] Bob studies MAGI.',
+          magi_owner_id: 'entity-secret',
         }],
       })
       return
@@ -311,30 +322,65 @@ test('maps active expand and evidence while hiding MAGI stable ids', async () =>
   }, async (baseUrl) => {
     const client = new MagiClient({ baseUrl, timeoutMs: 1_000 })
     const signal = new AbortController().signal
+    await client.registerExploration(
+      'explore-1',
+      'Who is Alice?',
+      signal,
+      { entities: ['Alice', 'Bob'], relations: [['Alice', 'Bob']] },
+    )
     const expanded = await client.expand({
       frontier: ['Alice'],
       visit: { entities: ['Alice'], relations: [] },
       maxCandidatesPerFrontier: 25,
+      trace: {
+        explorationId: 'explore-1',
+        agentId: 's0',
+        callId: 'call-1',
+        query: 'How does Alice connect to the project?',
+      },
     }, signal)
+    const described = await client.describe([{ entity: 'Bob' }], signal)
     const evidence = await client.evidence([
       { entity: 'Alice' },
       { relation: ['Bob', 'Alice'] },
     ], signal)
     assert.doesNotMatch(JSON.stringify(expanded), /entity-secret|relation-secret|magi_.*_id/)
-    assert.doesNotMatch(JSON.stringify(expanded), /\[atom-|\[status=|valid_at/)
-    assert.match(JSON.stringify(expanded), /Bob studies MAGI\./)
-    assert.match(JSON.stringify(expanded), /Alice mentors Bob\./)
+    assert.doesNotMatch(JSON.stringify(expanded), /description|\[atom-|\[status=|valid_at/)
+    assert.match(JSON.stringify(expanded), /PERSON|mentors/)
+    assert.doesNotMatch(JSON.stringify(described), /entity-secret|\[atom-|\[status=|valid_at/)
+    assert.match(JSON.stringify(described), /Bob studies MAGI\./)
     assert.doesNotMatch(JSON.stringify(evidence), /entity-secret|magi_owner_id/)
   })
 
   assert.deepEqual(seen, [
+    {
+      url: '/memory/explore/traces',
+      body: {
+        exploration_id: 'explore-1',
+        query: 'Who is Alice?',
+        initial_visit: {
+          entities: ['Alice', 'Bob'],
+          relations: [['Alice', 'Bob']],
+        },
+      },
+    },
     {
       url: '/memory/explore/expand',
       body: {
         frontier: ['Alice'],
         visit: { entities: ['Alice'], relations: [] },
         max_candidates_per_frontier: 25,
+        trace: {
+          exploration_id: 'explore-1',
+          agent_id: 's0',
+          call_id: 'call-1',
+          subquery: 'How does Alice connect to the project?',
+        },
       },
+    },
+    {
+      url: '/memory/explore/describe',
+      body: { owners: [{ entity: 'Bob' }] },
     },
     {
       url: '/memory/explore/evidence',

@@ -47,6 +47,12 @@ export interface ExpandInput {
   frontier: string[]
   visit: VisitInput
   maxCandidatesPerFrontier?: number
+  trace?: {
+    explorationId: string
+    agentId: string
+    callId: string
+    query?: string
+  }
 }
 
 export type EvidenceOwnerInput =
@@ -139,6 +145,19 @@ function compactObject(entries: Record<string, JsonValue | undefined>): Record<s
   )
 }
 
+function normalizeOwners(owners: EvidenceOwnerInput[]): JsonValue[] {
+  if (owners.length === 0) throw new Error('owners must not be empty')
+  return owners.map((owner, index) => {
+    if ('entity' in owner) return { entity: nonEmpty(owner.entity, `owners[${index}].entity`) }
+    return {
+      relation: [
+        nonEmpty(owner.relation[0], `owners[${index}].relation[0]`),
+        nonEmpty(owner.relation[1], `owners[${index}].relation[1]`),
+      ],
+    }
+  })
+}
+
 /** Stable Entity/Relation ids validate Core addressing but never enter model context. */
 export function hideMagiStableIds(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(hideMagiStableIds)
@@ -160,7 +179,7 @@ export function stripExplorerEvidenceMetadata(value: string): string {
     .trim()
 }
 
-/** Filter only expandable graph descriptions; evidence responses stay lossless. */
+/** Strip embedded evidence annotations from lightweight graph descriptions. */
 export function compactExplorerExpandResult(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(compactExplorerExpandResult)
   if (!isRecord(value)) return value
@@ -360,26 +379,56 @@ export class MagiClient {
         input.maxCandidatesPerFrontier,
         'max_candidates_per_frontier',
       ),
+      trace: input.trace === undefined
+        ? undefined
+        : {
+            exploration_id: nonEmpty(input.trace.explorationId, 'trace.exploration_id'),
+            agent_id: nonEmpty(input.trace.agentId, 'trace.agent_id'),
+            call_id: nonEmpty(input.trace.callId, 'trace.call_id'),
+            ...(input.trace.query === undefined
+              ? {}
+              : { subquery: nonEmpty(input.trace.query, 'trace.subquery') }),
+          },
     })))
     return compactExplorerExpandResult(result)
   }
 
-  async evidence(owners: EvidenceOwnerInput[], signal: AbortSignal): Promise<JsonValue> {
-    if (owners.length === 0) throw new Error('owners must not be empty')
-    const normalized = owners.map((owner, index) => {
-      if ('entity' in owner) return { entity: nonEmpty(owner.entity, `owners[${index}].entity`) }
-      return {
-        relation: [
-          nonEmpty(owner.relation[0], `owners[${index}].relation[0]`),
-          nonEmpty(owner.relation[1], `owners[${index}].relation[1]`),
-        ],
-      }
+  async registerExploration(
+    explorationId: string,
+    query: string,
+    signal: AbortSignal,
+    initialVisit?: VisitInput,
+  ): Promise<JsonValue> {
+    return this.request('POST', '/memory/explore/traces', signal, {
+      exploration_id: nonEmpty(explorationId, 'exploration_id'),
+      query: nonEmpty(query, 'query'),
+      ...(initialVisit === undefined
+        ? {}
+        : {
+            initial_visit: {
+              entities: initialVisit.entities,
+              relations: initialVisit.relations,
+            },
+          }),
     })
+  }
+
+  async evidence(owners: EvidenceOwnerInput[], signal: AbortSignal): Promise<JsonValue> {
     return hideMagiStableIds(await this.request(
       'POST',
       '/memory/explore/evidence',
       signal,
-      { owners: normalized },
+      { owners: normalizeOwners(owners) },
     ))
+  }
+
+  async describe(owners: EvidenceOwnerInput[], signal: AbortSignal): Promise<JsonValue> {
+    const result = hideMagiStableIds(await this.request(
+      'POST',
+      '/memory/explore/describe',
+      signal,
+      { owners: normalizeOwners(owners) },
+    ))
+    return compactExplorerExpandResult(result)
   }
 }

@@ -27,6 +27,52 @@ from magi_core.memory import (
 
 
 class MemoryModelsAndSQLiteTests(unittest.TestCase):
+    def test_exploration_trace_events_are_ordered_replayable_and_archivable(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                backend = SQLiteBackend(
+                    Path(temporary) / "magi-memory.db", "workspace-a"
+                )
+                await backend.initialize()
+                await backend.register_exploration_trace(
+                    "explore-1", "Who is Alice?"
+                )
+                first = await backend.append_exploration_event(
+                    exploration_id="explore-1",
+                    event_type="expand_started",
+                    agent_id="s0",
+                    call_id="call-1",
+                    payload={"frontier": ["Alice"]},
+                )
+                second = await backend.append_exploration_event(
+                    exploration_id="explore-1",
+                    event_type="expand_completed",
+                    agent_id="s0",
+                    call_id="call-1",
+                    payload={"result": {"results": []}},
+                )
+                self.assertEqual((first["seq"], second["seq"]), (1, 2))
+
+                replay = await backend.get_exploration_events(
+                    "explore-1", after_seq=1
+                )
+                self.assertEqual([event["seq"] for event in replay], [2])
+                traces = await backend.list_exploration_traces()
+                self.assertEqual(traces[0]["query"], "Who is Alice?")
+                self.assertEqual(traces[0]["last_seq"], 2)
+
+                self.assertTrue(await backend.archive_exploration_trace("explore-1"))
+                self.assertEqual(await backend.list_exploration_traces(), [])
+                archived = await backend.list_exploration_traces(
+                    include_archived=True
+                )
+                self.assertEqual(archived[0]["status"], "archived")
+                await backend.finalize()
+
+        asyncio.run(scenario())
+
     def test_initialize_migrates_v4_evidence_without_loss(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:

@@ -90,7 +90,7 @@ export class RawGraph {
   }
 }
 
-interface GraphState {
+export interface GraphState {
   selectedNode: string | null
   focusedNode: string | null
   selectedEdge: string | null
@@ -189,7 +189,7 @@ interface GraphState {
   updateEdgeAndSelect: (edgeId: string, dynamicId: string, sourceId: string, targetId: string, propertyName: string, newValue: string) => Promise<void>
 }
 
-const useGraphStoreBase = create<GraphState>()((set, get) => ({
+const createGraphStoreBase = () => create<GraphState>()((set, get) => ({
   selectedNode: null,
   focusedNode: null,
   selectedEdge: null,
@@ -469,6 +469,8 @@ const useGraphStoreBase = create<GraphState>()((set, get) => ({
   }
 }))
 
-const useGraphStore = createSelectors(useGraphStoreBase)
+const useGraphStore = createSelectors(createGraphStoreBase())
+export const createGraphStore = () => createSelectors(createGraphStoreBase())
+export type GraphStore = ReturnType<typeof createGraphStore>
 
 export { useGraphStore }

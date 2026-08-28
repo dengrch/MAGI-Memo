@@ -3,8 +3,13 @@ import test from 'node:test'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import {
   ACTIVE_EXPLORER_OUTPUT_SCHEMA,
+  addEntityFinding,
+  addRelationFinding,
+  activeExplorerWorkerPrompt,
   activeExplorerLabel,
   activeExplorerPrompt,
+  concurrentExplorerPrompt,
+  normalizeExplorerWorkerResult,
   parseRecallSeeds,
   runActiveExplorer,
 } from '../src/active-explorer.ts'
@@ -62,22 +67,43 @@ test('omits a seed finding whose description contains only evidence metadata', (
   assert.deepEqual(seeds.findings.entities, [])
 })
 
-test('prompt preserves the exact normal stopping rule and rejects extra state', () => {
+test('plugin-managed state normalizes owners and merges description notes', () => {
+  const visit = { entities: ['Alice'], relations: [] as Array<[string, string]> }
+  const findings = { entities: [], relations: [] } as ReturnType<typeof parseRecallSeeds>['findings']
+
+  assert.equal(addEntityFinding(visit, findings, ' alice ', ' Leads MAGI. '), true)
+  assert.equal(addEntityFinding(visit, findings, 'Alice', 'Leads MAGI.'), false)
+  assert.equal(addRelationFinding(visit, findings, ['Bob', 'Alice'], 'Works together.'), true)
+
+  assert.deepEqual(visit, {
+    entities: ['Alice', 'Bob'],
+    relations: [['Alice', 'Bob']],
+  })
+  assert.deepEqual(findings, {
+    entities: [{ name: 'Alice', notes: ['Leads MAGI.'] }],
+    relations: [{ endpoints: ['Alice', 'Bob'], notes: ['Works together.'] }],
+  })
+})
+
+test('prompt enforces the canonical three-layer retrieval state machine', () => {
   const seeds = parseRecallSeeds(recall)
   const prompt = activeExplorerPrompt('How are Alice and Bob connected?', seeds)
-  assert.match(prompt, /Maintain exactly two semantic accumulators: visit and findings/)
-  assert.match(prompt, /There is no fixed count: prefer focused expansion/)
-  assert.match(prompt, /choose only the owners you judge most promising/)
+  assert.match(prompt, /plugin, not you, owns visit and findings/)
+  assert.match(prompt, /Canonical three-layer retrieval state machine/)
+  assert.match(prompt, /DESCRIBE \(MANDATORY\)/)
+  assert.match(prompt, /exactly one batched magi_memory_describe/)
+  assert.match(prompt, /relation owner for a connection claim/)
+  assert.match(prompt, /or both when both semantics are needed/)
+  assert.match(prompt, /EVIDENCE \(OPTIONAL\)/)
+  assert.match(prompt, /Compact topology alone never creates a finding/)
+  assert.match(prompt, /describe commits both automatically/)
+  assert.match(prompt, /maintains expanded separately from visit/)
   assert.match(prompt, /Brief narration .* is allowed for debugging/)
-  assert.match(prompt, /visit is internal exploration state/)
-  assert.match(prompt, /every shown key is required even when its array is empty/)
-  assert.match(prompt, /findings\.notes is invalid/)
-  assert.match(prompt, /Never omit findings\.entities, findings\.relations, or stop_reason/)
-  assert.match(prompt, /Earlier rejection is not permanent/)
-  assert.match(prompt, /the current expand is truly exhausted OR you select no candidate/)
-  assert.match(prompt, /AND you add no candidate from historical context/)
-  assert.match(prompt, /explicitly returns exhausted=true/)
-  assert.match(prompt, /Never expose or copy MAGI stable ids/)
+  assert.match(prompt, /Do not return visit or findings/)
+  assert.match(prompt, /Each frontier entity may be expanded at most once/)
+  assert.match(prompt, /Never expose MAGI stable ids/)
+  assert.doesNotMatch(prompt, /"frontier":/)
+  assert.doesNotMatch(prompt, /"visit":/)
   assert.doesNotMatch(prompt, /INITIAL MIX RECALL/)
   assert.doesNotMatch(prompt, /atom-secret|valid_at/)
 })
@@ -108,7 +134,7 @@ test('runs exactly one isolated Sub-Agent and always disposes it', async () => {
   let disposeCalls = 0
   let startedWith: Record<string, unknown> | undefined
   const structured = {
-    findings: { entities: [], relations: [] },
+    report: 'The focused branch was exhausted.',
     stop_reason: 'No current or historical candidate was selected.',
   }
 
@@ -128,6 +154,7 @@ test('runs exactly one isolated Sub-Agent and always disposes it', async () => {
       startedWith = input
       return {
         result: Promise.resolve({ structured, stopReason: 'completed' }),
+        snapshotFindings: () => parseRecallSeeds(recall).findings,
         async dispose() {
           disposeCalls += 1
         },
@@ -139,13 +166,127 @@ test('runs exactly one isolated Sub-Agent and always disposes it', async () => {
   assert.equal(startCalls, 1)
   assert.equal(disposeCalls, 1)
   assert.deepEqual(startedWith?.toolFilter, {
-    allow: ['magi_memory_expand', 'magi_memory_evidence'],
+    allow: ['magi_memory_expand', 'magi_memory_describe', 'magi_memory_evidence', 'magi_memory_note'],
   })
+  assert.deepEqual(startedWith?.initialVisit, parseRecallSeeds(recall).visit)
   assert.equal(startedWith?.maxTokens, 4096)
   assert.deepEqual(result, {
     status: 'complete',
     subagent_stop_reason: 'completed',
-    ...structured,
+    findings: parseRecallSeeds(recall).findings,
+    report: structured.report,
+    stop_reason: structured.stop_reason,
+  })
+})
+
+test('hot start reuses Host recall seeds without issuing another Mix recall', async () => {
+  const initialSeeds = parseRecallSeeds(recall)
+  let recallCalls = 0
+  let startedWith: Record<string, unknown> | undefined
+
+  const result = await runActiveExplorer({
+    query: 'Which hidden relation connects Alice and Bob?',
+    signal: new AbortController().signal,
+    initialSeeds,
+    topK: 20,
+    chunkTopK: 10,
+    maxTokens: 4096,
+    async recall() {
+      recallCalls += 1
+      return { data: {} }
+    },
+    async start(input) {
+      startedWith = input
+      input.initialVisit.entities.push('Explorer-only mutation')
+      return {
+        result: Promise.resolve({
+          stopReason: 'completed',
+          structured: { report: 'Used the handed-off seeds.', stop_reason: 'Complete.' },
+        }),
+        snapshotFindings: () => input.initialFindings,
+        async dispose() {},
+      }
+    },
+  })
+
+  assert.equal(recallCalls, 0)
+  assert.deepEqual(initialSeeds.visit.entities, ['Alice', 'Bob'])
+  assert.deepEqual(
+    (startedWith?.initialVisit as { entities: string[] }).entities,
+    ['Alice', 'Bob', 'Explorer-only mutation'],
+  )
+  assert.equal((result as { status: string }).status, 'complete')
+})
+
+test('concurrent mode lets s0 delegate distinct branches without fixed worker budgets', async () => {
+  let startedWith: Record<string, unknown> | undefined
+  await runActiveExplorer({
+    query: 'How are Alice, Bob, and MAGI connected?',
+    signal: new AbortController().signal,
+    concurrent: true,
+    topK: 20,
+    chunkTopK: 10,
+    maxTokens: 4096,
+    async recall() {
+      return recall
+    },
+    async start(input) {
+      startedWith = input
+      return {
+        result: Promise.resolve({
+          stopReason: 'completed',
+          structured: {
+            report: 'Delegated two independent branches and merged them.',
+            stop_reason: 'Evidence is sufficient.',
+          },
+        }),
+        snapshotFindings: () => parseRecallSeeds(recall).findings,
+        async dispose() {},
+      }
+    },
+  })
+
+  assert.deepEqual(startedWith?.toolFilter, { allow: ['magi_memory_delegate'] })
+  assert.match(String(startedWith?.prompt), /Active Memory Coordinator s0/)
+  assert.match(String(startedWith?.prompt), /Tasks in one delegate call execute concurrently/)
+  assert.match(String(startedWith?.prompt), /As soon as accumulated findings are sufficient/)
+  assert.doesNotMatch(String(startedWith?.prompt), /"frontier":/)
+  assert.match(String(startedWith?.prompt), /Delegation is optional/)
+  assert.match(String(startedWith?.prompt), /known_owners/)
+  assert.match(String(startedWith?.prompt), /never copy notes into delegate arguments/)
+  assert.doesNotMatch(String(startedWith?.prompt), /Call magi_memory_expand with that entity-name frontier/)
+
+  const workerPrompt = activeExplorerWorkerPrompt({
+    parentQuery: 'How are Alice, Bob, and MAGI connected?',
+    subquery: 'How does Alice relate to MAGI?',
+    frontier: ['Alice', 'Carol'],
+    knownFindings: { entities: [], relations: [] },
+  })
+  assert.doesNotMatch(workerPrompt, /Hard task budget|max_hops/)
+  assert.match(workerPrompt, /DESCRIBE \(MANDATORY\)/)
+  assert.match(workerPrompt, /EVIDENCE \(OPTIONAL\)/)
+  assert.match(workerPrompt, /S0-SELECTED KNOWN FINDINGS FOR THIS SUBQUERY/)
+  assert.match(workerPrompt, /minimal subquery-relevant subset selected by s0/)
+  assert.match(workerPrompt, /"Carol"/)
+  assert.match(workerPrompt, /Do not attempt to coordinate with siblings/)
+  assert.match(workerPrompt, /Never return visit, findings/)
+  assert.match(concurrentExplorerPrompt('query', parseRecallSeeds(recall)), /execute concurrently/)
+})
+
+test('attaches plugin-managed findings to the worker terminal result', () => {
+  assert.deepEqual(normalizeExplorerWorkerResult({
+    stop_reason: 'Branch complete.',
+  }, 'completed', {
+    entities: [{ name: 'Alice', notes: ['Relevant'] }],
+    relations: [],
+  }), {
+    status: 'complete',
+    subagent_stop_reason: 'completed',
+    findings: {
+      entities: [{ name: 'Alice', notes: ['Relevant'] }],
+      relations: [],
+    },
+    stop_reason: 'Branch complete.',
   })
 })
 
@@ -163,6 +304,7 @@ test('preserves seed findings without exposing visit when the Sub-Agent stops ab
     async start() {
       return {
         result: Promise.resolve({ stopReason: 'max-tokens' }),
+        snapshotFindings: () => parseRecallSeeds(recall).findings,
         async dispose() {
           disposed = true
         },
@@ -176,7 +318,7 @@ test('preserves seed findings without exposing visit when the Sub-Agent stops ab
   assert.deepEqual((result as { findings: unknown }).findings, parseRecallSeeds(recall).findings)
 })
 
-test('rejects non-binary relation arrays after portable schema validation', async () => {
+test('accepts the minimal terminal schema and ignores model-owned findings', async () => {
   const result = await runActiveExplorer({
     query: 'How are Alice and Bob connected?',
     signal: new AbortController().signal,
@@ -191,21 +333,16 @@ test('rejects non-binary relation arrays after portable schema validation', asyn
         result: Promise.resolve({
           stopReason: 'completed',
           structured: {
-            findings: {
-              entities: [],
-              relations: [{ endpoints: ['Alice'], notes: [] }],
-            },
+            report: 'Plugin state is authoritative.',
             stop_reason: 'done',
           },
         }),
+        snapshotFindings: () => parseRecallSeeds(recall).findings,
         async dispose() {},
       }
     },
   })
 
-  assert.equal((result as { status: string }).status, 'abnormal')
-  assert.match(
-    (result as { stop_reason: string }).stop_reason,
-    /findings\.relations must contain only two-name endpoint pairs/,
-  )
+  assert.equal((result as { status: string }).status, 'complete')
+  assert.deepEqual((result as { findings: unknown }).findings, parseRecallSeeds(recall).findings)
 })

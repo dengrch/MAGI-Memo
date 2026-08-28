@@ -34,12 +34,16 @@ export interface ActiveExplorerRun {
     structured?: unknown
     stopReason: string
   }>
+  snapshotFindings(): Findings
   dispose(): Promise<void>
 }
 
 export interface ActiveExplorerInvocation {
   query: string
   signal: AbortSignal
+  concurrent?: boolean
+  /** Description-backed seeds handed off by a recall already completed by the Host. */
+  initialSeeds?: ExplorerSeeds
   topK: number
   chunkTopK: number
   maxTokens: number
@@ -51,6 +55,8 @@ export interface ActiveExplorerInvocation {
   }, signal: AbortSignal): Promise<JsonValue>
   start(input: {
     prompt: string
+    initialVisit: Visit
+    initialFindings: Findings
     outputSchema: typeof ACTIVE_EXPLORER_OUTPUT_SCHEMA
     toolFilter: { allow: string[] }
     maxTokens: number
@@ -77,6 +83,85 @@ export function normalizeRelationPair(source: string, target: string): [string, 
 
 function relationKey(pair: [string, string]): string {
   return `${nameKey(pair[0])}\u0000${nameKey(pair[1])}`
+}
+
+export function cloneVisit(visit: Visit): Visit {
+  return {
+    entities: [...visit.entities],
+    relations: visit.relations.map(pair => [...pair] as [string, string]),
+  }
+}
+
+export function cloneFindings(findings: Findings): Findings {
+  return {
+    entities: findings.entities.map(owner => ({ name: owner.name, notes: [...owner.notes] })),
+    relations: findings.relations.map(owner => ({
+      endpoints: [...owner.endpoints] as [string, string],
+      notes: [...owner.notes],
+    })),
+  }
+}
+
+export function cloneExplorerSeeds(seeds: ExplorerSeeds): ExplorerSeeds {
+  return {
+    frontier: [...seeds.frontier],
+    visit: cloneVisit(seeds.visit),
+    findings: cloneFindings(seeds.findings),
+  }
+}
+
+export function addEntityFinding(visit: Visit, findings: Findings, name: string, note?: string): boolean {
+  const normalized = name.trim().replace(/\s+/g, ' ')
+  if (!normalized) return false
+  const cleaned = note === undefined ? undefined : stripExplorerEvidenceMetadata(note)
+  if (note !== undefined && !cleaned) return false
+  const existingName = visit.entities.find(value => nameKey(value) === nameKey(normalized))
+  const canonicalName = existingName ?? normalized
+  if (existingName === undefined) visit.entities.push(canonicalName)
+  if (!cleaned) return false
+  let owner = findings.entities.find(value => nameKey(value.name) === nameKey(normalized))
+  if (owner === undefined) {
+    owner = { name: canonicalName, notes: [] }
+    findings.entities.push(owner)
+  }
+  if (owner.notes.includes(cleaned)) return false
+  owner.notes.push(cleaned)
+  return true
+}
+
+export function addRelationFinding(
+  visit: Visit,
+  findings: Findings,
+  endpoints: [string, string],
+  note?: string,
+): boolean {
+  const pair = normalizeRelationPair(endpoints[0], endpoints[1])
+  if (!pair[0] || !pair[1]) return false
+  const cleaned = note === undefined ? undefined : stripExplorerEvidenceMetadata(note)
+  if (note !== undefined && !cleaned) return false
+  addEntityFinding(visit, findings, pair[0])
+  addEntityFinding(visit, findings, pair[1])
+  if (!visit.relations.some(value => relationKey(normalizeRelationPair(value[0], value[1])) === relationKey(pair))) {
+    visit.relations.push(pair)
+  }
+  if (!cleaned) return false
+  let owner = findings.relations.find(value => relationKey(normalizeRelationPair(...value.endpoints)) === relationKey(pair))
+  if (owner === undefined) {
+    owner = { endpoints: pair, notes: [] }
+    findings.relations.push(owner)
+  }
+  if (owner.notes.includes(cleaned)) return false
+  owner.notes.push(cleaned)
+  return true
+}
+
+export function mergeFindings(visit: Visit, target: Findings, source: Findings): void {
+  for (const owner of source.entities) {
+    for (const note of owner.notes) addEntityFinding(visit, target, owner.name, note)
+  }
+  for (const owner of source.relations) {
+    for (const note of owner.notes) addRelationFinding(visit, target, owner.endpoints, note)
+  }
 }
 
 /** Give durable one-shot histories a human-readable, restart-safe identity. */
@@ -180,133 +265,197 @@ export const ACTIVE_EXPLORER_OUTPUT_SCHEMA = {
   type: 'object' as const,
   additionalProperties: false,
   properties: {
-    findings: {
-      type: 'object' as const,
-      additionalProperties: false,
-      properties: {
-        entities: {
-          type: 'array' as const,
-          items: {
-            type: 'object' as const,
-            additionalProperties: false,
-            properties: {
-              name: { type: 'string' as const },
-              notes: { type: 'array' as const, items: { type: 'string' as const } },
-            },
-            required: ['name', 'notes'],
-          },
-        },
-        relations: {
-          type: 'array' as const,
-          items: {
-            type: 'object' as const,
-            additionalProperties: false,
-            properties: {
-              endpoints: {
-                type: 'array' as const,
-                items: { type: 'string' as const },
-              },
-              notes: { type: 'array' as const, items: { type: 'string' as const } },
-            },
-            required: ['endpoints', 'notes'],
-          },
-        },
-      },
-      required: ['entities', 'relations'],
-    },
+    report: { type: 'string' as const },
     stop_reason: { type: 'string' as const },
   },
-  required: ['findings', 'stop_reason'],
+  required: ['report', 'stop_reason'],
 }
 
-function invalidRelationPair(value: unknown): boolean {
-  return !Array.isArray(value)
-    || value.length !== 2
-    || value.some(endpoint => typeof endpoint !== 'string' || !endpoint.trim())
+export const ACTIVE_EXPLORER_WORKER_OUTPUT_SCHEMA = {
+  type: 'object' as const,
+  additionalProperties: false,
+  properties: {
+    stop_reason: { type: 'string' as const },
+  },
+  required: ['stop_reason'],
 }
 
-/** Enforce tuple cardinality that dsh's portable JSON-Schema subset cannot express. */
-function structuredPairError(value: unknown): string | undefined {
-  if (!isRecord(value) || !isRecord(value.findings)) {
-    return 'Explorer structured result is missing findings.'
+/** Normalize one worker's structured terminal result for the coordinator tool. */
+export function normalizeExplorerWorkerResult(
+  structured: unknown,
+  stopReason: string,
+  findings: Findings,
+): JsonValue {
+  if (structured === undefined || !isRecord(structured) || typeof structured.stop_reason !== 'string') {
+    return {
+      status: 'abnormal',
+      subagent_stop_reason: stopReason,
+      findings: findings as unknown as JsonValue,
+      stop_reason: `Worker stopped with ${stopReason} before producing a valid structured result.`,
+    }
   }
-  if (!Array.isArray(value.findings.relations)
-    || value.findings.relations.some(item => (
-      !isRecord(item) || invalidRelationPair(item.endpoints)
-    ))) {
-    return 'Explorer findings.relations must contain only two-name endpoint pairs.'
+  return {
+    status: stopReason === 'completed' ? 'complete' : 'abnormal',
+    subagent_stop_reason: stopReason,
+    findings: findings as unknown as JsonValue,
+    stop_reason: structured.stop_reason,
   }
-  return undefined
+}
+
+/** One canonical three-layer retrieval state machine shared by s0-alone and workers. */
+function progressiveExplorationContract(): string[] {
+  return [
+    'Canonical three-layer retrieval state machine:',
+    '0. Inspect the supplied findings first. They are already description-backed; stop without expanding when they answer the assigned query.',
+    '1. EXPAND — Choose the smallest promising frontier. Call magi_memory_expand with entity names only. The plugin owns and injects the complete visit state. Each frontier entity may be expanded at most once in this branch.',
+    '2. SELECT — Inspect every compact candidate using only its entity name/type and relation endpoints/keywords, rank them against the assigned query, and provisionally select the smallest useful-looking subset. When expand returns at least one candidate, this subset must be non-empty; compact signals prioritize description loading but never justify skipping the description layer.',
+    '3. DESCRIBE (MANDATORY) — Before another expand, make exactly one batched magi_memory_describe call. Represent every selected candidate with at least one relevant owner: its relation owner for a connection claim, its entity owner for node identity/context, or both when both semantics are needed. Calling describe is the final selection decision: successful returned owners and descriptions automatically enter plugin-managed visit/findings. Compact topology alone never creates a finding. Do not describe rejected candidates.',
+    '4. EVIDENCE (OPTIONAL) — Call magi_memory_evidence only when a description leaves a query-critical factual, temporal, provenance, or evolution ambiguity. If it yields a useful conclusion, immediately call magi_memory_note with only that concise conclusion; never copy ids, status/time annotations, evidence rows, or evolution payloads.',
+    '5. CONTINUE OR STOP — If no candidate was returned, stop. Otherwise continue from any entity visible in exploration history that has never been expanded and resolves a specific remaining gap. Relation endpoint pairs are unordered; de-duplicate visit and findings by normalized owner.',
+    '',
+    'Hard transition rules:',
+    '- Every expand returning one or more candidates must be followed by SELECT and exactly one batched DESCRIBE before either another expand or normal completion. describe is mandatory; evidence is optional.',
+    '- visit and findings are authoritative plugin state. Never pass, reproduce, or return them. describe commits both automatically; magi_memory_note records optional evidence conclusions.',
+    '- The plugin maintains expanded separately from visit. A frontier may be any entity visible in exploration history, whether described or topology-only, but a repeated frontier is refused by the tool.',
+    '- If expand returns status=refused, do not retry. Finish any already-required describe/evidence work, otherwise stop and report the refusal.',
+    '- Missing frontier, partial/truncated output, tool failure, cancellation, or a safety/budget limit is abnormal rather than exhaustion. Preserve description-backed partial findings and explain the condition in stop_reason.',
+  ]
 }
 
 /** Build the complete isolated instruction for one active-retrieval Sub-Agent. */
 export function activeExplorerPrompt(query: string, seeds: ExplorerSeeds): string {
+  const visibleSeeds = { findings: seeds.findings }
   return [
     'You are MAGI Active Memory Explorer v1. Investigate hidden relational memory for the parent query.',
     '',
     `PARENT QUERY:\n${query}`,
     '',
-    `COMPACT INITIAL MIX STATE:\n${JSON.stringify(seeds, null, 2)}`,
+    `COMPACT INITIAL MIX STATE:\n${JSON.stringify(visibleSeeds, null, 2)}`,
     '',
     'State contract:',
-    '- Maintain exactly two semantic accumulators: visit and findings. Do not create seen, deferred, expanded, path, or other graph-selection state.',
-    '- visit.entities contains selected entity names. visit.relations contains selected unordered endpoint-name pairs.',
-    '- findings stores descriptions from every selected candidate and concise conclusions from evidence calls under the matching entity or relation owner.',
+    '- The plugin, not you, owns visit and findings. You see only the initial findings and each tool result needed for the next decision.',
+    '- describe automatically stores selected owners and their descriptions. magi_memory_note stores concise conclusions derived from optional evidence.',
     '',
-    'Exploration loop:',
-    '1. Before each expand, choose the frontier entities you judge most promising for the parent query. There is no fixed count: prefer focused expansion over expanding every available entity merely because it is in visit. Any unchosen entity remains available for later reconsideration.',
-    '2. Call magi_memory_expand with that entity-name frontier and the complete current visit.',
-    '3. Inspect every returned (relation, neighbor entity) candidate. Select candidates that may help the parent query. A selected candidate adds both its relation pair and neighbor entity to visit, records their useful descriptions in findings, and puts the selected entity into the next frontier.',
-    '4. In the same round, reconsider useful candidates from earlier tool results still present in context. Earlier rejection is not permanent. Add any newly selected historical candidates exactly as above.',
-    '5. When evidence is needed, choose only the owners you judge most promising for resolving the question or an actual ambiguity. There is no fixed count. After each magi_memory_evidence call, write a concise semantic conclusion under the matching findings owner; do not copy raw Atom ids, status/time annotations, evidence rows, or evolution payloads into findings.',
-    '6. Relation pairs are unordered. De-duplicate visit by normalized entity name and unordered endpoint pair when updating it.',
+    ...progressiveExplorationContract(),
     'Brief narration of your selection and tool-use reasoning is allowed for debugging, but keep it concise.',
     '',
-    'The only normal stopping rule is:',
-    '(the current expand is truly exhausted OR you select no candidate from its current results) AND you add no candidate from historical context in the same round.',
-    'Here, truly exhausted means the tool explicitly returns exhausted=true. Missing frontier, partial status, truncation, tool failure, cancellation, or a safety/budget limit is not exhaustion. If such an abnormal condition prevents continuation, preserve partial visit/findings and explain it in stop_reason.',
-    '',
-    'visit is internal exploration state: keep using it for expand de-duplication, but do not return it to the parent Agent.',
-    'Finish by calling structured_output with exactly this object shape; every shown key is required even when its array is empty:',
-    '{"findings":{"entities":[],"relations":[]},"stop_reason":"short completion or abnormal-stop explanation"}',
-    'Populate findings.entities only with {"name":"...","notes":["..."]} objects and findings.relations only with {"endpoints":["...","..."],"notes":["..."]} objects. findings.notes is invalid.',
-    'Never omit findings.entities, findings.relations, or stop_reason. Never expose or copy MAGI stable ids.',
+    'Finish by calling structured_output with exactly:',
+    '{"report":"concise exploration process and conclusion report","stop_reason":"short completion or abnormal-stop explanation"}',
+    'Do not return visit or findings; the plugin attaches its authoritative snapshot. Never expose MAGI stable ids.',
   ].join('\n')
 }
 
-/** Execute exactly one mix recall and one disposable Explorer Sub-Agent run. */
+/** Build the s0 coordinator instruction used by concurrent active retrieval. */
+export function concurrentExplorerPrompt(
+  query: string,
+  seeds: ExplorerSeeds,
+): string {
+  const visibleSeeds = { findings: seeds.findings }
+  return [
+    'You are MAGI Active Memory Coordinator s0. Investigate the parent query by dynamically delegating focused graph searches to isolated worker Sub-Agents.',
+    '',
+    `PARENT QUERY:\n${query}`,
+    '',
+    `COMPACT INITIAL MIX STATE:\n${JSON.stringify(visibleSeeds, null, 2)}`,
+    '',
+    'Coordinator contract:',
+    '- Do not call magi_memory_expand, magi_memory_describe, or magi_memory_evidence yourself. Call only magi_memory_delegate for graph exploration.',
+    '- Tasks in one delegate call execute concurrently. Create only genuinely necessary tasks; do not delegate merely to increase worker count.',
+    '- Derive each task subquery from the parent query plus all context accumulated so far. Each subquery must name one specific unresolved fact, not paraphrase the parent query. Assign only frontier entities that plausibly lead to that fact.',
+    '- For every task, provide known_owners containing only owner references for the smallest plugin-managed findings subset useful to that subquery. The plugin resolves their notes; never copy notes into delegate arguments.',
+    '- Use distinct subqueries that cover genuinely different reasoning branches. Two tasks are not distinct merely because their wording differs; their unresolved target or intended reasoning path must differ. Do not split merely to fill every worker slot.',
+    '- Delegation is optional. First judge whether the initial findings already answer the parent query. Delegate only for a concrete missing reasoning branch that requires graph expansion; zero delegation is the preferred outcome when evidence is already sufficient.',
+    '- Treat every worker and delegate batch as expensive. As soon as accumulated findings are sufficient to answer the parent query, stop. Continue only when you can name a specific unresolved fact and a genuinely useful frontier. Do not paraphrase an earlier subquery into a supposedly new task.',
+    '- Workers are isolated and preserve their own complete reasoning chain. They return findings, not shared visit state. There is intentionally no cross-worker coverage lock or candidate suppression.',
+    '- Every worker follows the same mandatory three-layer branch protocol: compact expand, one batched describe for selected candidates, then optional evidence. Treat only description-backed worker notes as findings; topology-only names/keywords are never evidence.',
+    '- Worker findings are automatically merged into s0 plugin state before each delegate result is returned. Reason about the returned branch deltas, then stop or issue a genuinely necessary follow-up.',
+    '- The first batch normally chooses frontier owners named in the initial findings. Later batches should prefer useful description-backed entity findings returned by workers. Reusing an earlier frontier is allowed only when accumulated findings expose a genuinely different unresolved branch that requires an independent interpretation of that node.',
+    '- Never repeat the same subquery + frontier task, and never disguise a repeated branch by merely rewording its subquery.',
+    '- Keep the initial findings even when no delegation is needed. Never expose MAGI stable ids.',
+    '',
+    'Finish by calling structured_output with exactly this object shape; every key is required:',
+    '{"report":"which subqueries/frontiers were delegated, what they found, and why the merged evidence is sufficient or blocked","stop_reason":"short completion or abnormal-stop explanation"}',
+    'report must concisely record the worker/subquery allocation, exploration result, and merge decision. Never return visit or findings.',
+  ].join('\n')
+}
+
+/** Build one isolated worker instruction for an s0-selected subquery/frontier. */
+export function activeExplorerWorkerPrompt(input: {
+  parentQuery: string
+  subquery: string
+  frontier: string[]
+  knownFindings: Findings
+}): string {
+  return [
+    'You are an isolated MAGI active-retrieval worker. Follow one assigned reasoning branch and return evidence to coordinator s0.',
+    '',
+    `PARENT QUERY:\n${input.parentQuery}`,
+    '',
+    `ASSIGNED SUBQUERY:\n${input.subquery}`,
+    '',
+    `ASSIGNED INITIAL FRONTIER:\n${JSON.stringify(input.frontier)}`,
+    '',
+    `S0-SELECTED KNOWN FINDINGS FOR THIS SUBQUERY:\n${JSON.stringify(input.knownFindings, null, 2)}`,
+    '',
+    'The plugin owns private visit and findings state. Never pass or reproduce either one. describe automatically commits selected descriptions; use magi_memory_note only for concise conclusions from optional evidence.',
+    ...progressiveExplorationContract(),
+    'Stay inside the assigned subquery. Do not attempt to coordinate with siblings and do not broaden back into the whole parent query.',
+    'The known findings above are the minimal subquery-relevant subset selected by s0, not the complete exploration state. Use them as context. The plugin will expose only this branch\'s newly discovered or materially strengthened notes to s0.',
+    'Stop as soon as existing findings answer the assigned subquery, the branch is exhausted, or described findings reveal no useful continuation. Do not expand merely because another frontier is available.',
+    '',
+    'Finish with structured_output using exactly:',
+    '{"stop_reason":"short branch completion or abnormal-stop explanation"}',
+    'Never return visit, findings, or MAGI stable ids.',
+  ].join('\n')
+}
+
+/** Execute one disposable Explorer, reusing Host recall seeds or cold-starting with one Mix recall. */
 export async function runActiveExplorer(invocation: ActiveExplorerInvocation): Promise<JsonValue> {
-  const recall = await invocation.recall({
-    query: invocation.query,
-    mode: 'mix',
-    topK: invocation.topK,
-    chunkTopK: invocation.chunkTopK,
-  }, invocation.signal)
-  const seeds = parseRecallSeeds(recall)
+  const seeds = invocation.initialSeeds === undefined
+    ? parseRecallSeeds(await invocation.recall({
+        query: invocation.query,
+        mode: 'mix',
+        topK: invocation.topK,
+        chunkTopK: invocation.chunkTopK,
+      }, invocation.signal))
+    : cloneExplorerSeeds(invocation.initialSeeds)
+  const concurrent = invocation.concurrent ?? false
   const run = await invocation.start({
-    prompt: activeExplorerPrompt(invocation.query, seeds),
+    prompt: concurrent
+      ? concurrentExplorerPrompt(invocation.query, seeds)
+      : activeExplorerPrompt(invocation.query, seeds),
+    initialVisit: seeds.visit,
+    initialFindings: seeds.findings,
     outputSchema: ACTIVE_EXPLORER_OUTPUT_SCHEMA,
-    toolFilter: { allow: ['magi_memory_expand', 'magi_memory_evidence'] },
+    toolFilter: {
+      allow: concurrent
+        ? ['magi_memory_delegate']
+        : ['magi_memory_expand', 'magi_memory_describe', 'magi_memory_evidence', 'magi_memory_note'],
+    },
     maxTokens: invocation.maxTokens,
   })
   try {
     const result = await run.result
-    const pairError = result.structured === undefined
-      ? undefined
-      : structuredPairError(result.structured)
-    if (result.structured === undefined || pairError !== undefined) {
+    const findings = run.snapshotFindings()
+    if (result.structured === undefined || !isRecord(result.structured)) {
       return {
         status: 'abnormal',
         subagent_stop_reason: result.stopReason,
-        findings: seeds.findings as unknown as JsonValue,
-        stop_reason: pairError
-          ?? `Explorer stopped with ${result.stopReason} before producing a valid structured result.`,
+        findings: findings as unknown as JsonValue,
+        report: concurrent
+          ? 'The coordinator did not produce a valid structured merge.'
+          : 'The explorer did not produce a valid structured result.',
+        stop_reason: `Explorer stopped with ${result.stopReason} before producing a valid structured result.`,
       }
     }
     return {
       status: result.stopReason === 'completed' ? 'complete' : 'abnormal',
       subagent_stop_reason: result.stopReason,
-      ...(result.structured as Record<string, JsonValue>),
+      findings: findings as unknown as JsonValue,
+      report: typeof result.structured.report === 'string' ? result.structured.report : '',
+      stop_reason: typeof result.structured.stop_reason === 'string'
+        ? result.structured.stop_reason
+        : `Explorer stopped with ${result.stopReason} without a stop reason.`,
     }
   } finally {
     await run.dispose()

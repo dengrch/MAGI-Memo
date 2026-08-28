@@ -14,6 +14,7 @@ import MagiCoreMark from '@/components/icons/MagiCoreMark'
 import GraphViewer from '@/features/GraphViewer'
 import MemoryWorkspace from '@/features/MemoryWorkspace'
 import RetrievalView from '@/features/RetrievalView'
+import BalthasarView from '@/features/BalthasarView'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
 
@@ -208,6 +209,9 @@ function App() {
                 </TabsContent>
                 <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <RetrievalView />
+                </TabsContent>
+                <TabsContent value="balthasar" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                  <BalthasarView />
                 </TabsContent>
               </div>
             </Tabs>

@@ -111,6 +111,7 @@ const sages = [
 
 function TheSagesNavigation() {
   const [expanded, setExpanded] = useState(true)
+  const currentTab = useSettingsStore.use.currentTab()
 
   return (
     <section className="mt-4 max-md:hidden">
@@ -134,15 +135,34 @@ function TheSagesNavigation() {
         <div className="min-h-0 overflow-hidden">
           <div className="space-y-0.5 pt-0.5">
             {sages.map((sage) => (
-              <div
-                key={sage.name}
-                className="text-muted-foreground flex h-8 items-center gap-2.5 rounded-md px-2.5 text-sm"
-              >
-                <span className="border-input bg-background/50 flex size-5 items-center justify-center rounded border text-[9px] font-semibold">
-                  {sage.initial}
-                </span>
-                <span>{sage.name}</span>
-              </div>
+              sage.name === 'Balthasar' ? (
+                <TabsList key={sage.name} className="block h-auto w-full bg-transparent p-0">
+                  <TabsTrigger
+                    value="balthasar"
+                    className={cn(
+                      'flex h-8 w-full cursor-pointer items-center justify-start gap-2.5 rounded-md px-2.5 text-sm transition-colors',
+                      currentTab === 'balthasar'
+                        ? 'bg-accent text-foreground'
+                        : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                    )}
+                  >
+                    <span className="border-input bg-background/50 flex size-5 items-center justify-center rounded border text-[9px] font-semibold">
+                      {sage.initial}
+                    </span>
+                    <span>{sage.name}</span>
+                  </TabsTrigger>
+                </TabsList>
+              ) : (
+                <div
+                  key={sage.name}
+                  className="text-muted-foreground flex h-8 items-center gap-2.5 rounded-md px-2.5 text-sm"
+                >
+                  <span className="border-input bg-background/50 flex size-5 items-center justify-center rounded border text-[9px] font-semibold">
+                    {sage.initial}
+                  </span>
+                  <span>{sage.name}</span>
+                </div>
+              )
             ))}
           </div>
         </div>

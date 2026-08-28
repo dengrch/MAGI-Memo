@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef, type ReactNode } from 'react'
 // import { MiniMap } from '@react-sigma/minimap'
 import { SigmaContainer, useRegisterEvents, useSigma } from '@react-sigma/core'
 import { Settings as SigmaSettings } from 'sigma/settings'
@@ -28,7 +28,7 @@ import Legend from '@/components/graph/Legend'
 import LegendButton from '@/components/graph/LegendButton'
 
 import { useSettingsStore } from '@/stores/settings'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 import useIsDarkMode from '@/hooks/useIsDarkMode'
 import { labelColorDarkTheme, labelColorLightTheme, edgeColorDarkTheme, EDGE_PERF_LIMIT } from '@/lib/constants'
 
@@ -142,15 +142,30 @@ const GraphEvents = () => {
   return null
 }
 
-const GraphViewer = () => {
+type GraphViewerProps = {
+  readOnly?: boolean
+  nodeProgramClasses?: NonNullable<SigmaSettings['nodeProgramClasses']>
+  overlay?: ReactNode
+  propertyPanel?: ReactNode
+  propertyPanelClassName?: string
+}
+
+const GraphViewer = ({
+  readOnly = false,
+  nodeProgramClasses,
+  overlay,
+  propertyPanel,
+  propertyPanelClassName
+}: GraphViewerProps) => {
+  const graphStore = useGraphRuntimeStore()
   const sigmaRef = useRef<any>(null)
   const prevTheme = useRef<string>('')
 
-  const selectedNode = useGraphStore.use.selectedNode()
-  const focusedNode = useGraphStore.use.focusedNode()
-  const moveToSelectedNode = useGraphStore.use.moveToSelectedNode()
-  const isFetching = useGraphStore.use.isFetching()
-  const isLayoutComputing = useGraphStore.use.isLayoutComputing()
+  const selectedNode = graphStore.use.selectedNode()
+  const focusedNode = graphStore.use.focusedNode()
+  const moveToSelectedNode = graphStore.use.moveToSelectedNode()
+  const isFetching = graphStore.use.isFetching()
+  const isLayoutComputing = graphStore.use.isLayoutComputing()
 
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
@@ -158,7 +173,7 @@ const GraphViewer = () => {
   const showLegend = useSettingsStore.use.showLegend()
   const theme = useSettingsStore.use.theme()
   const enableEdgeEvents = useSettingsStore.use.enableEdgeEvents()
-  const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+  const graphEdgeCount = graphStore.use.graphEdgeCount()
 
   // Edge events are disabled above EDGE_PERF_LIMIT regardless of the user
   // setting: the picking buffer renders edges to an extra frame buffer every
@@ -180,8 +195,17 @@ const GraphViewer = () => {
   // enableEdgeEvents is in the deps because it must be baked in at construction
   // (the picking buffer can't be added later); toggling it rebuilds the instance.
   const memoizedSigmaSettings = useMemo(
-    () => createSigmaSettings(isDarkMode, effectiveEdgeEvents),
-    [isDarkMode, effectiveEdgeEvents]
+    () => {
+      const settings = createSigmaSettings(isDarkMode, effectiveEdgeEvents)
+      return {
+        ...settings,
+        nodeProgramClasses: {
+          ...settings.nodeProgramClasses,
+          ...nodeProgramClasses
+        }
+      }
+    },
+    [isDarkMode, effectiveEdgeEvents, nodeProgramClasses]
   )
 
   // Detect theme changes and briefly show a loading overlay to avoid flash of
@@ -213,36 +237,36 @@ const GraphViewer = () => {
     return () => {
       // TAB is mount twice in vite dev mode, this is a workaround
 
-      const sigma = useGraphStore.getState().sigmaInstance
+      const sigma = graphStore.getState().sigmaInstance
       if (sigma) {
         try {
           // Destroy sigma，and clear WebGL context
           sigma.kill()
-          useGraphStore.getState().setSigmaInstance(null)
+          graphStore.getState().setSigmaInstance(null)
           console.log('Cleared sigma instance on Graphviewer unmount')
         } catch (error) {
           console.error('Error cleaning up sigma instance:', error)
         }
       }
     }
-  }, [])
+  }, [graphStore])
 
   // Note: There was a useLayoutEffect hook here to set up the sigma instance and graph data,
   // but testing showed it wasn't executing or having any effect, while the backup mechanism
   // in GraphControl was sufficient. This code was removed to simplify implementation
 
   const onSearchFocus = useCallback((value: GraphSearchOption | null) => {
-    if (value === null) useGraphStore.getState().setFocusedNode(null)
-    else if (value.type === 'nodes') useGraphStore.getState().setFocusedNode(value.id)
-  }, [])
+    if (value === null) graphStore.getState().setFocusedNode(null)
+    else if (value.type === 'nodes') graphStore.getState().setFocusedNode(value.id)
+  }, [graphStore])
 
   const onSearchSelect = useCallback((value: GraphSearchOption | null) => {
     if (value === null) {
-      useGraphStore.getState().setSelectedNode(null)
+      graphStore.getState().setSelectedNode(null)
     } else if (value.type === 'nodes') {
-      useGraphStore.getState().setSelectedNode(value.id, true)
+      graphStore.getState().setSelectedNode(value.id, true)
     }
-  }, [])
+  }, [graphStore])
 
   const autoFocusedNode = useMemo(() => focusedNode ?? selectedNode, [focusedNode, selectedNode])
   const searchInitSelectedNode = useMemo(
@@ -264,8 +288,10 @@ const GraphViewer = () => {
 
         <FocusOnNode node={autoFocusedNode} move={moveToSelectedNode} />
 
-        <div className="absolute top-2 left-2 flex items-start gap-2">
-          <GraphLabels />
+        {overlay}
+
+        <div className="absolute top-2 left-2 z-30 flex items-start gap-2">
+          {!readOnly && <GraphLabels />}
           {showNodeSearchBar && !isThemeSwitching && (
             <GraphSearch
               value={searchInitSelectedNode}
@@ -285,8 +311,8 @@ const GraphViewer = () => {
         </div>
 
         {showPropertyPanel && (
-          <div className="absolute top-2 right-2 z-10">
-            <PropertiesView />
+          <div className={`absolute top-2 z-10 ${propertyPanelClassName ?? 'right-2'}`}>
+            {propertyPanel ?? <PropertiesView />}
           </div>
         )}
 

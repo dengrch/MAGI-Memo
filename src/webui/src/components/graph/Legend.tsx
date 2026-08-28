@@ -1,6 +1,6 @@
 import React from 'react'
 import { useTranslation } from 'react-i18next'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 import { Card } from '@/components/ui/Card'
 import { ScrollArea } from '@/components/ui/ScrollArea'
 
@@ -9,8 +9,9 @@ interface LegendProps {
 }
 
 const Legend: React.FC<LegendProps> = ({ className }) => {
+  const graphStore = useGraphRuntimeStore()
   const { t } = useTranslation()
-  const typeColorMap = useGraphStore.use.typeColorMap()
+  const typeColorMap = graphStore.use.typeColorMap()
 
   if (!typeColorMap || typeColorMap.size === 0) {
     return null

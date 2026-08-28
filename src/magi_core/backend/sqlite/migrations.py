@@ -1,6 +1,6 @@
 """SQLite schema migrations for the local memory record store."""
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -234,6 +234,37 @@ CREATE TABLE IF NOT EXISTS owner_summary_checkpoints (
 );
 """
 
+MIGRATION_7 = """
+CREATE TABLE IF NOT EXISTS exploration_traces (
+    workspace_id TEXT NOT NULL,
+    exploration_id TEXT NOT NULL,
+    query TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, exploration_id)
+);
+CREATE INDEX IF NOT EXISTS idx_exploration_traces_updated
+    ON exploration_traces(workspace_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS exploration_events (
+    workspace_id TEXT NOT NULL,
+    exploration_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id, exploration_id, seq),
+    FOREIGN KEY(workspace_id, exploration_id)
+        REFERENCES exploration_traces(workspace_id, exploration_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_exploration_events_call
+    ON exploration_events(workspace_id, exploration_id, call_id);
+"""
+
 MIGRATIONS = (
     (1, MIGRATION_1),
     (2, MIGRATION_2),
@@ -241,4 +272,5 @@ MIGRATIONS = (
     (4, MIGRATION_4),
     (5, MIGRATION_5),
     (6, MIGRATION_6),
+    (7, MIGRATION_7),
 )

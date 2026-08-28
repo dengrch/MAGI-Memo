@@ -14,7 +14,7 @@ import Button from '@/components/ui/Button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
 import { Command, CommandGroup, CommandItem, CommandList } from '@/components/ui/Command'
 import { controlButtonVariant, ANIMATE_NODE_LIMIT, workerBudgetMs } from '@/lib/constants'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 
 import { GripIcon, PlayIcon, PauseIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -104,11 +104,12 @@ const buildSupervisor = (name: WorkerLayoutName, graph: unknown): LayoutSupervis
  * five times a second.
  */
 const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) => {
+  const graphStore = useGraphRuntimeStore()
   const sigma = useSigma()
   const { t } = useTranslation()
   // Rebind when the underlying graph is replaced (refresh / new label), so a
   // running layout never keeps a supervisor bound to the detached old graph.
-  const sigmaGraph = useGraphStore.use.sigmaGraph()
+  const sigmaGraph = graphStore.use.sigmaGraph()
   const [running, setRunning] = useState(false)
   const supervisorRef = useRef<LayoutSupervisor | null>(null)
   const stopTimerRef = useRef<number | null>(null)
@@ -144,7 +145,7 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
       setRunning(false)
       // Release the shared slot (kills the stopped worker) so
       // "activeLayoutSupervisor != null" reliably means a layout is running.
-      useGraphStore.getState().releaseLayoutSupervisor(supervisorRef.current)
+      graphStore.getState().releaseLayoutSupervisor(supervisorRef.current)
       if (settleView) {
         try {
           sigma.setCustomBBox(null)
@@ -154,11 +155,11 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
         }
       }
     },
-    [clearTimer, sigma]
+    [clearTimer, graphStore, sigma]
   )
 
   const start = useCallback(() => {
-    const graph = useGraphStore.getState().sigmaGraph
+    const graph = graphStore.getState().sigmaGraph
     if (!graph || graph.order === 0) return
 
     // Cancel any pending start/stop timers from a previous cycle before
@@ -178,7 +179,7 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
     // Become the single layout owner. This kills whatever was running before
     // (the initial FA2 from GraphControl, or a previously selected worker
     // layout) so two supervisors never mutate the same coordinates at once.
-    useGraphStore.getState().setActiveLayoutSupervisor(supervisor)
+    graphStore.getState().setActiveLayoutSupervisor(supervisor)
 
     // A custom bbox frozen by dragging breaks coordinate normalization and
     // makes a relaxing layout look like it collapses; clear it before running.
@@ -216,7 +217,7 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
       }
       stopTimerRef.current = window.setTimeout(() => stop(true), workerBudgetMs(graph.order))
     }, 50)
-  }, [layoutName, sigma, clearTimer, stop])
+  }, [layoutName, sigma, clearTimer, graphStore, stop])
 
   // Auto-run when this worker layout becomes active; clean up on
   // change/unmount. Keyed on layoutName + sigmaGraph: when the graph is
@@ -238,7 +239,7 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
       // Release the slot if we still own it; otherwise just kill our own
       // (previous) supervisor. start() for the incoming layout runs AFTER this
       // cleanup, so the slot still points at our supervisor here.
-      useGraphStore.getState().releaseLayoutSupervisor(supervisorRef.current)
+      graphStore.getState().releaseLayoutSupervisor(supervisorRef.current)
       supervisorRef.current = null
       setRunning(false)
     }
@@ -264,7 +265,8 @@ const WorkerLayoutControl = ({ layoutName }: { layoutName: WorkerLayoutName }) =
 /**
  * Component that controls the layout of the graph.
  */
-const LayoutsControl = () => {
+const LayoutsControl = ({ standalone = false }: { standalone?: boolean }) => {
+  const graphStore = useGraphRuntimeStore()
   const sigma = useSigma()
   const { t } = useTranslation()
   const [layout, setLayout] = useState<LayoutName>('Circular')
@@ -286,8 +288,10 @@ const LayoutsControl = () => {
   }, [layoutCircular, layoutCirclepack, layoutRandom])
 
   const allLayoutNames: LayoutName[] = useMemo(
-    () => ['Circular', 'Circlepack', 'Random', 'Noverlaps', 'Force Directed', 'Force Atlas'],
-    []
+    () => standalone
+      ? ['Circular', 'Circlepack', 'Random']
+      : ['Circular', 'Circlepack', 'Random', 'Noverlaps', 'Force Directed', 'Force Atlas'],
+    [standalone]
   )
 
   const runLayout = useCallback(
@@ -316,7 +320,7 @@ const LayoutsControl = () => {
           // Kill any running worker layout (notably the initial FA2, which has
           // no WorkerLayoutControl to unmount) before assigning positions, or
           // it keeps mutating coordinates and fights this synchronous layout.
-          useGraphStore.getState().setActiveLayoutSupervisor(null)
+          if (!standalone) graphStore.getState().setActiveLayoutSupervisor(null)
           const pos = syncLayouts[newLayout].positions()
           sigma.setCustomBBox(null)
           if (graph.order > ANIMATE_NODE_LIMIT) {
@@ -347,19 +351,19 @@ const LayoutsControl = () => {
       // one frame so React actually paints the overlay before we block.
       // Small graphs animate (400ms) -- the animation itself is feedback.
       if (graph.order > ANIMATE_NODE_LIMIT) {
-        useGraphStore.getState().setIsLayoutComputing(true)
+        graphStore.getState().setIsLayoutComputing(true)
         window.requestAnimationFrame(() => {
           try {
             doLayout()
           } finally {
-            useGraphStore.getState().setIsLayoutComputing(false)
+            graphStore.getState().setIsLayoutComputing(false)
           }
         })
       } else {
         doLayout()
       }
     },
-    [syncLayouts, sigma]
+    [graphStore, standalone, syncLayouts, sigma]
   )
 
   return (

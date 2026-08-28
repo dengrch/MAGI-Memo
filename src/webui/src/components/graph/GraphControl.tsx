@@ -9,7 +9,7 @@ import useIsDarkMode from '@/hooks/useIsDarkMode'
 import * as Constants from '@/lib/constants'
 
 import { useSettingsStore } from '@/stores/settings'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 
 const isButtonPressed = (ev: MouseEvent | TouchEvent) => {
   if (ev.type.startsWith('mouse')) {
@@ -21,6 +21,7 @@ const isButtonPressed = (ev: MouseEvent | TouchEvent) => {
 }
 
 const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) => {
+  const graphStore = useGraphRuntimeStore()
   const sigma = useSigma<NodeType, EdgeType>()
   const registerEvents = useRegisterEvents<NodeType, EdgeType>()
   const setSettings = useSetSettings<NodeType, EdgeType>()
@@ -32,12 +33,12 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
   const renderLabels = useSettingsStore.use.showNodeLabel()
   const minEdgeSize = useSettingsStore.use.minEdgeSize()
   const maxEdgeSize = useSettingsStore.use.maxEdgeSize()
-  const selectedNode = useGraphStore.use.selectedNode()
-  const focusedNode = useGraphStore.use.focusedNode()
-  const selectedEdge = useGraphStore.use.selectedEdge()
-  const focusedEdge = useGraphStore.use.focusedEdge()
-  const sigmaGraph = useGraphStore.use.sigmaGraph()
-  const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+  const selectedNode = graphStore.use.selectedNode()
+  const focusedNode = graphStore.use.focusedNode()
+  const selectedEdge = graphStore.use.selectedEdge()
+  const focusedEdge = graphStore.use.focusedEdge()
+  const sigmaGraph = graphStore.use.sigmaGraph()
+  const graphEdgeCount = graphStore.use.graphEdgeCount()
 
   // Mirror GraphViewer's gating: above EDGE_PERF_LIMIT the sigma instance is
   // (re)built without the edge picking buffer, so edge events cannot fire even
@@ -106,7 +107,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
       layout.start()
       // Become the single layout owner. If a previous layout is somehow still
       // registered, this kills it so only one supervisor mutates coordinates.
-      useGraphStore.getState().setActiveLayoutSupervisor(layout)
+      graphStore.getState().setActiveLayoutSupervisor(layout)
       console.log(`FA2 worker layout started (${sigmaGraph.order} nodes)`)
     } catch (error) {
       console.error('Error starting FA2 worker layout:', error)
@@ -126,7 +127,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
         // Release the shared slot so the store invariant "activeLayoutSupervisor
         // != null => a layout is running" holds (the budget just stopped this
         // one); no-op for the slot if a manually selected layout already took over.
-        useGraphStore.getState().releaseLayoutSupervisor(layout)
+        graphStore.getState().releaseLayoutSupervisor(layout)
         // Clear any stale custom bbox (set by node dragging) and refresh so
         // the camera normalization fits the settled layout.
         sigma.setCustomBBox(null)
@@ -141,16 +142,16 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
       // Release the slot if we still own it (a manually selected worker layout
       // may have taken over and already killed `layout`); otherwise just kill
       // our own supervisor without disturbing the newer layout.
-      useGraphStore.getState().releaseLayoutSupervisor(layout)
+      graphStore.getState().releaseLayoutSupervisor(layout)
     }
-  }, [sigma, sigmaGraph])
+  }, [graphStore, sigma, sigmaGraph])
 
   /**
    * Ensure the sigma instance is set in the store
    */
   useEffect(() => {
     if (sigma) {
-      const currentInstance = useGraphStore.getState().sigmaInstance
+      const currentInstance = graphStore.getState().sigmaInstance
       // Update when the instance CHANGED, not only when it's unset. A theme
       // toggle, an effectiveEdgeEvents flip, or crossing the edge threshold
       // rebuilds the SigmaContainer (old instance killed, new one created); if
@@ -159,10 +160,10 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
       // on a dead Sigma.
       if (currentInstance !== sigma) {
         console.log('Setting sigma instance from GraphControl')
-        useGraphStore.getState().setSigmaInstance(sigma)
+        graphStore.getState().setSigmaInstance(sigma)
       }
     }
-  }, [sigma])
+  }, [graphStore, sigma])
 
   /**
    * With hideEdgesOnMove, edges are skipped while the camera is moving. sigma's
@@ -260,10 +261,10 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
    */
   useEffect(() => {
     if (effectiveEdgeEvents) return
-    const { selectedEdge, focusedEdge, setSelectedEdge, setFocusedEdge } = useGraphStore.getState()
+    const { selectedEdge, focusedEdge, setSelectedEdge, setFocusedEdge } = graphStore.getState()
     if (selectedEdge !== null) setSelectedEdge(null)
     if (focusedEdge !== null) setFocusedEdge(null)
-  }, [effectiveEdgeEvents])
+  }, [effectiveEdgeEvents, graphStore])
 
   /**
    * When component mounts
@@ -271,7 +272,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
    */
   useEffect(() => {
     const { setFocusedNode, setSelectedNode, setFocusedEdge, setSelectedEdge, clearSelection } =
-      useGraphStore.getState()
+      graphStore.getState()
 
     type NodeEvent = { node: string; event: { original: MouseEvent | TouchEvent } }
     type EdgeEvent = { edge: string; event: { original: MouseEvent | TouchEvent } }
@@ -318,7 +319,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
     }
 
     registerEvents(events)
-  }, [registerEvents, effectiveEdgeEvents, sigma])
+  }, [registerEvents, effectiveEdgeEvents, graphStore, sigma])
 
   /**
    * When edge size settings change, recalculate edge sizes.

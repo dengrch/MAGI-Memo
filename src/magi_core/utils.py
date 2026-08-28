@@ -414,6 +414,11 @@ class LightragPathFilter(logging.Filter):
             "/documents/pipeline_status",
             "/runtime/logs",
         ]
+        self.filtered_path_prefixes = [
+            # Balthasar polls both the trace collection and per-trace event
+            # endpoints while the live exploration view is open.
+            "/memory/explore/traces",
+        ]
         # self.filtered_paths = ["/health", "/webui/"]
 
     def filter(self, record):
@@ -438,7 +443,13 @@ class LightragPathFilter(logging.Filter):
             if (
                 (method == "GET" or method == "POST")
                 and (status == 200 or status == 304)
-                and route_path in self.filtered_paths
+                and (
+                    route_path in self.filtered_paths
+                    or any(
+                        route_path == prefix or route_path.startswith(f"{prefix}/")
+                        for prefix in self.filtered_path_prefixes
+                    )
+                )
             ):
                 return False
 

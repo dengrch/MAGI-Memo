@@ -6,7 +6,7 @@ import {
 } from '@react-sigma/graph-search'
 import { AsyncSearch } from '@/components/ui/AsyncSearch'
 import { searchResultLimit } from '@/lib/constants'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 import MiniSearch from 'minisearch'
 import { useTranslation } from 'react-i18next'
 
@@ -21,7 +21,8 @@ export interface OptionItem {
 }
 
 const NodeOption = ({ id }: { id: string }) => {
-  const graph = useGraphStore.use.sigmaGraph()
+  const graphStore = useGraphRuntimeStore()
+  const graph = graphStore.use.sigmaGraph()
 
   // Early return if no graph or node doesn't exist
   if (!graph?.hasNode(id)) {
@@ -72,16 +73,17 @@ export const GraphSearchInput = ({
   onFocus?: GraphSearchInputProps['onFocus']
   value?: GraphSearchInputProps['value']
 }) => {
+  const graphStore = useGraphRuntimeStore()
   const { t } = useTranslation()
-  const graph = useGraphStore.use.sigmaGraph()
-  const searchEngine = useGraphStore.use.searchEngine()
+  const graph = graphStore.use.sigmaGraph()
+  const searchEngine = graphStore.use.searchEngine()
 
   // Reset search engine when graph changes
   useEffect(() => {
     if (graph) {
-      useGraphStore.getState().resetSearchEngine()
+      graphStore.getState().resetSearchEngine()
     }
-  }, [graph]);
+  }, [graph, graphStore]);
 
   // Create search engine when needed
   useEffect(() => {
@@ -116,8 +118,8 @@ export const GraphSearchInput = ({
     }
 
     // Update search engine in store
-    useGraphStore.getState().setSearchEngine(newSearchEngine)
-  }, [graph, searchEngine])
+    graphStore.getState().setSearchEngine(newSearchEngine)
+  }, [graph, graphStore, searchEngine])
 
   /**
    * Loading the options while the user is typing.

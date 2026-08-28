@@ -39,6 +39,59 @@ export type MemoryOverview = {
   projection_outbox: Record<string, number>
 }
 
+export type ExplorationTraceSummary = {
+  exploration_id: string
+  query?: string | null
+  status: 'active' | 'archived'
+  created_at: string
+  updated_at: string
+  last_seq: number
+}
+
+export type ExplorationEntity = {
+  name: string
+  entity_type?: string | null
+  description?: string | null
+}
+
+export type ExplorationRelation = {
+  endpoints: [string, string]
+  keywords?: string[] | string | null
+  description?: string | null
+}
+
+export type ExplorationCandidate = {
+  entity: ExplorationEntity
+  relation: ExplorationRelation
+}
+
+export type ExplorationExpandResult = {
+  frontier: string
+  candidates: ExplorationCandidate[]
+}
+
+export type ExplorationEvent = {
+  exploration_id: string
+  seq: number
+  type: 'exploration_initialized' | 'expand_started' | 'expand_completed' | 'expand_failed'
+  agent_id: string
+  call_id: string
+  payload: {
+    frontier?: string[]
+    subquery?: string
+    visit?: {
+      entities: string[]
+      relations: [string, string][]
+      entity_metadata?: ExplorationEntity[]
+    }
+    error?: string
+    result?: {
+      results?: ExplorationExpandResult[]
+    }
+  }
+  created_at: string
+}
+
 export type MemoryEpisode = {
   episode_id: string
   kind: string
@@ -1423,6 +1476,22 @@ export const getMemoryAtoms = async (params: {
 
 export const getMemoryAtom = async (atomId: string): Promise<MemoryAtom> => {
   const response = await axiosInstance.get(`/memory/atoms/${encodeURIComponent(atomId)}`)
+  return response.data
+}
+
+export const getExplorationTraces = async (): Promise<ExplorationTraceSummary[]> => {
+  const response = await axiosInstance.get('/memory/explore/traces')
+  return response.data.items
+}
+
+export const getExplorationEvents = async (
+  explorationId: string,
+  afterSeq = 0
+): Promise<{ events: ExplorationEvent[]; last_seq: number }> => {
+  const response = await axiosInstance.get(
+    `/memory/explore/traces/${encodeURIComponent(explorationId)}/events`,
+    { params: { after_seq: afterSeq } }
+  )
   return response.data
 }
 

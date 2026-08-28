@@ -41,12 +41,40 @@ class VisitRequest(BaseModel):
         return values
 
 
+class ExplorationTraceRequest(BaseModel):
+    """Server-owned visualization identity automatically supplied by a caller."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    exploration_id: str = Field(min_length=1, max_length=200)
+    agent_id: str = Field(min_length=1, max_length=200)
+    call_id: str = Field(min_length=1, max_length=200)
+    subquery: str | None = Field(default=None, max_length=10_000)
+
+    @field_validator("exploration_id", "agent_id", "call_id")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("trace identities must not be empty")
+        return normalized
+
+    @field_validator("subquery")
+    @classmethod
+    def validate_subquery(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class ExpandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     frontier: list[str] = Field(min_length=1, max_length=200)
     visit: VisitRequest = Field(default_factory=VisitRequest)
     max_candidates_per_frontier: int = Field(default=50, ge=1, le=500)
+    trace: ExplorationTraceRequest | None = None
 
     @field_validator("frontier")
     @classmethod
@@ -56,14 +84,38 @@ class ExpandRequest(BaseModel):
         return values
 
 
-class EvidenceOwnerRequest(BaseModel):
+class ExplorationRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exploration_id: str = Field(min_length=1, max_length=200)
+    query: str | None = Field(default=None, max_length=10_000)
+    initial_visit: VisitRequest | None = None
+
+    @field_validator("exploration_id")
+    @classmethod
+    def validate_exploration_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("exploration_id must not be empty")
+        return normalized
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class ExplorationOwnerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entity: str | None = None
     relation: tuple[str, str] | None = None
 
     @model_validator(mode="after")
-    def validate_owner(self) -> "EvidenceOwnerRequest":
+    def validate_owner(self) -> "ExplorationOwnerRequest":
         if (self.entity is None) == (self.relation is None):
             raise ValueError("exactly one of entity or relation is required")
         if self.entity is not None and not self.entity.strip():
@@ -75,10 +127,10 @@ class EvidenceOwnerRequest(BaseModel):
         return self
 
 
-class EvidenceRequest(BaseModel):
+class ExplorationOwnersRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    owners: list[EvidenceOwnerRequest] = Field(min_length=1, max_length=200)
+    owners: list[ExplorationOwnerRequest] = Field(min_length=1, max_length=200)
 
 
 def create_memory_routes(
@@ -92,6 +144,34 @@ def create_memory_routes(
 
     def explorer() -> MemoryExplorer:
         return MemoryExplorer(rag.chunk_entity_relation_graph, memory_db)
+
+    async def visit_trace_payload(visit: VisitRequest) -> dict[str, Any]:
+        """Enrich identity-only visit state for visualization replay."""
+
+        metadata: list[dict[str, Any]] = []
+        try:
+            nodes = await rag.chunk_entity_relation_graph.get_nodes_batch(
+                list(dict.fromkeys(visit.entities))
+            )
+            for requested in visit.entities:
+                node = nodes.get(requested)
+                if node is None:
+                    continue
+                metadata.append(
+                    {
+                        "name": str(node.get("entity_id") or requested),
+                        "entity_type": node.get("entity_type", "UNKNOWN"),
+                        "description": node.get("description", ""),
+                    }
+                )
+        except Exception as exc:
+            # Trace enrichment is observational and must never make expand fail.
+            logger.warning("Failed to enrich exploration visit trace: %s", exc)
+        return {
+            "entities": visit.entities,
+            "relations": visit.relations,
+            "entity_metadata": metadata,
+        }
 
     @router.get("/overview", dependencies=protected)
     async def get_memory_overview():
@@ -170,22 +250,155 @@ def create_memory_routes(
     async def expand_memory(request: ExpandRequest):
         """Expand entity frontiers by one complete graph hop after visit de-dup."""
 
+        trace = request.trace
+        if trace is not None:
+            visit_payload = await visit_trace_payload(request.visit)
+            await memory_db.append_exploration_event(
+                exploration_id=trace.exploration_id,
+                event_type="expand_started",
+                agent_id=trace.agent_id,
+                call_id=trace.call_id,
+                payload={
+                    "frontier": request.frontier,
+                    "visit": visit_payload,
+                    **(
+                        {"subquery": trace.subquery}
+                        if trace.subquery is not None
+                        else {}
+                    ),
+                },
+            )
         try:
-            return await explorer().expand(
+            result = await explorer().expand(
                 frontier=request.frontier,
                 visit_entities=request.visit.entities,
                 visit_relations=request.visit.relations,
                 max_candidates_per_frontier=request.max_candidates_per_frontier,
             )
         except ExplorationReadError as exc:
+            if trace is not None:
+                await memory_db.append_exploration_event(
+                    exploration_id=trace.exploration_id,
+                    event_type="expand_failed",
+                    agent_id=trace.agent_id,
+                    call_id=trace.call_id,
+                    payload={"frontier": request.frontier, "error": str(exc)},
+                )
             logger.error("Failed to expand active-memory frontier: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
+            if trace is not None:
+                await memory_db.append_exploration_event(
+                    exploration_id=trace.exploration_id,
+                    event_type="expand_failed",
+                    agent_id=trace.agent_id,
+                    call_id=trace.call_id,
+                    payload={"frontier": request.frontier, "error": str(exc)},
+                )
             logger.error("Failed to expand active-memory frontier: %s", exc)
+            raise internal_server_error(exc)
+        if trace is not None:
+            await memory_db.append_exploration_event(
+                exploration_id=trace.exploration_id,
+                event_type="expand_completed",
+                agent_id=trace.agent_id,
+                call_id=trace.call_id,
+                payload={"frontier": request.frontier, "result": result},
+            )
+        return result
+
+    @router.post("/explore/traces", dependencies=protected)
+    async def register_exploration(request: ExplorationRegistrationRequest):
+        """Register human-readable metadata for an exploration identity."""
+
+        try:
+            trace = await memory_db.register_exploration_trace(
+                request.exploration_id, request.query
+            )
+            if request.initial_visit is not None:
+                existing = await memory_db.get_exploration_events(
+                    request.exploration_id, after_seq=0, limit=1
+                )
+                if not existing:
+                    await memory_db.append_exploration_event(
+                        exploration_id=request.exploration_id,
+                        event_type="exploration_initialized",
+                        agent_id=request.exploration_id,
+                        call_id="initial",
+                        payload={
+                            "visit": await visit_trace_payload(
+                                request.initial_visit
+                            )
+                        },
+                    )
+            return trace
+        except Exception as exc:
+            logger.error("Failed to register exploration trace: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.get("/explore/traces", dependencies=protected)
+    async def list_exploration_traces(
+        include_archived: bool = False,
+        limit: int = Query(50, ge=1, le=200),
+    ):
+        try:
+            items = await memory_db.list_exploration_traces(
+                include_archived=include_archived, limit=limit
+            )
+            return {"items": items}
+        except Exception as exc:
+            logger.error("Failed to list exploration traces: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.get(
+        "/explore/traces/{exploration_id}/events", dependencies=protected
+    )
+    async def list_exploration_events(
+        exploration_id: str,
+        after_seq: int = Query(0, ge=0),
+        limit: int = Query(500, ge=1, le=2_000),
+    ):
+        try:
+            events = await memory_db.get_exploration_events(
+                exploration_id, after_seq=after_seq, limit=limit
+            )
+            return {
+                "events": events,
+                "last_seq": events[-1]["seq"] if events else after_seq,
+            }
+        except Exception as exc:
+            logger.error("Failed to list exploration events: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.post(
+        "/explore/traces/{exploration_id}/archive", dependencies=protected
+    )
+    async def archive_exploration_trace(exploration_id: str):
+        try:
+            archived = await memory_db.archive_exploration_trace(exploration_id)
+        except Exception as exc:
+            logger.error("Failed to archive exploration trace: %s", exc)
+            raise internal_server_error(exc)
+        if not archived:
+            raise HTTPException(status_code=404, detail="Exploration trace not found")
+        return {"archived": True}
+
+    @router.post("/explore/describe", dependencies=protected)
+    async def describe_memory_owners(request: ExplorationOwnersRequest):
+        """Read lightweight graph descriptions by entity/relation names."""
+
+        owners = [owner.model_dump(exclude_none=True) for owner in request.owners]
+        try:
+            return await explorer().describe(owners)
+        except ExplorationReadError as exc:
+            logger.error("Failed to describe active-memory owners: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to describe active-memory owners: %s", exc)
             raise internal_server_error(exc)
 
     @router.post("/explore/evidence", dependencies=protected)
-    async def get_memory_evidence(request: EvidenceRequest):
+    async def get_memory_evidence(request: ExplorationOwnersRequest):
         """Read Atom evidence and evolution history by entity/relation names."""
 
         owners = [owner.model_dump(exclude_none=True) for owner in request.owners]

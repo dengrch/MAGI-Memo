@@ -7,7 +7,7 @@ import Input from '@/components/ui/Input'
 
 import { controlButtonVariant, EDGE_PERF_LIMIT } from '@/lib/constants'
 import { useSettingsStore } from '@/stores/settings'
-import { useGraphStore } from '@/stores/graph'
+import { useGraphRuntimeStore } from '@/contexts/GraphRuntimeContext'
 import useRandomGraph from '@/hooks/useRandomGraph'
 
 import { SettingsIcon, Undo2, Shuffle } from 'lucide-react'
@@ -180,13 +180,14 @@ const LabeledNumberInput = ({
  * Component that displays a popover with settings options.
  */
 export default function Settings() {
+  const graphStore = useGraphRuntimeStore()
   const [opened, setOpened] = useState<boolean>(false)
 
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const showNodeLabel = useSettingsStore.use.showNodeLabel()
   const enableEdgeEvents = useSettingsStore.use.enableEdgeEvents()
-  const graphEdgeCount = useGraphStore.use.graphEdgeCount()
+  const graphEdgeCount = graphStore.use.graphEdgeCount()
   const enableNodeDrag = useSettingsStore.use.enableNodeDrag()
   const enableHideUnselectedEdges = useSettingsStore.use.enableHideUnselectedEdges()
   const showEdgeLabel = useSettingsStore.use.showEdgeLabel()
@@ -248,8 +249,8 @@ export default function Settings() {
   const setGraphQueryMaxDepth = useCallback((depth: number) => {
     if (depth < 1) return
     useSettingsStore.setState({ graphQueryMaxDepth: depth })
-    useGraphStore.getState().setGraphDataFetchAttempted(false)
-  }, [])
+    graphStore.getState().setGraphDataFetchAttempted(false)
+  }, [graphStore])
 
   const setGraphMaxNodes = useCallback((nodes: number) => {
     const maxLimit = backendMaxGraphNodes || 1000
@@ -259,8 +260,8 @@ export default function Settings() {
 
   const handleGenerateRandomGraph = useCallback(() => {
     const graph = randomGraph()
-    useGraphStore.getState().setSigmaGraph(graph)
-  }, [randomGraph])
+    graphStore.getState().setSigmaGraph(graph)
+  }, [graphStore, randomGraph])
 
   const { t } = useTranslation();
 

@@ -23,6 +23,7 @@ from magi_core.backend.sqlite.migrations import (
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
 )
 from magi_core.memory import (
     AtomEvidence,
@@ -225,6 +226,12 @@ class SQLiteBackend:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
                 "VALUES (?, ?)",
                 (6, _utc_now()),
+            )
+            connection.executescript(MIGRATION_7)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
+                (7, _utc_now()),
             )
             self._prune_orphan_projection_owners(connection)
 
@@ -2658,3 +2665,211 @@ class SQLiteBackend:
                 (self.workspace_id,),
             ).fetchone()
         return row["setting_value"] if row else None
+
+    async def register_exploration_trace(
+        self, exploration_id: str, query: str | None = None
+    ) -> dict[str, Any]:
+        """Create or enrich one persisted exploration trace."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._register_exploration_trace_sync, exploration_id, query
+        )
+
+    def _register_exploration_trace_sync(
+        self, exploration_id: str, query: str | None
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        normalized_query = query.strip() if query else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO exploration_traces(
+                    workspace_id, exploration_id, query, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?)
+                ON CONFLICT(workspace_id, exploration_id) DO UPDATE SET
+                    query = COALESCE(excluded.query, exploration_traces.query),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    self.workspace_id,
+                    exploration_id,
+                    normalized_query,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT exploration_id, query, status, created_at, updated_at
+                FROM exploration_traces
+                WHERE workspace_id = ? AND exploration_id = ?
+                """,
+                (self.workspace_id, exploration_id),
+            ).fetchone()
+        return dict(row)
+
+    async def append_exploration_event(
+        self,
+        *,
+        exploration_id: str,
+        event_type: str,
+        agent_id: str,
+        call_id: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Append one ordered event and return its persisted representation."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._append_exploration_event_sync,
+            exploration_id,
+            event_type,
+            agent_id,
+            call_id,
+            dict(payload),
+        )
+
+    def _append_exploration_event_sync(
+        self,
+        exploration_id: str,
+        event_type: str,
+        agent_id: str,
+        call_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO exploration_traces(
+                    workspace_id, exploration_id, status, created_at, updated_at
+                ) VALUES (?, ?, 'active', ?, ?)
+                ON CONFLICT(workspace_id, exploration_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (self.workspace_id, exploration_id, now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+                FROM exploration_events
+                WHERE workspace_id = ? AND exploration_id = ?
+                """,
+                (self.workspace_id, exploration_id),
+            ).fetchone()
+            seq = int(row["next_seq"])
+            connection.execute(
+                """
+                INSERT INTO exploration_events(
+                    workspace_id, exploration_id, seq, event_type,
+                    agent_id, call_id, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.workspace_id,
+                    exploration_id,
+                    seq,
+                    event_type,
+                    agent_id,
+                    call_id,
+                    payload_json,
+                    now,
+                ),
+            )
+        return {
+            "exploration_id": exploration_id,
+            "seq": seq,
+            "type": event_type,
+            "agent_id": agent_id,
+            "call_id": call_id,
+            "payload": payload,
+            "created_at": now,
+        }
+
+    async def list_exploration_traces(
+        self, *, include_archived: bool = False, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._list_exploration_traces_sync, include_archived, limit
+        )
+
+    def _list_exploration_traces_sync(
+        self, include_archived: bool, limit: int
+    ) -> list[dict[str, Any]]:
+        status_filter = "" if include_archived else "AND trace.status = 'active'"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT trace.exploration_id, trace.query, trace.status,
+                       trace.created_at, trace.updated_at,
+                       COALESCE(MAX(event.seq), 0) AS last_seq
+                FROM exploration_traces AS trace
+                LEFT JOIN exploration_events AS event
+                  ON event.workspace_id = trace.workspace_id
+                 AND event.exploration_id = trace.exploration_id
+                WHERE trace.workspace_id = ? {status_filter}
+                GROUP BY trace.workspace_id, trace.exploration_id
+                ORDER BY trace.updated_at DESC
+                LIMIT ?
+                """,
+                (self.workspace_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_exploration_events(
+        self, exploration_id: str, *, after_seq: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._get_exploration_events_sync, exploration_id, after_seq, limit
+        )
+
+    def _get_exploration_events_sync(
+        self, exploration_id: str, after_seq: int, limit: int
+    ) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT exploration_id, seq, event_type, agent_id, call_id,
+                       payload_json, created_at
+                FROM exploration_events
+                WHERE workspace_id = ? AND exploration_id = ? AND seq > ?
+                ORDER BY seq ASC
+                LIMIT ?
+                """,
+                (self.workspace_id, exploration_id, after_seq, limit),
+            ).fetchall()
+        return [
+            {
+                "exploration_id": row["exploration_id"],
+                "seq": row["seq"],
+                "type": row["event_type"],
+                "agent_id": row["agent_id"],
+                "call_id": row["call_id"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    async def archive_exploration_trace(self, exploration_id: str) -> bool:
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._archive_exploration_trace_sync, exploration_id
+        )
+
+    def _archive_exploration_trace_sync(self, exploration_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE exploration_traces
+                SET status = 'archived', updated_at = ?
+                WHERE workspace_id = ? AND exploration_id = ?
+                """,
+                (_utc_now(), self.workspace_id, exploration_id),
+            )
+        return cursor.rowcount > 0
