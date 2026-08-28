@@ -24,9 +24,11 @@ automatically commits successfully described owners and descriptions. Models
 never pass or return the complete state. Topology alone never becomes a
 finding. `evidence` is the optional third layer, reserved for
 query-critical factual, temporal, provenance, or evolution ambiguity that
-remains after description; only its concise model-written conclusion is stored
-through `magi_memory_note`. The plugin rejects a repeated frontier and refuses
-a later expand while the preceding candidates still await description.
+remains after description. `magi_memory_note` stores a concise conclusion formed
+from Evidence or from the explorer's wider accumulated context; it is not
+restricted to immediately following an evidence call. The plugin rejects a
+repeated frontier and refuses a later expand while the preceding candidates
+still await description.
 `expanded` is maintained separately from `visit`: any entity visible in the
 exploration history may become a frontier, including an earlier topology-only
 candidate, but each entity can be expanded only once per branch.
@@ -85,8 +87,9 @@ The Web profile registers a session-scoped `/memory` command:
 - `explore` enables the Recall Gate to choose `magi_memory_explore` when hidden
   graph relations may matter. It selects concurrent mode for broad or
   multi-branch investigations and the direct s0 path for small focused chains.
-  The parent receives only merged findings, a compact exploration `report`, and stop
-  metadata; private visit state remains inside the explorers.
+  The parent receives only merged findings, a compact exploration `report`,
+  `stop_reason`, and system completion metadata; private visit state remains
+  inside the explorers.
 - `off` prohibits recall and memory writes.
 - In DSH Web, entering bare `/memory` opens the available mode selector; the
   right-side composer selector uses the same command and session state.

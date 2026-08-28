@@ -11,10 +11,10 @@ MAGI Memo 是一个以知识图谱为主要组织与检索结构、面向 Agent 
 1. 从文档 RAG 演进为可持续维护的图谱记忆系统；
 2. 从单一服务演进为可被 Agent Harness 调用的记忆基础设施。
 
-当前主线是 DeepSeek Harness（DSH）接入、受预算约束的主动图谱检索，以及 Reflect / 社区摘要研究。未来的 MAGI Sys 才负责人格化的 CASPER、MELCHIOR、BALTHASAR、Blackboard、MQP、MCC 与通用多 Agent 协商。
+当前主线是 DeepSeek Harness（DSH）接入、由插件状态机约束的主动图谱检索，以及 Reflect / 社区摘要研究。未来的 MAGI Sys 才负责人格化的 CASPER、MELCHIOR、BALTHASAR、Blackboard、MQP、MCC 与通用多 Agent 协商。
 
 > [!IMPORTANT]
-> MAGI Memo 当前处于 Beta / research preview。记忆内核、Runtime、REST API、WebUI 和 DSH 插件已经可用；主动检索 v1 正在验收，Reflect、多 Explorer 并发和通用 MCP 入口仍在演进。
+> MAGI Memo 当前处于 Beta / research preview。记忆内核、Runtime、REST API、WebUI 和 DSH 插件已经可用；主动检索 v1/v2、冷热启动、多 Explorer 并发和 Balthasar 实时回放已进入验收，Reflect、社区摘要和通用 MCP 入口仍在演进。
 
 ## 快速开始
 
@@ -94,7 +94,7 @@ magi-core-gunicorn
 ```bash
 cd src/webui
 bun install --frozen-lockfile
-bun run build:bun
+bun --bun run build
 ```
 
 ## 为什么图谱还需要记忆语义
@@ -142,8 +142,10 @@ Episode
 | Runtime / Workspace       | 稳定     | 单 active Runtime、多 Handle、Workspace 隔离、切换与级联删除       |
 | REST API / WebUI          | 可用     | 写入队列、Memory Core、语义图、检索、Workspace 与运行日志          |
 | DSH plugin                | 可用     | Session 级`auto` / `manual` / `explore` / `off` 记忆模式   |
-| 主动图谱检索 v1           | 验收中   | Mix 冷启动、单 Explorer、单跳 expand、Evidence 下钻                |
-| 主动检索 v2 / Reflect     | 规划中   | 热启动、query rewrite、多 Explorer、社区聚类与层次摘要             |
+| 主动图谱检索 v1           | 验收中   | Mix 冷启动、单 Explorer、`expand → describe → evidence` 渐进加载    |
+| 主动图谱检索 v2           | 验收中   | Auto 热启动、动态 subquery、一层多 Explorer 并发与部分失败保留      |
+| 主动探索可视化            | 验收中   | Balthasar 实时增量图、Agent 分段光晕、Trace 持久化与历史回放        |
+| Reflect / 社区摘要        | 研究中   | Neo4j/GDS 社区、主题识别与带 Evidence 血缘的层次摘要                |
 
 ## 架构
 
@@ -208,21 +210,41 @@ Episode
 - `naive`：直接做文本块向量召回；
 - `mix`：融合知识图谱与向量上下文，通常配合 reranker 使用。
 
-主动检索 v1 在普通 Mix 召回之后增加一个隔离的只读 Explorer：
+主动检索在普通召回之上增加隔离的只读 Explorer。显式 `/memory explore` 可以用一次 Mix 冷启动；`/memory auto` 则先由 Host 执行普通 recall，只在已激活相关实体与描述、但仍存在必须沿图追踪的具体关系缺口时请求热启动：
 
 ```text
-query → mix seeds → frontier
-                       ↓
-              expand one hop
-                       ↓
-              select candidate
-                       ↓
-              inspect Evidence
-                       ↓
-             continue or stop
+                                  ┌─ explicit explore: one Mix cold start
+query → ordinary recall / seeds ──┤
+                                  └─ auto: current-turn hot start + native approval
+                                                    ↓
+                                                   s0
+                         ┌──────────────────────────┴─────────────────────────┐
+                         │ direct                                            │ concurrent
+                         ▼                                                   ▼
+          expand → mandatory describe → optional evidence/note     dynamic subquery/frontier
+                                                                             ↓
+                                                               s1 / s2 / … in one batch
+                                                                             ↓
+                                                               merge findings into s0
 ```
 
-Explorer 只接收 `expand` 和 `evidence` 两个内部工具，不能写入记忆。它维护紧凑的 `visit` 与 `findings`，所有真实写入仍统一经过单一 Memory Writer。
+`expand` 只返回实体名、类型、关系端点和关键词等紧凑拓扑。每个非空候选轮次必须选择一个非空小集合执行一次批量 `describe`；插件自动把成功加载的 owner 与描述写入 `visit/findings`。`evidence` 只在描述仍留下查询所需歧义时按需加载；`note` 可以记录由 Evidence 或整体探索上下文形成的结论。
+
+插件分别维护 `visit`、`findings`、`expanded` 与待 describe 状态，模型不传递完整状态。并发模式仍只由 Host 启动一个 s0；s0 根据累计 findings 动态委派一层 s1/s2…，同一 batch 真并发执行。worker 不能继续委派，彼此不共享 coverage，局部推理链不会被兄弟分支截断；findings 在 s0 聚合时按规范化 Entity 名和无序 Relation endpoint pair 去重，单个 worker 失败不会丢失其他分支结果。
+
+最终 Host 接收聚合 `findings`、探索 `report`、`stop_reason` 与系统完成状态，不接收私有 visit 或原始工具噪声：
+
+```json
+{
+  "status": "complete",
+  "subagent_stop_reason": "completed",
+  "findings": { "entities": [], "relations": [] },
+  "report": "探索分支、主要收获与聚合判断",
+  "stop_reason": "停止探索的直接原因"
+}
+```
+
+Explorer 始终只读，所有真实记忆写入仍统一经过单一 Memory Writer。完整协议见 [`doc/phase3-mag25-active-graph-retrieval-design.md`](./doc/phase3-mag25-active-graph-retrieval-design.md)。
 
 ## 图谱记忆如何形成
 
@@ -630,7 +652,8 @@ FastAPI 服务同时承载 WebUI 与公开 API。常用接口包括：
 | 生成式查询        | `POST /query`、`POST /query/stream`                                                   |
 | 结构化召回        | `POST /query/data`                                                                      |
 | Memory inspection | `GET /memory/overview`、`/memory/episodes`、`/memory/atoms`                         |
-| 主动探索原语      | `POST /memory/explore/expand`、`POST /memory/explore/evidence`                        |
+| 主动探索原语      | `POST /memory/explore/expand`、`POST /memory/explore/describe`、`POST /memory/explore/evidence` |
+| 探索 Trace        | `POST/GET /memory/explore/traces`、`GET .../{id}/events`、`POST .../{id}/archive`   |
 | 图谱              | `GET /graphs` 与 `/graph/*`                                                           |
 | 管线状态          | `GET /documents/pipeline_status`                                                        |
 
@@ -639,6 +662,7 @@ WebUI 当前提供：
 - Episode 上传、文本写入、扫描、队列与错误状态；
 - Episode、Atom、Evidence、Entity、Relation 与演化详情；
 - 语义图可视化和普通检索控制台；
+- Balthasar 主动探索实时增量图、Agent 光晕与历史场景回放；
 - Workspace 创建、切换与受控删除；
 - Runtime 状态和近期日志。
 
@@ -667,9 +691,9 @@ WebUI 当前提供：
 /memory
 ```
 
-- `auto`：每轮执行 Recall Gate 与 Write Gate，但不机械强制工具调用；
+- `auto`：每轮执行 Recall Gate 与 Write Gate，但不机械强制工具调用；普通 recall 仍不足时可用同一 turn 的 seeds 热启动 explore，创建 s0 前由 DSH 原生授权界面征求一次许可；
 - `manual`：仅在用户明确要求时读写记忆；
-- `explore`：允许在隐藏图关系可能重要时启动一个隔离 Explorer；
+- `explore`：允许在隐藏图关系可能重要时冷启动一个隔离 s0，并按问题规模选择直接探索或动态并发 worker；
 - `off`：禁止记忆召回与写入。
 
 模式由 DSH Session log 持久化，恢复或 fork 后仍然有效；Agent 无权自行切换模式。Workspace 的创建和激活同样要求用户明确授权。
@@ -690,8 +714,8 @@ MAGI 的命名仍然保留，但在 **Memo** 中代表三条能力研究线，�
 | 研究线           | 当前含义                                                          |
 | ---------------- | ----------------------------------------------------------------- |
 | CASPER / 直觉    | 让外部 Harness 低开销、可靠地调用基础记忆检索，并持续优化召回效率 |
-| MELCHIOR / 分析  | 受预算约束的主动图谱探索、Evidence 下钻与后续多 Explorer 研究     |
-| BALTHASAR / 判断 | Neo4j/GDS 社区聚类、Reflect、主题识别与带证据血缘的层次摘要       |
+| MELCHIOR / 分析  | 渐进式主动图谱探索、冷热启动、Evidence 下钻与动态多 Explorer      |
+| BALTHASAR / 判断 | 主动探索实时可视化；以及后续 Neo4j/GDS 社区、Reflect 与层次摘要研究 |
 
 人格、群聊、投票、Blackboard、MQP、MCC 和通用 Agent 状态机属于未来 **MAGI Sys**，不应被描述为 MAGI Memo 的现有功能。
 
@@ -713,8 +737,9 @@ MAGI 的命名仍然保留，但在 **Memo** 中代表三条能力研究线，�
 
 3. **三期：DSH 主动图谱检索与 Reflect**
    - DSH plugin 与 Session 级记忆模式；
-   - 主动检索 v1：单 Explorer 的 `mix → expand → evidence` 闭环；
-   - 主动检索 v2：冷热启动、自动 query rewrite、自适应多 Explorer；
+   - 主动检索 v1：单 Explorer 的 `mix → expand → describe → evidence` 闭环；
+   - 主动检索 v2：Auto 热启动、s0 动态 subquery 与一层自适应多 Explorer；
+   - Balthasar：Core 权威 Trace、实时增量图、多 Agent 分段光晕与历史回放；
    - Neo4j/GDS 社区聚类、Reflect 与证据可追溯的摘要。
 
 ### 明确不在当前范围
@@ -777,7 +802,7 @@ WebUI：
 cd src/webui
 bun test
 bun run lint
-bun run build
+bun --bun run build
 ```
 
 DSH plugin：
