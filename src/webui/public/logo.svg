@@ -1,36 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
   <title id="title">MAGI Memo</title>
-  <desc id="desc">Three geometric MAGI cores linked to form a central hexagon with compact MAGI text</desc>
+  <desc id="desc">Three geometric MAGI cores linked around a central hexagonal opening</desc>
   <style>
     :root { color: #111827; }
     @media (prefers-color-scheme: dark) { :root { color: #ffffff; } }
   </style>
   <g fill="currentColor">
     <!-- Top core (Balthasar) -->
-    <path d="M16 7h32v10l-10 10H26L16 17z"/>
+    <path d="M14 6h36v9L39 26H25L14 15z"/>
     <!-- Lower-left core (Casper) -->
-    <path d="M18 35l8 8v14H2V35z"/>
+    <path d="M3 35h13l11 10v13H3z"/>
     <!-- Lower-right core (Melchior) -->
-    <path d="M46 35l-8 8v14h24V35z"/>
+    <path d="M48 35H61v23H37V45z"/>
   </g>
   <!-- Three links forming the central hexagon -->
   <path
-    d="M38 27l8 8m-8 8H26m-8-8l8-8"
+    d="M39 26l9 9M37 45H27M16 35l9-9"
     fill="none"
     stroke="currentColor"
     stroke-width="2.5"
     stroke-linejoin="round"
     stroke-linecap="round"
   />
-  <text
-    x="32"
-    y="35"
-    font-family="Georgia, serif"
-    font-size="5.5"
-    font-weight="bold"
-    text-anchor="middle"
-    dominant-baseline="central"
-    fill="currentColor"
-    letter-spacing="0.2"
-  >MAGI</text>
 </svg>

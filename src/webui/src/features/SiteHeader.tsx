@@ -7,7 +7,6 @@ import {
   ChevronRightIcon,
   LoaderCircleIcon,
   LogOutIcon,
-  MessagesSquareIcon,
   PlusIcon,
   Share2Icon,
   Trash2Icon
@@ -95,18 +94,15 @@ function TabsNavigation() {
         <NavigationTab value="knowledge-graph" currentTab={currentTab} icon={Share2Icon}>
           {t('header.knowledgeGraph')}
         </NavigationTab>
-        <NavigationTab value="retrieval" currentTab={currentTab} icon={MessagesSquareIcon}>
-          {t('header.retrieval')}
-        </NavigationTab>
       </TabsList>
     </div>
   )
 }
 
 const sages = [
-  { name: 'Melchior', initial: 'M' },
-  { name: 'Balthasar', initial: 'B' },
-  { name: 'Casper', initial: 'C' }
+  { name: 'Balthasar', initial: 'B', tab: 'balthasar' },
+  { name: 'Melchior', initial: 'M', tab: 'melchior' },
+  { name: 'Casper', initial: 'C', tab: 'casper' }
 ] as const
 
 function TheSagesNavigation() {
@@ -135,13 +131,13 @@ function TheSagesNavigation() {
         <div className="min-h-0 overflow-hidden">
           <div className="space-y-0.5 pt-0.5">
             {sages.map((sage) => (
-              sage.name === 'Balthasar' ? (
+              'tab' in sage ? (
                 <TabsList key={sage.name} className="block h-auto w-full bg-transparent p-0">
                   <TabsTrigger
-                    value="balthasar"
+                    value={sage.tab}
                     className={cn(
                       'flex h-8 w-full cursor-pointer items-center justify-start gap-2.5 rounded-md px-2.5 text-sm transition-colors',
-                      currentTab === 'balthasar'
+                      currentTab === sage.tab
                         ? 'bg-accent text-foreground'
                         : 'text-muted-foreground hover:bg-accent hover:text-foreground'
                     )}
@@ -152,17 +148,7 @@ function TheSagesNavigation() {
                     <span>{sage.name}</span>
                   </TabsTrigger>
                 </TabsList>
-              ) : (
-                <div
-                  key={sage.name}
-                  className="text-muted-foreground flex h-8 items-center gap-2.5 rounded-md px-2.5 text-sm"
-                >
-                  <span className="border-input bg-background/50 flex size-5 items-center justify-center rounded border text-[9px] font-semibold">
-                    {sage.initial}
-                  </span>
-                  <span>{sage.name}</span>
-                </div>
-              )
+              ) : null
             ))}
           </div>
         </div>
@@ -558,9 +544,9 @@ export default function SiteHeader() {
   return (
     <aside className="magi-system-header relative z-50 flex h-full w-[240px] shrink-0 flex-col border-r p-3 max-md:h-14 max-md:w-full max-md:flex-row max-md:items-center max-md:border-r-0 max-md:border-b max-md:px-3 max-md:py-1.5">
       <div className="flex min-h-11 items-center px-2 max-md:min-h-0 max-md:px-0">
-        <a href={webuiPrefix} className="group flex items-center gap-2.5">
-          <span className="magi-brand-mark flex size-7 items-center justify-center rounded-lg transition-transform group-hover:scale-[1.03]">
-            <MagiCoreMark className="size-5" />
+        <a href={webuiPrefix} className="flex items-center gap-2.5">
+          <span className="text-foreground flex size-8 items-center justify-center">
+            <MagiCoreMark variant="solid" className="size-7" />
           </span>
           <span className="text-sm font-medium tracking-[-0.01em] max-sm:hidden">{SiteInfo.name}</span>
         </a>
@@ -619,7 +605,7 @@ export default function SiteHeader() {
               <GithubIcon className="size-4" />
             </a>
           </Button>
-          <AppSettings side="top" />
+          <AppSettings side="top" showRuntimeModels />
           {!isGuestMode && (
             <Button
               variant="ghost"

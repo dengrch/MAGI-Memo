@@ -9,9 +9,14 @@ import { useDebounce } from '@/hooks/useDebounce'
 import QuerySettings from '@/components/retrieval/QuerySettings'
 import { ChatMessage, MessageWithError } from '@/components/retrieval/ChatMessage'
 import {
+  graphGlassPanelClass,
+  graphGlassControlClass
+} from '@/components/graph/glassStyles'
+import {
   ChevronDownIcon,
   CopyIcon,
   EraserIcon,
+  ScanSearchIcon,
   SendIcon,
   SlidersHorizontalIcon,
   SquareIcon,
@@ -121,7 +126,7 @@ export default function RetrievalView() {
   const { t } = useTranslation()
   // Get current tab to determine if this tab is active (for performance optimization)
   const currentTab = useSettingsStore.use.currentTab()
-  const isRetrievalTabActive = currentTab === 'retrieval'
+  const isCasperTabActive = currentTab === 'casper'
 
   const [messages, setMessages] = useState<MessageWithError[]>(() => {
     try {
@@ -982,12 +987,20 @@ export default function RetrievalView() {
         <div className="relative grow">
           <div
             ref={messagesContainerRef}
-            className="magi-chat-surface absolute inset-0 flex flex-col overflow-auto rounded-lg border p-3"
+            className={cn(graphGlassPanelClass, 'absolute inset-0 flex flex-col overflow-auto bg-background/45 p-4')}
           >
             <div className="flex min-h-0 flex-1 flex-col gap-2">
               {messages.length === 0 ? (
-                <div className="text-muted-foreground flex h-full items-center justify-center text-lg">
-                  {t('retrievePanel.retrieval.startPrompt')}
+                <div className="flex h-full items-center justify-center px-6 text-center">
+                  <div className="flex max-w-md flex-col items-center">
+                    <span className={cn(graphGlassControlClass, 'mb-4 flex size-12 items-center justify-center text-violet-300')}>
+                      <ScanSearchIcon className="size-5" />
+                    </span>
+                    <div className="text-foreground text-sm font-semibold tracking-wide">Casper</div>
+                    <div className="text-muted-foreground mt-1.5 text-sm leading-relaxed">
+                      {t('retrievePanel.retrieval.startPrompt')}
+                    </div>
+                  </div>
                 </div>
               ) : (
                 messages.map((message, idx) => { // Remove unused idx
@@ -1000,7 +1013,7 @@ export default function RetrievalView() {
                       {message.role === 'user' && (
                         <Button
                           onClick={() => handleCopyMessage(message)}
-                          className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
+                          className="mb-2 size-6 shrink-0 rounded-lg opacity-50 transition-opacity hover:opacity-100"
                           tooltip={t('retrievePanel.chatMessage.copyTooltip')}
                           variant="ghost"
                           size="icon"
@@ -1010,7 +1023,7 @@ export default function RetrievalView() {
                       )}
                       <ChatMessage
                         message={message}
-                        isTabActive={isRetrievalTabActive}
+                        isTabActive={isCasperTabActive}
                         activeProgress={
                           idx === messages.length - 1 && message.role === 'assistant'
                             ? queryProgress
@@ -1025,7 +1038,7 @@ export default function RetrievalView() {
                       {message.role === 'assistant' && (
                         <Button
                           onClick={() => handleCopyMessage(message)}
-                          className="mb-2 size-6 rounded-md opacity-60 transition-opacity hover:opacity-100 shrink-0"
+                          className="mb-2 size-6 shrink-0 rounded-lg opacity-50 transition-opacity hover:opacity-100"
                           tooltip={t('retrievePanel.chatMessage.copyTooltip')}
                           variant="ghost"
                           size="icon"
@@ -1057,7 +1070,7 @@ export default function RetrievalView() {
 
         <form
           onSubmit={handleSubmit}
-          className="magi-chat-composer flex shrink-0 items-center gap-2 rounded-lg border p-2"
+          className={cn(graphGlassControlClass, 'flex shrink-0 items-center gap-2 bg-background/38 p-2')}
           autoComplete="on"
           method="post"
           action="#"
@@ -1071,7 +1084,7 @@ export default function RetrievalView() {
             onClick={clearMessages}
             disabled={isLoading}
             size="sm"
-            className="shrink-0 max-sm:size-8 max-sm:px-0"
+            className="shrink-0 rounded-lg max-sm:size-8 max-sm:px-0"
             aria-label={t('retrievePanel.retrieval.clear')}
             tooltip={t('retrievePanel.retrieval.clear')}
           >
@@ -1082,7 +1095,7 @@ export default function RetrievalView() {
             type="button"
             variant="outline"
             size="icon"
-            className="shrink-0 md:hidden"
+            className="shrink-0 rounded-lg md:hidden"
             aria-label={t('retrievePanel.querySettings.parametersTitle')}
             tooltip={t('retrievePanel.querySettings.parametersTitle')}
             onClick={() => setSettingsOpen(true)}
@@ -1098,7 +1111,7 @@ export default function RetrievalView() {
                 ref={inputRef as React.RefObject<HTMLTextAreaElement>}
                 id="query-input"
                 autoComplete="on"
-                className="w-full min-h-[40px] max-h-[120px] overflow-y-auto"
+                className="min-h-[40px] max-h-[120px] w-full overflow-y-auto rounded-lg bg-white/[0.025]"
                 value={inputValue}
                 onChange={handleChange}
                 onKeyDown={handleKeyDown}
@@ -1125,7 +1138,7 @@ export default function RetrievalView() {
                 ref={inputRef as React.RefObject<HTMLInputElement>}
                 id="query-input"
                 autoComplete="on"
-                className="w-full"
+                className="w-full rounded-lg bg-white/[0.025]"
                 value={inputValue}
                 onChange={handleChange}
                 onKeyDown={handleKeyDown}
@@ -1146,7 +1159,7 @@ export default function RetrievalView() {
               onClick={handleStop}
               disabled={stopDisabled}
               size="sm"
-              className="shrink-0 max-sm:size-8 max-sm:px-0"
+              className="shrink-0 rounded-lg max-sm:size-8 max-sm:px-0"
               aria-label={t('retrievePanel.retrieval.stop')}
               tooltip={t('retrievePanel.retrieval.stop')}
             >
@@ -1156,9 +1169,9 @@ export default function RetrievalView() {
           ) : (
             <Button
               type="submit"
-              variant="default"
+              variant="outline"
               size="sm"
-              className="shrink-0 max-sm:size-8 max-sm:px-0"
+              className="shrink-0 rounded-lg border-violet-400/20 bg-violet-400/[0.08] shadow-[inset_0_1px_rgba(255,255,255,0.08),0_4px_12px_-8px_rgba(124,58,237,0.7)] hover:border-violet-300/30 hover:bg-violet-400/[0.12] max-sm:size-8 max-sm:px-0"
               aria-label={t('retrievePanel.retrieval.send')}
               tooltip={t('retrievePanel.retrieval.send')}
             >

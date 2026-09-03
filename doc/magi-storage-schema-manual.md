@@ -1,14 +1,14 @@
 # MAGI Memo 存储 Schema 手册
 
-> 适用代码：当前仓库 `src/magi_core`；SQLite schema 版本：`6`  
+> 适用代码：当前仓库 `src/magi_core`；SQLite schema 版本：`10`
 > 本文描述初始化完成后的实际 schema，包括迁移 DDL 之外由 `SQLiteBackend.initialize()` 自动补齐的字段。
 
 ## 1. 存储职责与数据流
 
 MAGI Memo 使用两层存储，二者不是双主模型：
 
-- **SQLite 是记忆事实、证据、身份、演化和投影任务的权威数据源（source of truth）**。
-- **Neo4j 是面向 LightRAG 查询的可重建检索投影**。节点和边的描述由 SQLite 中当前有效的 Atom 汇总生成。
+- **SQLite 是记忆事实、证据、身份、演化和投影任务的权威数据源（source of truth）**，也保存 Dreaming 的运行账本与历史派生快照。
+- **Neo4j 是面向 LightRAG 查询的可重建检索投影**。节点和边的描述由 SQLite 中当前有效的 Atom 汇总生成；当前 Dreaming 社区归属与报告也作为派生服务投影保存在图中。
 - 实体/关系向量库仍沿用 LightRAG；`memory_embeddings` 则是 MAGI 自己用于实体消歧与 Atom 判定的本地向量表，两者用途不同。
 
 核心管线如下：
@@ -46,6 +46,8 @@ MAGI Memo 使用两层存储，二者不是双主模型：
 ```
 
 删除 Episode 时，系统先写 `memory_deletion_backups`，再撤销证据、清理失去证据的 Atom 和孤立 owner，并通过 outbox 删除或重建投影。恢复操作从备份回灌 SQLite 后再次投影。
+
+Dreaming 不进入上述严格事实提交事务。它从 Neo4j 当前语义图计算社区，在 SQLite 准备一份完整快照，原子替换 Neo4j 当前社区投影后再将快照标记 published；社区报告始终是派生信息，不是 Atom/Evidence 事实源。
 
 ## 2. 通用约定
 
@@ -92,6 +94,10 @@ MAGI Memo 使用两层存储，二者不是双主模型：
 | `workspace_settings` | 兼容性护栏 | 保存 workspace 级运行模式。 |
 | `memory_deletion_backups` | 可恢复删除 | 保存 Episode 删除前快照。 |
 | `owner_summary_checkpoints` | 摘要状态 | 保存增量摘要 checkpoint、覆盖集合和指标。 |
+| `dreaming_runs` | 离线作业账本 | 保存 Dreaming 状态、阶段、参数、规模、成本与错误。 |
+| `dreaming_snapshots` | 派生快照 | 保存一次完整社区分区的算法元数据与发布状态。 |
+| `dreaming_memberships` | 派生快照 | 保存快照内实体到社区的稳定归属。 |
+| `dreaming_community_reports` | 派生摘要 | 保存社区名称、报告、规模和模型调用成本。 |
 
 ## 4. SQLite 字段手册
 
@@ -99,7 +105,7 @@ MAGI Memo 使用两层存储，二者不是双主模型：
 
 | 字段 | 类型/约束 | 含义与功能 |
 |---|---|---|
-| `version` | `INTEGER PRIMARY KEY` | 已成功应用的迁移版本；当前最高为 `6`。 |
+| `version` | `INTEGER PRIMARY KEY` | 已成功应用的迁移版本；当前最高为 `10`。 |
 | `applied_at` | `TEXT NOT NULL` | 该版本首次登记的 UTC 时间。 |
 
 初始化会重复执行幂等 DDL，并通过 `_ensure_column` 修复某些历史构建遗漏的增量列，因此判断实际 schema 不应只看本表版本。
@@ -363,6 +369,62 @@ Atom/owner 变化与 outbox 排队在同一 SQLite 事务中提交。worker 先�
 
 摘要 checkpoint 只是派生状态，不是 evidence。该表只存在于 SQLite，不再向 Neo4j 写任何 `magi_summary_*` 属性。
 
+### 4.15 `dreaming_runs`
+
+| 字段 | 类型/约束 | 含义与功能 |
+|---|---|---|
+| `run_id` | `TEXT PRIMARY KEY` | 一次 Dreaming 作业 ID。 |
+| `workspace_id` | `TEXT NOT NULL` | workspace 隔离键；部分唯一索引保证每个 workspace 最多一个 running run。 |
+| `status` | `TEXT NOT NULL` | `running`、`succeeded` 或 `failed`。 |
+| `phase` | `TEXT NOT NULL` | `queued`、`projecting`、`reporting`、`staging`、`publishing`、`complete` 或 `failed`。 |
+| `config_json` | `TEXT NOT NULL DEFAULT '{}'` | Leiden 的 seed、gamma、theta、max levels 和 concurrency。 |
+| `snapshot_id` | `TEXT` | 本次作业准备/发布的快照。 |
+| `node_count` / `relationship_count` / `community_count` | `INTEGER NOT NULL DEFAULT 0` | 输入图规模及过滤 singleton 后的社区数量。 |
+| `report_count` | `INTEGER NOT NULL DEFAULT 0` | 成功生成的社区报告数。 |
+| `prompt_tokens` / `completion_tokens` / `total_tokens` | `INTEGER NOT NULL DEFAULT 0` | 本次作业聚合 token 使用。 |
+| `llm_call_count` | `INTEGER NOT NULL DEFAULT 0` | 报告生成总调用次数，包含校验重试。 |
+| `token_usage_source` | `TEXT` | `provider`、`estimated` 或 `mixed`。 |
+| `error` | `TEXT` | 失败原因，最多保留 4000 字符。 |
+| `created_at` / `started_at` / `finished_at` | `TEXT` | UTC 作业生命周期时间。 |
+
+初始化时遗留的 `running` 作业会被标记为因进程重启而失败，避免永久占据唯一运行槽。
+
+### 4.16 `dreaming_snapshots`
+
+| 字段 | 类型/约束 | 含义与功能 |
+|---|---|---|
+| `snapshot_id` | `TEXT PRIMARY KEY` | 完整社区快照 ID。 |
+| `workspace_id` | `TEXT NOT NULL` | workspace 隔离键。 |
+| `run_id` | `TEXT NOT NULL UNIQUE`，外键 | 产生该快照的 Dreaming run。 |
+| `status` | `TEXT NOT NULL` | `prepared`、`published` 或 `failed`。读取当前分区时只选择 published。 |
+| `algorithm` / `algorithm_version` | `TEXT` | 当前为 `leiden` 及实际 GDS 版本。 |
+| `config_json` | `TEXT NOT NULL DEFAULT '{}'` | 本次算法配置。 |
+| 图规模、社区数、报告数及 token 字段 | 数值 | 与对应 run 一致的快照级审计指标。 |
+| `created_at` / `published_at` | `TEXT` | 准备和最终发布的 UTC 时间。 |
+
+### 4.17 `dreaming_memberships`
+
+| 字段 | 类型/约束 | 含义与功能 |
+|---|---|---|
+| `snapshot_id` | `TEXT`，联合主键/外键 | 所属完整快照，删除快照时级联删除。 |
+| `entity_id` | `TEXT`，联合主键 | Neo4j 语义实体的 `entity_id`。 |
+| `community_id` | `TEXT NOT NULL` | 由完整成员集合哈希得到的稳定社区 ID。 |
+| `membership_status` | `TEXT NOT NULL DEFAULT 'stable'` | 全量快照当前只写 `stable`；在线 provisional 不回写历史快照。 |
+
+单节点分区不会写入本表。
+
+### 4.18 `dreaming_community_reports`
+
+| 字段 | 类型/约束 | 含义与功能 |
+|---|---|---|
+| `snapshot_id` / `community_id` | `TEXT`，联合主键 | 报告所属快照和社区。 |
+| `community_name` | `TEXT NOT NULL` | `dream` 角色模型生成的简短主题名。 |
+| `report` | `TEXT NOT NULL` | 基于社区实体与内部关系生成的综合报告。 |
+| `member_count` | `INTEGER NOT NULL DEFAULT 0` | 社区完整成员数量。 |
+| token 与调用字段 | 数值/文本 | 该社区报告的 prompt、completion、total、调用数及 usage 来源。 |
+
+该表由 migration 10 引入。读取旧快照而 SQLite 尚无报告时，API 可以从 Neo4j 当前 `DreamCommunity` 节点回填，兼容早期 Neo4j-only 报告。
+
 ## 5. SQLite 索引与约束
 
 ### 5.1 显式索引
@@ -448,7 +510,23 @@ Atom/owner 变化与 outbox 排队在同一 SQLite 事务中提交。worker 先�
 
 `description`、`source_id`、`file_path` 等字段不是新增 schema，但其内容现在由 SQLite Atom/Evidence 管线驱动，而不再只是对 chunk 抽取描述做直接合并。
 
-### 6.4 明确不会写入 Neo4j 的内部字段
+### 6.4 Dreaming 派生投影
+
+全量 Dreaming 发布时会在一个 Neo4j 事务内先清除旧归属，再写入当前快照：
+
+| 实体节点属性 | 含义 |
+|---|---|
+| `dream_community_id` | 当前稳定或临时社区 ID。 |
+| `dream_community_name` | 当前社区报告生成的名称。 |
+| `dream_membership_status` | 全量发布为 `stable`；新节点最近社区归属为 `provisional`。 |
+| `dream_snapshot_id` | 归属所基于的已发布快照。 |
+| `dream_published_at` | 全量归属发布时间；provisional 节点可不含该字段。 |
+
+同一事务还会替换 workspace 的 `DreamCommunity` 节点。这些节点保存 `workspace_id`、`snapshot_id`、`community_id`、`community_name`、`report`、`member_count` 及 token/call 指标。它们是当前查询投影，不构成新的语义事实节点，也不连接进 `DIRECTED` 实体关系网。
+
+普通 `/graphs` 响应默认把上述内部字段收敛为 `community_id` 与 `community_name`；Balthasar 内部视图可显式请求完整 Dreaming 属性。
+
+### 6.5 明确不会写入 Neo4j 的内部字段
 
 以下字段曾用于实验、调试或管线内部状态，当前均不应出现在新投影中：
 
@@ -497,6 +575,9 @@ RETURN type(r), ks;
 | 删除 | Episode、Evidence、相关 owner/Atom | deletion backup、SQLite 清理、outbox 删除/重建任务 |
 | 恢复 | deletion backup | 回灌 SQLite、`restored_at`、outbox 重建任务 |
 | 查询 | Neo4j + LightRAG VDB | 通常只读；`atom_ids` 可回溯 SQLite 事实和证据 |
+| Dreaming 聚类/报告 | Neo4j 当前实体关系图 | GDS 临时图；SQLite run、prepared snapshot、memberships、reports |
+| Dreaming 发布 | SQLite prepared/上一份 published 快照 | Neo4j 当前归属与 `DreamCommunity`；SQLite snapshot published/run succeeded |
+| 新节点临时归属 | Neo4j 1–3 跳已归属邻居 | Neo4j 节点 `provisional` 属性；不改 SQLite 历史快照 |
 
 ## 8. 运维与排障原则
 
@@ -507,6 +588,8 @@ RETURN type(r), ks;
 5. **`invalid_at` 与 `expired_at` 含义不同。** 前者描述事实在现实世界何时失效，后者描述系统何时将该 Atom 淘汰/替代。
 6. **检查图谱血缘时以 `atom_ids` 为入口。** Atom 内容、时间状态和引用证据都应回 SQLite 查询。
 7. **模型漏给实体 schema 不应导致关系丢失。** 当前管线会为只出现在关系中的端点创建空实体容器，随后走正常实体解析和投影；`magi_endpoint_only` 只用于本轮归一化控制。
+8. **Dreaming 报告不是事实源。** 修正事实应回到 Episode/Atom/Evidence 管线；不要直接把 `DreamCommunity.report` 反写成 Atom。
+9. **不要把 provisional 当全量裁决。** 它只根据 1–3 跳最近已发布社区提供在线视觉连续性，下一次 Leiden 会重新计算。
 
 ## 9. 实现位置
 
@@ -517,3 +600,5 @@ RETURN type(r), ks;
 - 严格提交、摘要 checkpoint、outbox 和 Graph/VDB 投影：`src/magi_core/memory/adapter.py`
 - 抽取归一化、LightRAG 基线实体/关系字段：`src/magi_core/operate.py`
 - Neo4j MERGE 和属性写入：`src/magi_core/kg/neo4j_impl.py`
+- Dreaming 编排、报告校验与补偿发布：`src/magi_core/memory/dreaming.py`
+- Dreaming REST 控制面：`src/magi_core/api/routers/dreaming_routes.py`

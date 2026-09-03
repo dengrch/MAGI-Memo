@@ -1,0 +1,184 @@
+.dream-action-halo {
+  isolation: isolate;
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.dream-action-halo::before {
+  position: absolute;
+  z-index: 0;
+  inset: -7px -9px;
+  border-radius: 15px;
+  background:
+    radial-gradient(ellipse 70% 105% at -5% 48%, rgba(34, 211, 238, 0.42), transparent 74%),
+    radial-gradient(ellipse 78% 72% at 38% -12%, rgba(59, 130, 246, 0.4), transparent 76%),
+    radial-gradient(ellipse 70% 105% at 105% 48%, rgba(99, 102, 241, 0.43), transparent 74%),
+    radial-gradient(ellipse 78% 72% at 62% 112%, rgba(139, 92, 246, 0.4), transparent 76%);
+  content: '';
+  filter: blur(7px);
+  opacity: 0.78;
+  pointer-events: none;
+}
+
+.dream-action-halo::after {
+  position: absolute;
+  z-index: 0;
+  inset: -6px -7px;
+  border-radius: 15px;
+  background: radial-gradient(ellipse at center, rgba(99, 102, 241, 0.16), transparent 78%);
+  content: '';
+  filter: blur(7px);
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.dream-action-halo > * {
+  position: relative;
+  z-index: 1;
+}
+
+.dream-action-halo--wide {
+  display: flex;
+  width: 100%;
+}
+
+.dream-action-halo--wide::before {
+  inset: -4px -3px;
+  background:
+    radial-gradient(ellipse 27% 94% at -1% 50%, rgba(34, 211, 238, 0.34), transparent 78%),
+    radial-gradient(ellipse 32% 72% at 28% -6%, rgba(59, 130, 246, 0.31), transparent 80%),
+    radial-gradient(ellipse 32% 72% at 72% -6%, rgba(99, 102, 241, 0.32), transparent 80%),
+    radial-gradient(ellipse 27% 94% at 101% 50%, rgba(139, 92, 246, 0.34), transparent 78%),
+    radial-gradient(ellipse 33% 72% at 70% 106%, rgba(124, 58, 237, 0.29), transparent 80%),
+    radial-gradient(ellipse 33% 72% at 30% 106%, rgba(37, 99, 235, 0.27), transparent 80%);
+  filter: blur(8px);
+  opacity: 0.58;
+}
+
+.dream-action-halo--wide::after {
+  inset: -4px -2px;
+  filter: blur(8px);
+  opacity: 0.42;
+}
+
+.dark .dream-action-halo::before {
+  opacity: 0.82;
+}
+
+.dream-glass-button {
+  --dream-glass-fill: rgba(255, 255, 255, 0.22);
+  --dream-glass-fill-hover: rgba(255, 255, 255, 0.27);
+  --dream-glass-highlight: rgba(255, 255, 255, 0.36);
+  --dream-glass-shadow: rgba(43, 34, 91, 0.16);
+
+  isolation: isolate;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid transparent;
+  color: rgb(109 40 217);
+  background: var(--dream-glass-fill);
+  box-shadow:
+    inset 0 1px 1px var(--dream-glass-highlight),
+    inset 1px 0 1px rgba(255, 255, 255, 0.14),
+    inset 0 -1px 1px rgba(76, 29, 149, 0.1),
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    0 4px 10px -5px var(--dream-glass-shadow);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
+  transition:
+    color 160ms ease,
+    background-color 160ms ease,
+    box-shadow 180ms ease,
+    transform 160ms cubic-bezier(0.2, 0.75, 0.25, 1);
+}
+
+/* The accent is held behind the icon, so the button still reads as clear glass. */
+.dream-glass-button::after {
+  position: absolute;
+  z-index: -2;
+  inset: 0;
+  background: radial-gradient(circle at 68% 76%, rgba(139, 92, 246, 0.14), transparent 58%);
+  content: '';
+  opacity: 0.65;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.dream-glass-button__content {
+  position: relative;
+  z-index: 1;
+}
+
+.dream-glass-button--compact {
+  border-radius: 9px;
+}
+
+.dream-glass-button--wide {
+  min-height: 2.5rem;
+  border-radius: 10px;
+}
+
+.dark .dream-glass-button {
+  --dream-glass-fill: rgba(255, 255, 255, 0.028);
+  --dream-glass-fill-hover: rgba(255, 255, 255, 0.04);
+  --dream-glass-highlight: rgba(255, 255, 255, 0.065);
+  --dream-glass-shadow: rgba(0, 0, 0, 0.56);
+
+  color: rgb(196 181 253);
+  box-shadow:
+    inset 0 1px 1px var(--dream-glass-highlight),
+    inset 1px 0 1px rgba(255, 255, 255, 0.045),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.18),
+    0 1px 2px rgba(0, 0, 0, 0.28),
+    0 5px 12px -6px var(--dream-glass-shadow);
+}
+
+@media (hover: hover) {
+  .dream-glass-button:not(:disabled):hover {
+    background: var(--dream-glass-fill-hover);
+    box-shadow:
+      inset 0 1px 1px var(--dream-glass-highlight),
+      inset 1px 0 1px rgba(255, 255, 255, 0.14),
+      inset 0 -1px 1px rgba(76, 29, 149, 0.1),
+      0 1px 2px rgba(15, 23, 42, 0.08),
+      0 5px 11px -6px var(--dream-glass-shadow);
+  }
+
+  .dark .dream-glass-button:not(:disabled):hover {
+    box-shadow:
+      inset 0 1px 1px var(--dream-glass-highlight),
+      inset 1px 0 1px rgba(255, 255, 255, 0.045),
+      inset 0 -1px 1px rgba(0, 0, 0, 0.18),
+      0 1px 2px rgba(0, 0, 0, 0.28),
+      0 6px 13px -7px var(--dream-glass-shadow);
+  }
+}
+
+.dream-glass-button:not(:disabled):active {
+  background: var(--dream-glass-fill);
+  box-shadow:
+    inset 0 1px 2px rgba(43, 34, 91, 0.13),
+    0 1px 2px rgba(15, 23, 42, 0.08);
+  transform: translateY(1px) scale(0.985);
+  transition-duration: 70ms;
+}
+
+.dream-glass-button:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--background),
+    0 0 0 4px rgba(139, 92, 246, 0.45),
+    0 4px 10px -5px var(--dream-glass-shadow);
+}
+
+.dream-glass-button:disabled {
+  filter: saturate(0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dream-glass-button,
+  .dream-glass-button::after {
+    transition-duration: 0.01ms;
+  }
+}

@@ -228,6 +228,10 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         label: str = Query(..., description="Label to get knowledge graph for"),
         max_depth: int = Query(3, description="Maximum depth of graph", ge=1),
         max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+        include_dreaming_internal: bool = Query(
+            False,
+            description="Expose BALTHASAR-only membership metadata",
+        ),
     ):
         """
         Retrieve a connected subgraph of nodes where the label includes the specified label.
@@ -249,11 +253,32 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 f"get_knowledge_graph called with label: '{label}' (length: {len(label)}, repr: {repr(label)})"
             )
 
-            return await rag.get_knowledge_graph(
+            graph = await rag.get_knowledge_graph(
                 node_label=label,
                 max_depth=max_depth,
                 max_nodes=max_nodes,
             )
+            if not include_dreaming_internal:
+                for node in graph.nodes:
+                    properties = node.properties
+                    community_id = properties.get(
+                        "dream_community_id", properties.get("community_id")
+                    )
+                    community_name = properties.get(
+                        "dream_community_name", properties.get("community_name")
+                    )
+                    for key in list(properties):
+                        if key.startswith("dream_") or key in {
+                            "community_status",
+                            "communityId",
+                            "membership_status",
+                        }:
+                            properties.pop(key, None)
+                    if community_id:
+                        properties["community_id"] = community_id
+                    if community_name:
+                        properties["community_name"] = community_name
+            return graph
         except Exception as e:
             logger.error(f"Error getting knowledge graph for label '{label}': {str(e)}")
             logger.error(traceback.format_exc())

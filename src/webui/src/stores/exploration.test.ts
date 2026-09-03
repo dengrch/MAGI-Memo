@@ -147,6 +147,8 @@ describe('exploration projection', () => {
     expect(graph.getNodeAttribute('bob', 'owners')).toEqual(['s0'])
     expect(graph.getEdgeAttribute(graph.edge('seed', 'alice')!, 'explorationState')).toBe('visited')
     expect(graph.getEdgeAttribute(graph.edge('alice', 'bob')!, 'explorationState')).toBe('visited')
+    expect(graph.getEdgeAttribute(graph.edge('seed', 'alice')!, 'color')).toBe('#737373')
+    expect(graph.getEdgeAttribute(graph.edge('alice', 'bob')!, 'color')).toBe('#737373')
     expect(graph.size).toBe(2)
   })
 
@@ -180,5 +182,6 @@ describe('exploration projection', () => {
     expect(graph.getNodeAttribute('bob', 'agentColors')).toEqual([])
     expect(graph.getNodeAttribute('bob', 'explorationState')).toBe('candidate')
     expect(graph.getEdgeAttribute(graph.edges()[0]!, 'type')).toBeUndefined()
+    expect(graph.getEdgeAttribute(graph.edges()[0]!, 'color')).toBe('#22D3EE')
   })
 })

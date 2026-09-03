@@ -278,6 +278,282 @@ class MemoryModelsAndSQLiteTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_relation_workbench_view_exposes_endpoints_and_atoms(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                backend = SQLiteBackend(
+                    Path(temporary) / "magi-memory.db", "workspace-a"
+                )
+                await backend.initialize()
+                alice = EntityRecord(
+                    id="entity-alice",
+                    workspace_id="workspace-a",
+                    canonical_name="Alice",
+                )
+                bob = EntityRecord(
+                    id="entity-bob",
+                    workspace_id="workspace-a",
+                    canonical_name="Bob",
+                )
+                await backend.put_entity(alice)
+                await backend.put_entity(bob)
+                episode = Episode(
+                    id="episode-relation", content="Alice collaborates with Bob."
+                )
+                await backend.put_episode(episode)
+                relation = RelationRecord(
+                    id="relation-alice-bob",
+                    workspace_id="workspace-a",
+                    entity_a_id=alice.id,
+                    entity_b_id=bob.id,
+                    entity_a_name=alice.canonical_name,
+                    entity_b_name=bob.canonical_name,
+                    keywords=("collaborates",),
+                )
+                await backend.put_relation(relation)
+                atom = AtomRecord(
+                    id="atom-relation",
+                    workspace_id="workspace-a",
+                    owner_id=relation.id,
+                    content="Alice collaborates with Bob.",
+                    valid_at=datetime.now(timezone.utc),
+                    subject_entity_id=alice.id,
+                    object_entity_id=bob.id,
+                )
+                await backend.put_atom(
+                    atom,
+                    AtomEvidence(atom_id=atom.id, episode_id=episode.id),
+                )
+
+                page = await backend.list_relations(query="collaborates")
+                self.assertEqual(page["total"], 1)
+                self.assertEqual(page["items"][0]["atom_count"], 1)
+                detail = await backend.get_relation_memory_view(relation.id)
+                self.assertEqual(
+                    [endpoint["canonical_name"] for endpoint in detail["endpoints"]],
+                    ["Alice", "Bob"],
+                )
+                self.assertEqual(detail["atoms"][0]["atom_id"], atom.id)
+                await backend.finalize()
+
+        asyncio.run(scenario())
+
+    def test_entity_alias_ambiguity_and_manual_atom_conflict_resolution(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                backend = SQLiteBackend(
+                    Path(temporary) / "magi-memory.db", "workspace-a"
+                )
+                await backend.initialize()
+                episode = Episode(id="episode-conflict", content="Conflicting facts")
+                await backend.put_episode(episode)
+                first_entity = EntityRecord(
+                    id="entity-alice-researcher",
+                    workspace_id="workspace-a",
+                    canonical_name="Alice Chen",
+                    aliases=("Alice",),
+                    entity_type="PERSON",
+                )
+                second_entity = EntityRecord(
+                    id="entity-alice-author",
+                    workspace_id="workspace-a",
+                    canonical_name="Alice Smith",
+                    aliases=("Alice",),
+                    entity_type="PERSON",
+                )
+                await backend.put_entity(first_entity)
+                await backend.put_entity(second_entity)
+                await backend.put_entity(
+                    EntityRecord(
+                        id="entity-aaron",
+                        workspace_id="workspace-a",
+                        canonical_name="Aaron",
+                        entity_type="PERSON",
+                    )
+                )
+                first_atom = AtomRecord(
+                    id="atom-prefers-tea",
+                    workspace_id="workspace-a",
+                    owner_id=first_entity.id,
+                    content="Alice prefers tea.",
+                    valid_at=episode.effective_reference_at,
+                )
+                second_atom = AtomRecord(
+                    id="atom-dislikes-tea",
+                    workspace_id="workspace-a",
+                    owner_id=first_entity.id,
+                    content="Alice dislikes tea.",
+                    valid_at=episode.effective_reference_at,
+                )
+                await backend.put_atom(
+                    first_atom,
+                    AtomEvidence(
+                        atom_id=first_atom.id,
+                        episode_id=episode.id,
+                    ),
+                )
+                await backend.put_atom(
+                    second_atom,
+                    AtomEvidence(
+                        atom_id=second_atom.id,
+                        episode_id=episode.id,
+                    ),
+                )
+                await backend.add_atom_evolution(
+                    second_atom.id,
+                    first_atom.id,
+                    "CONTRADICTION",
+                    metadata={"reason": "overlapping claims"},
+                )
+
+                prioritized_atoms = await backend.list_atoms()
+                self.assertEqual(
+                    prioritized_atoms["items"][0]["unresolved_conflict_count"],
+                    1,
+                )
+                prioritized_entities = await backend.list_entities()
+                self.assertIn(
+                    prioritized_entities["items"][0]["entity_id"],
+                    {first_entity.id, second_entity.id},
+                )
+
+                overview = await backend.memory_overview()
+                self.assertEqual(
+                    overview["time_bounds"]["episode_reference"]["min"],
+                    episode.effective_reference_at.isoformat(),
+                )
+                self.assertEqual(
+                    (
+                        await backend.list_episodes(
+                            reference_to=(
+                                episode.effective_reference_at - timedelta(days=1)
+                            ).isoformat()
+                        )
+                    )["total"],
+                    0,
+                )
+                evolution_page = await backend.list_atoms(evolution_type="any")
+                self.assertEqual(evolution_page["total"], 2)
+                self.assertEqual(evolution_page["items"][0]["evolution_count"], 1)
+                self.assertEqual(
+                    (
+                        await backend.list_atoms(
+                            valid_time_from=(
+                                episode.effective_reference_at + timedelta(days=1)
+                            ).isoformat()
+                        )
+                    )["total"],
+                    0,
+                )
+                earliest_created = min(first_atom.created_at, second_atom.created_at)
+                self.assertEqual(
+                    (
+                        await backend.list_atoms(
+                            system_time_to=(
+                                earliest_created - timedelta(days=1)
+                            ).isoformat()
+                        )
+                    )["total"],
+                    0,
+                )
+
+                entity_page = await backend.list_entities(query="Alice")
+                self.assertEqual(entity_page["total"], 2)
+                researcher = next(
+                    item
+                    for item in entity_page["items"]
+                    if item["entity_id"] == first_entity.id
+                )
+                self.assertEqual(researcher["ambiguity_count"], 1)
+                entity_view = await backend.get_entity_memory_view(first_entity.id)
+                self.assertEqual(entity_view["alias_ambiguities"][0]["alias"], "Alice")
+                self.assertEqual(
+                    entity_view["alias_ambiguities"][0]["candidates"][0][
+                        "entity_id"
+                    ],
+                    second_entity.id,
+                )
+                self.assertEqual(entity_view["atom_count"], 2)
+                resolved_entity = await backend.resolve_entity_alias(
+                    "Alice", first_entity.id
+                )
+                self.assertEqual(resolved_entity["alias_ambiguities"], [])
+                reordered_entities = await backend.list_entities()
+                self.assertEqual(
+                    reordered_entities["items"][0]["entity_id"], "entity-aaron"
+                )
+                losing_entity = await backend.get_entity(second_entity.id)
+                self.assertNotIn("Alice", losing_entity.aliases)
+
+                duplicate_aaron = EntityRecord(
+                    id="entity-aaron-legacy-duplicate",
+                    workspace_id="workspace-a",
+                    canonical_name="Aaron",
+                    aliases=("A. Aaron",),
+                    entity_type="PERSON",
+                )
+                await backend.put_entity(duplicate_aaron)
+                duplicate_atom = AtomRecord(
+                    id="atom-aaron-legacy-duplicate",
+                    workspace_id="workspace-a",
+                    owner_id=duplicate_aaron.id,
+                    content="Aaron has a legacy duplicate record.",
+                    valid_at=episode.effective_reference_at,
+                )
+                await backend.put_atom(
+                    duplicate_atom,
+                    AtomEvidence(
+                        atom_id=duplicate_atom.id,
+                        episode_id=episode.id,
+                    ),
+                )
+                merged_aaron = await backend.resolve_entity_alias(
+                    "Aaron", "entity-aaron"
+                )
+                self.assertEqual(merged_aaron["alias_ambiguities"], [])
+                self.assertEqual(merged_aaron["atom_count"], 1)
+                migrated_atom = await backend.get_atom(duplicate_atom.id)
+                self.assertEqual(migrated_atom.owner_id, "entity-aaron")
+                expired_duplicate = await backend.get_entity(duplicate_aaron.id)
+                self.assertIsNotNone(expired_duplicate.expired_at)
+
+                atom_view = await backend.get_atom_memory_view(second_atom.id)
+                self.assertEqual(atom_view["evolutions"][0]["relation_type"], "CONTRADICTION")
+                self.assertFalse(atom_view["evolutions"][0]["resolved"])
+                self.assertEqual(
+                    atom_view["evolutions"][0]["related_atom"]["atom_id"],
+                    first_atom.id,
+                )
+
+                resolution = await backend.resolve_atom_conflict(
+                    second_atom.id,
+                    first_atom.id,
+                    second_atom.id,
+                    note="Operator retained the newer evidence.",
+                )
+                self.assertEqual(resolution["winner_atom_id"], second_atom.id)
+                self.assertEqual(resolution["retired_atom_id"], first_atom.id)
+                retired = await backend.get_atom(first_atom.id)
+                self.assertIsNotNone(retired.expired_at)
+                resolved_view = await backend.get_atom_memory_view(second_atom.id)
+                evolution = resolved_view["evolutions"][0]
+                self.assertTrue(evolution["resolved"])
+                self.assertEqual(evolution["metadata"]["winner_atom_id"], second_atom.id)
+                self.assertEqual(
+                    evolution["metadata"]["resolution_note"],
+                    "Operator retained the newer evidence.",
+                )
+                reordered_atoms = await backend.list_atoms()
+                self.assertTrue(
+                    all(
+                        item["unresolved_conflict_count"] == 0
+                        for item in reordered_atoms["items"]
+                    )
+                )
+                await backend.finalize()
+
+        asyncio.run(scenario())
+
     def test_same_episode_chunk_evidence_has_stable_distinct_identity(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as temporary:

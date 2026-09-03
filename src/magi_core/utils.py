@@ -413,6 +413,7 @@ class LightragPathFilter(logging.Filter):
             "/webui/",
             "/documents/pipeline_status",
             "/runtime/logs",
+            "/dreaming/status",
         ]
         self.filtered_path_prefixes = [
             # Balthasar polls both the trace collection and per-trace event

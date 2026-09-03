@@ -198,11 +198,11 @@ export const ChatMessage = ({
     <div
       className={`${
         message.role === 'user'
-          ? 'max-w-[80%] bg-primary text-primary-foreground'
+          ? 'max-w-[78%] border border-violet-300/20 bg-violet-500/65 text-primary-foreground shadow-[inset_0_1px_rgba(255,255,255,0.09),0_8px_20px_-16px_rgba(76,29,149,0.9)] backdrop-blur-lg'
           : message.isError
-            ? 'w-[95%] bg-red-100 text-red-600 dark:bg-red-950 dark:text-red-400'
-            : 'w-[95%] bg-muted'
-      } rounded-lg px-4 py-2`}
+            ? 'w-[95%] border border-red-400/25 bg-red-500/10 text-red-600 dark:text-red-400'
+            : 'w-[95%] border border-border/55 bg-background/24 shadow-[inset_0_1px_rgba(255,255,255,0.035),0_10px_28px_-22px_rgba(0,0,0,0.75)] backdrop-blur-lg'
+      } rounded-xl px-4 py-3`}
     >
       {/* Before any answer text: the timing row sits on top and the thinking
           hint appears beneath it, so the time doesn't jump when "Thinking..."

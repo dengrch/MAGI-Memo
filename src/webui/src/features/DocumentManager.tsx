@@ -1369,13 +1369,16 @@ export default function DocumentManager() {
   ]);
 
   return (
-    <Card className="!rounded-none !overflow-hidden flex flex-col h-full min-h-0">
-      <CardHeader className="py-2 px-6">
-        <CardTitle className="text-lg">{t('documentPanel.documentManager.title')}</CardTitle>
+    <Card className="magi-memory-document-manager !overflow-hidden flex h-full min-h-0 flex-col !rounded-none border-0 bg-transparent shadow-none">
+      <CardHeader className="flex-none border-b px-5 py-4">
+        <CardTitle className="text-base font-semibold">{t('documentPanel.documentManager.title')}</CardTitle>
+        <CardDescription className="text-xs">
+          {t('documentPanel.documentManager.uploadedDescription')}
+        </CardDescription>
       </CardHeader>
-      <CardContent className="flex-1 flex flex-col min-h-0 overflow-auto">
-        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap gap-2">
+      <CardContent className="magi-memory-document-scroll flex min-h-0 flex-1 flex-col overflow-auto px-5 pt-4 pb-5">
+        <div className="magi-memory-queue-toolbar mb-2 grid min-h-8 flex-none grid-cols-[minmax(max-content,1fr)_13rem_minmax(max-content,1fr)] items-center gap-2 overflow-x-auto">
+          <div className="flex flex-nowrap justify-start gap-2">
             <Button
               variant="outline"
               onClick={scanDocuments}
@@ -1400,20 +1403,22 @@ export default function DocumentManager() {
           </div>
 
           {/* Pagination Controls in the middle */}
-          {pagination.total_pages > 1 && (
-            <PaginationControls
-              currentPage={pagination.page}
-              totalPages={pagination.total_pages}
-              pageSize={pagination.page_size}
-              totalCount={pagination.total_count}
-              onPageChange={handlePageChange}
-              onPageSizeChange={handlePageSizeChange}
-              isLoading={isRefreshing}
-              compact={true}
-            />
-          )}
+          <div className="flex min-h-8 min-w-52 items-center justify-center">
+            {pagination.total_pages > 1 && (
+              <PaginationControls
+                currentPage={pagination.page}
+                totalPages={pagination.total_pages}
+                pageSize={pagination.page_size}
+                totalCount={pagination.total_count}
+                onPageChange={handlePageChange}
+                onPageSizeChange={handlePageSizeChange}
+                isLoading={isRefreshing}
+                compact={true}
+              />
+            )}
+          </div>
 
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-nowrap justify-end gap-2">
             {isSelectionMode && (
               <DeleteDocumentsDialog
                 selectedDocIds={selectedDocIds}
@@ -1451,9 +1456,9 @@ export default function DocumentManager() {
           </div>
         </div>
 
-        <Card className="flex-1 flex flex-col border rounded-md min-h-0 mb-2">
+        <Card className="magi-memory-document-list mb-2 flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl">
           <CardHeader className="flex-none py-2 px-4">
-            <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex min-h-9 flex-nowrap items-center justify-between gap-2 overflow-x-auto">
               <CardTitle>{t('documentPanel.documentManager.uploadedTitle')}</CardTitle>
               <div className="flex flex-wrap items-center gap-2">
                 <div className="flex flex-wrap gap-1" dir={i18n.dir()}>
@@ -1575,11 +1580,11 @@ export default function DocumentManager() {
             )}
             {docs && (
               <div className="absolute inset-0 flex min-h-0 flex-col p-0">
-                <div className="absolute inset-[-1px] flex flex-col p-0 border rounded-md border-gray-200 dark:border-gray-700 overflow-hidden">
+                <div className="magi-memory-table-well absolute inset-[-1px] flex flex-col overflow-hidden rounded-xl border p-0">
                   <TooltipProvider>
                     <Table className="w-full">
-                      <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
-                        <TableRow className="border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/75 shadow-[inset_0_-1px_0_rgba(0,0,0,0.1)]">
+                      <TableHeader className="magi-memory-table-header sticky top-0 z-10">
+                        <TableRow className="border-b bg-transparent shadow-[inset_0_-1px_0_rgba(0,0,0,0.1)]">
                           <TableHead
                             onClick={() => handleSort('id')}
                             className="cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800 select-none"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -133,6 +134,47 @@ class ExplorationOwnersRequest(BaseModel):
     owners: list[ExplorationOwnerRequest] = Field(min_length=1, max_length=200)
 
 
+class AtomConflictResolutionRequest(BaseModel):
+    """Explicit operator choice for one persisted Atom contradiction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_atom_id: str = Field(min_length=1, max_length=200)
+    target_atom_id: str = Field(min_length=1, max_length=200)
+    winner_atom_id: str = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_conflict_pair(self) -> "AtomConflictResolutionRequest":
+        if self.source_atom_id == self.target_atom_id:
+            raise ValueError("conflicting Atom ids must be different")
+        if self.winner_atom_id not in {
+            self.source_atom_id,
+            self.target_atom_id,
+        }:
+            raise ValueError("winner_atom_id must be one of the conflicting Atoms")
+        if self.note is not None:
+            self.note = self.note.strip() or None
+        return self
+
+
+class EntityAliasResolutionRequest(BaseModel):
+    """Explicit operator choice for one ambiguous normalized alias."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(min_length=1, max_length=500)
+    winner_entity_id: str = Field(min_length=1, max_length=200)
+
+    @field_validator("alias", "winner_entity_id")
+    @classmethod
+    def normalize_value(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be empty")
+        return normalized
+
+
 def create_memory_routes(
     rag: Any, memory_db: SQLiteBackend, api_key: Optional[str] = None
 ) -> APIRouter:
@@ -144,6 +186,25 @@ def create_memory_routes(
 
     def explorer() -> MemoryExplorer:
         return MemoryExplorer(rag.chunk_entity_relation_graph, memory_db)
+
+    async def sync_latest_community_reports() -> None:
+        """One-time backfill for snapshots created before SQLite stored reports."""
+
+        latest = await memory_db.get_latest_dreaming_memberships()
+        if latest is None or latest.get("reports"):
+            return
+        loader = getattr(
+            rag.chunk_entity_relation_graph,
+            "get_dreaming_community_reports",
+            None,
+        )
+        if not callable(loader):
+            return
+        reports = await loader(latest["snapshot_id"])
+        if reports:
+            await memory_db.store_dreaming_community_reports(
+                latest["snapshot_id"], reports
+            )
 
     async def visit_trace_payload(visit: VisitRequest) -> dict[str, Any]:
         """Enrich identity-only visit state for visualization replay."""
@@ -188,6 +249,8 @@ def create_memory_routes(
         status: Literal["pending", "indexed", "failed"] | None = None,
         kind: Literal["document", "conversation", "multimodal_text"] | None = None,
         q: str | None = Query(None, max_length=500),
+        reference_from: datetime | None = None,
+        reference_to: datetime | None = None,
     ):
         try:
             return await memory_db.list_episodes(
@@ -196,6 +259,10 @@ def create_memory_routes(
                 status=status,
                 kind=kind,
                 query=q,
+                reference_from=(
+                    reference_from.isoformat() if reference_from else None
+                ),
+                reference_to=reference_to.isoformat() if reference_to else None,
             )
         except Exception as exc:
             logger.error("Failed to list Episodes: %s", exc)
@@ -212,6 +279,99 @@ def create_memory_routes(
             raise HTTPException(status_code=404, detail="Episode not found")
         return result
 
+    @router.get("/entities", dependencies=protected)
+    async def list_entities(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        q: str | None = Query(None, max_length=500),
+    ):
+        try:
+            return await memory_db.list_entities(
+                page=page,
+                page_size=page_size,
+                query=q,
+            )
+        except Exception as exc:
+            logger.error("Failed to list memory entities: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.get("/entities/{entity_id}", dependencies=protected)
+    async def get_entity(entity_id: str):
+        try:
+            result = await memory_db.get_entity_memory_view(entity_id)
+        except Exception as exc:
+            logger.error("Failed to read memory entity %s: %s", entity_id, exc)
+            raise internal_server_error(exc)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        return result
+
+    @router.post("/entities/aliases/resolve", dependencies=protected)
+    async def resolve_entity_alias(payload: EntityAliasResolutionRequest):
+        try:
+            return await memory_db.resolve_entity_alias(
+                payload.alias, payload.winner_entity_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to resolve entity alias %s: %s", payload.alias, exc)
+            raise internal_server_error(exc)
+
+    @router.get("/relations", dependencies=protected)
+    async def list_relations(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        q: str | None = Query(None, max_length=500),
+    ):
+        try:
+            return await memory_db.list_relations(
+                page=page, page_size=page_size, query=q
+            )
+        except Exception as exc:
+            logger.error("Failed to list memory relations: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.get("/relations/{relation_id}", dependencies=protected)
+    async def get_relation(relation_id: str):
+        try:
+            result = await memory_db.get_relation_memory_view(relation_id)
+        except Exception as exc:
+            logger.error("Failed to read memory relation %s: %s", relation_id, exc)
+            raise internal_server_error(exc)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Relation not found")
+        return result
+
+    @router.get("/communities", dependencies=protected)
+    async def list_communities(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        q: str | None = Query(None, max_length=500),
+    ):
+        try:
+            await sync_latest_community_reports()
+            return await memory_db.list_communities(
+                page=page, page_size=page_size, query=q
+            )
+        except Exception as exc:
+            logger.error("Failed to list memory communities: %s", exc)
+            raise internal_server_error(exc)
+
+    @router.get("/communities/{community_id}", dependencies=protected)
+    async def get_community(community_id: str):
+        try:
+            await sync_latest_community_reports()
+            result = await memory_db.get_community_memory_view(community_id)
+        except Exception as exc:
+            logger.error("Failed to read memory community %s: %s", community_id, exc)
+            raise internal_server_error(exc)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Community not found")
+        return result
+
     @router.get("/atoms", dependencies=protected)
     async def list_atoms(
         page: int = Query(1, ge=1),
@@ -221,6 +381,14 @@ def create_memory_routes(
         | None = None,
         q: str | None = Query(None, max_length=500),
         episode_id: str | None = Query(None, max_length=200),
+        evolution_type: Literal[
+            "any", "REFINEMENT", "TEMPORAL_SUCCESSOR", "CONTRADICTION"
+        ]
+        | None = None,
+        valid_time_from: datetime | None = None,
+        valid_time_to: datetime | None = None,
+        system_time_from: datetime | None = None,
+        system_time_to: datetime | None = None,
     ):
         try:
             return await memory_db.list_atoms(
@@ -230,6 +398,15 @@ def create_memory_routes(
                 temporal_status=temporal_status,
                 query=q,
                 episode_id=episode_id,
+                evolution_type=evolution_type,
+                valid_time_from=(
+                    valid_time_from.isoformat() if valid_time_from else None
+                ),
+                valid_time_to=valid_time_to.isoformat() if valid_time_to else None,
+                system_time_from=(
+                    system_time_from.isoformat() if system_time_from else None
+                ),
+                system_time_to=system_time_to.isoformat() if system_time_to else None,
             )
         except Exception as exc:
             logger.error("Failed to list Atoms: %s", exc)
@@ -245,6 +422,23 @@ def create_memory_routes(
         if result is None:
             raise HTTPException(status_code=404, detail="Atom not found")
         return result
+
+    @router.post("/atoms/conflicts/resolve", dependencies=protected)
+    async def resolve_atom_conflict(request: AtomConflictResolutionRequest):
+        try:
+            return await memory_db.resolve_atom_conflict(
+                request.source_atom_id,
+                request.target_atom_id,
+                request.winner_atom_id,
+                note=request.note,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Failed to resolve Atom conflict: %s", exc)
+            raise internal_server_error(exc)
 
     @router.post("/explore/expand", dependencies=protected)
     async def expand_memory(request: ExpandRequest):

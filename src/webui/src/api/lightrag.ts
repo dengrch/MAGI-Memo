@@ -36,7 +36,18 @@ export type MemoryOverview = {
   evidence: number
   entities: number
   relations: number
+  communities: number
   projection_outbox: Record<string, number>
+  time_bounds: {
+    episode_reference: MemoryTimeBounds
+    atom_validity: MemoryTimeBounds
+    atom_system: MemoryTimeBounds
+  }
+}
+
+export type MemoryTimeBounds = {
+  min?: string | null
+  max?: string | null
 }
 
 export type ExplorationTraceSummary = {
@@ -138,9 +149,95 @@ export type MemoryAtom = {
   importance?: number | null
   support_count: number
   evidence_count?: number
+  evolution_count?: number
+  unresolved_conflict_count?: number
   relation_keywords: string[]
   quote?: string | null
   evidence?: AtomEvidenceView[]
+  evolutions?: MemoryAtomEvolution[]
+}
+
+export type MemoryAtomEvolution = {
+  source_atom_id: string
+  target_atom_id: string
+  relation_type: 'REFINEMENT' | 'TEMPORAL_SUCCESSOR' | 'CONTRADICTION' | string
+  created_at: string
+  direction: 'incoming' | 'outgoing'
+  resolved: boolean
+  metadata: {
+    resolved_at?: string
+    resolution?: string
+    winner_atom_id?: string
+    retired_atom_id?: string
+    resolution_note?: string
+    [key: string]: unknown
+  }
+  related_atom: Pick<
+    MemoryAtom,
+    'atom_id' | 'content' | 'valid_at' | 'invalid_at' | 'expired_at' | 'temporal_status'
+  >
+}
+
+export type MemoryEntityAliasAmbiguity = {
+  alias: string
+  normalized_alias: string
+  candidates: Array<{
+    entity_id: string
+    canonical_name: string
+    entity_type?: string | null
+  }>
+}
+
+export type MemoryEntity = {
+  entity_id: string
+  canonical_name: string
+  normalized_name?: string | null
+  entity_type?: string | null
+  aliases: string[]
+  revision: number
+  created_at: string
+  expired_at?: string | null
+  atom_count: number
+  alias_count?: number
+  ambiguity_count?: number
+  alias_ambiguities?: MemoryEntityAliasAmbiguity[]
+  atoms?: MemoryAtom[]
+}
+
+export type MemoryRelation = {
+  relation_id: string
+  entity_a_id: string
+  entity_b_id: string
+  entity_a_name: string
+  entity_b_name: string
+  keywords: string[]
+  revision: number
+  created_at: string
+  expired_at?: string | null
+  atom_count: number
+  atoms?: MemoryAtom[]
+  endpoints?: Array<{
+    entity_id: string
+    canonical_name: string
+    entity_type?: string | null
+  }>
+}
+
+export type MemoryCommunity = {
+  community_id: string
+  community_name: string
+  report?: string | null
+  member_count: number
+  snapshot_id: string
+  published_at: string
+  members?: Array<{
+    membership_key: string
+    entity_id?: string | null
+    canonical_name?: string | null
+    entity_type?: string | null
+    membership_status: string
+    resolved: boolean
+  }>
 }
 
 export type MemoryPage<T> = {
@@ -209,6 +306,91 @@ export type LightragRoleLLMConfig = {
   timeout?: number
   has_model_kwargs?: boolean
   metadata?: Record<string, any>
+}
+
+export type RuntimeLLMSettings = {
+  scope: 'runtime'
+  restart_required: false
+  bindings: string[]
+  roles: Record<string, LightragRoleLLMConfig>
+}
+
+export type DreamingRun = {
+  run_id: string
+  workspace_id: string
+  status: 'running' | 'succeeded' | 'failed'
+  phase: 'queued' | 'projecting' | 'reporting' | 'staging' | 'publishing' | 'complete' | 'failed'
+  snapshot_id?: string | null
+  node_count: number
+  relationship_count: number
+  community_count: number
+  report_count?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  llm_call_count?: number
+  token_usage_source?: string | null
+  error?: string | null
+  created_at: string
+  started_at: string
+  finished_at?: string | null
+}
+
+export type DreamingSnapshot = {
+  snapshot_id: string
+  workspace_id: string
+  run_id: string
+  status: 'published'
+  algorithm: string
+  algorithm_version?: string | null
+  node_count: number
+  relationship_count: number
+  community_count: number
+  report_count?: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  llm_call_count?: number
+  token_usage_source?: string | null
+  created_at: string
+  published_at: string
+}
+
+export type DreamingStatus = {
+  workspace_id: string
+  active_run: DreamingRun | null
+  latest_run: DreamingRun | null
+  latest_snapshot: DreamingSnapshot | null
+}
+
+export type DreamingCommunityReport = {
+  community_id: string
+  community_name: string
+  report: string
+  member_count: number
+  snapshot_id: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  llm_call_count?: number
+  token_usage_source?: 'provider' | 'estimated' | 'mixed'
+}
+
+export type RuntimeLLMRoleUpdate = {
+  binding?: string
+  model?: string
+  host?: string
+  api_key?: string
+  max_async?: number
+  timeout?: number
+}
+
+export type RuntimeModelDiscovery = {
+  role: string
+  binding: string
+  supported: boolean
+  models: string[]
+  message?: string | null
 }
 
 export type LightragStatus = {
@@ -688,9 +870,12 @@ axiosInstance.interceptors.response.use(
 export const queryGraphs = async (
   label: string,
   maxDepth: number,
-  maxNodes: number
+  maxNodes: number,
+  includeDreamingInternal = false
 ): Promise<LightragGraphType> => {
-  const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
+  const response = await axiosInstance.get(
+    `/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}&include_dreaming_internal=${includeDreamingInternal}`
+  )
   return response.data
 }
 
@@ -1452,6 +1637,8 @@ export const getMemoryEpisodes = async (params: {
   status?: string
   kind?: string
   q?: string
+  reference_from?: string
+  reference_to?: string
 } = {}): Promise<MemoryPage<MemoryEpisode>> => {
   const response = await axiosInstance.get('/memory/episodes', { params })
   return response.data
@@ -1469,6 +1656,11 @@ export const getMemoryAtoms = async (params: {
   temporal_status?: 'pending' | 'active' | 'invalid' | 'expired'
   q?: string
   episode_id?: string
+  evolution_type?: 'any' | 'REFINEMENT' | 'TEMPORAL_SUCCESSOR' | 'CONTRADICTION'
+  valid_time_from?: string
+  valid_time_to?: string
+  system_time_from?: string
+  system_time_to?: string
 } = {}): Promise<MemoryPage<MemoryAtom>> => {
   const response = await axiosInstance.get('/memory/atoms', { params })
   return response.data
@@ -1476,6 +1668,74 @@ export const getMemoryAtoms = async (params: {
 
 export const getMemoryAtom = async (atomId: string): Promise<MemoryAtom> => {
   const response = await axiosInstance.get(`/memory/atoms/${encodeURIComponent(atomId)}`)
+  return response.data
+}
+
+export const getMemoryEntities = async (params: {
+  page?: number
+  page_size?: number
+  q?: string
+} = {}): Promise<MemoryPage<MemoryEntity>> => {
+  const response = await axiosInstance.get('/memory/entities', { params })
+  return response.data
+}
+
+export const getMemoryEntity = async (entityId: string): Promise<MemoryEntity> => {
+  const response = await axiosInstance.get(`/memory/entities/${encodeURIComponent(entityId)}`)
+  return response.data
+}
+
+export const resolveMemoryEntityAlias = async (request: {
+  alias: string
+  winner_entity_id: string
+}): Promise<MemoryEntity> => {
+  const response = await axiosInstance.post('/memory/entities/aliases/resolve', request)
+  return response.data
+}
+
+export const getMemoryRelations = async (params: {
+  page?: number
+  page_size?: number
+  q?: string
+} = {}): Promise<MemoryPage<MemoryRelation>> => {
+  const response = await axiosInstance.get('/memory/relations', { params })
+  return response.data
+}
+
+export const getMemoryRelation = async (relationId: string): Promise<MemoryRelation> => {
+  const response = await axiosInstance.get(`/memory/relations/${encodeURIComponent(relationId)}`)
+  return response.data
+}
+
+export const getMemoryCommunities = async (params: {
+  page?: number
+  page_size?: number
+  q?: string
+} = {}): Promise<MemoryPage<MemoryCommunity>> => {
+  const response = await axiosInstance.get('/memory/communities', { params })
+  return response.data
+}
+
+export const getMemoryCommunity = async (communityId: string): Promise<MemoryCommunity> => {
+  const response = await axiosInstance.get(`/memory/communities/${encodeURIComponent(communityId)}`)
+  return response.data
+}
+
+export const resolveMemoryAtomConflict = async (request: {
+  source_atom_id: string
+  target_atom_id: string
+  winner_atom_id: string
+  note?: string
+}): Promise<{
+  source_atom_id: string
+  target_atom_id: string
+  winner_atom_id: string
+  retired_atom_id: string
+  resolved_at: string
+  winner_atom: MemoryAtom
+  retired_atom: MemoryAtom
+}> => {
+  const response = await axiosInstance.post('/memory/atoms/conflicts/resolve', request)
   return response.data
 }
 
@@ -1521,5 +1781,46 @@ export const deleteRuntimeWorkspace = async (
 
 export const getRuntimeLogs = async (limit = 6): Promise<RuntimeLogList> => {
   const response = await axiosInstance.get('/runtime/logs', { params: { limit } })
+  return response.data
+}
+
+export const getRuntimeLLMSettings = async (): Promise<RuntimeLLMSettings> => {
+  const response = await axiosInstance.get('/runtime/llm')
+  return response.data
+}
+
+export const updateRuntimeLLMRole = async (
+  role: string,
+  input: RuntimeLLMRoleUpdate
+): Promise<{ role: string; config: LightragRoleLLMConfig; scope: 'runtime' }> => {
+  const response = await axiosInstance.patch(
+    `/runtime/llm/${encodeURIComponent(role)}`,
+    input
+  )
+  return response.data
+}
+
+export const discoverRuntimeLLMModels = async (input: {
+  role: string
+  binding?: string
+  host?: string
+  api_key?: string
+}): Promise<RuntimeModelDiscovery> => {
+  const response = await axiosInstance.post('/runtime/llm/models', input)
+  return response.data
+}
+
+export const getDreamingStatus = async (): Promise<DreamingStatus> => {
+  const response = await axiosInstance.get('/dreaming/status')
+  return response.data
+}
+
+export const getDreamingCommunityReports = async (): Promise<DreamingCommunityReport[]> => {
+  const response = await axiosInstance.get('/dreaming/communities')
+  return response.data.items
+}
+
+export const startDreamingRun = async (): Promise<DreamingRun> => {
+  const response = await axiosInstance.post('/dreaming/runs', {})
   return response.data
 }

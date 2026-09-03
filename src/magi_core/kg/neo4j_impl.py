@@ -1,5 +1,6 @@
 import os
 import re
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -1216,6 +1217,9 @@ class Neo4JStorage(BaseGraphStorage):
                     await result.consume()
 
                 await session.execute_write(execute_batch)
+            await self._assign_provisional_communities(
+                list({node_id for src, tgt, _ in edges for node_id in (src, tgt)})
+            )
         except Exception as e:
             logger.error(f"[{self.workspace}] Error during batch edge upsert: {str(e)}")
             raise
@@ -1277,9 +1281,56 @@ class Neo4JStorage(BaseGraphStorage):
                         await result.consume()  # Ensure result is consumed
 
                 await session.execute_write(execute_upsert)
+            await self._assign_provisional_communities(
+                [source_node_id, target_node_id]
+            )
         except Exception as e:
             logger.error(f"[{self.workspace}] Error during edge upsert: {str(e)}")
             raise
+
+    async def _assign_provisional_communities(self, node_ids: list[str]) -> None:
+        """Attach only unassigned nodes to their nearest published community."""
+
+        if not node_ids:
+            return
+        workspace_label = self._get_workspace_label()
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                result = await session.run(
+                    f"""
+                    UNWIND $node_ids AS entity_id
+                    MATCH (n:`{workspace_label}` {{entity_id: entity_id}})
+                    WHERE n.dream_community_id IS NULL
+                    CALL {{
+                        WITH n
+                        MATCH path = (n)-[:DIRECTED*1..3]-(neighbor:`{workspace_label}`)
+                        WHERE neighbor.dream_community_id IS NOT NULL
+                        WITH neighbor.dream_community_id AS community_id,
+                             neighbor.dream_community_name AS community_name,
+                             neighbor.dream_snapshot_id AS snapshot_id,
+                             min(length(path)) AS distance,
+                             count(*) AS support
+                        ORDER BY distance ASC, support DESC, community_id ASC
+                        LIMIT 1
+                        RETURN community_id, community_name, snapshot_id
+                    }}
+                    SET n.dream_community_id = community_id,
+                        n.dream_community_name = community_name,
+                        n.dream_membership_status = 'provisional',
+                        n.dream_snapshot_id = snapshot_id
+                    """,
+                    node_ids=list(dict.fromkeys(node_ids)),
+                )
+                await result.consume()
+        except Exception as exc:
+            # Provisional assignment is a derived online convenience. The
+            # strict memory write remains authoritative and must not fail if a
+            # deployment lacks the optional Dreaming properties or traversal.
+            logger.warning(
+                "[%s] Failed to assign provisional Dreaming memberships: %s",
+                self.workspace,
+                exc,
+            )
 
     async def get_knowledge_graph(
         self,
@@ -2043,6 +2094,335 @@ class Neo4JStorage(BaseGraphStorage):
                     f"[{self.workspace}] Fallback search ({'Chinese' if is_chinese else 'Latin'}) for '{query}' returned {len(labels)} results (limit: {limit})"
                 )
                 return labels
+
+    async def compute_leiden_communities(
+        self,
+        *,
+        random_seed: int = 19,
+        gamma: float = 1.0,
+        theta: float = 0.01,
+        max_levels: int = 10,
+        concurrency: int = 4,
+    ) -> dict:
+        """Stream one full-workspace Leiden partition without database writes.
+
+        The temporary named graph is unique per run and is always removed from
+        the GDS catalog.  Publishing is deliberately a separate operation so a
+        projection or algorithm failure cannot damage the current snapshot.
+        """
+
+        if self._driver is None:
+            raise RuntimeError("Neo4j storage is not initialized")
+
+        workspace_label = self._get_workspace_label()
+        raw_workspace_label = self._get_raw_workspace_label()
+        graph_name = f"magi_dream_{uuid4().hex}"
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            stats_result = await session.run(
+                f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IS NOT NULL
+                OPTIONAL MATCH (n)-[r:DIRECTED]-(m:`{workspace_label}`)
+                RETURN count(DISTINCT n) AS node_count,
+                       count(DISTINCT r) AS relationship_count,
+                       collect(DISTINCT n.entity_id) AS entity_ids
+                """
+            )
+            stats = await stats_result.single()
+            await stats_result.consume()
+
+        node_count = int(stats["node_count"] if stats else 0)
+        relationship_count = int(stats["relationship_count"] if stats else 0)
+        entity_ids = sorted(str(value) for value in (stats["entity_ids"] if stats else []))
+        if node_count == 0 or relationship_count == 0:
+            return {
+                "assignments": {
+                    entity_id: index for index, entity_id in enumerate(entity_ids)
+                },
+                "node_count": node_count,
+                "relationship_count": relationship_count,
+                "algorithm_version": None,
+            }
+
+        projected = False
+        gds_version: str | None = None
+        try:
+            async with self._driver.session(database=self._DATABASE) as session:
+                version_result = await session.run("RETURN gds.version() AS version")
+                version_record = await version_result.single()
+                await version_result.consume()
+                gds_version = str(version_record["version"])
+
+                projection_result = await session.run(
+                    """
+                    CALL gds.graph.project(
+                        $graph_name,
+                        $node_label,
+                        {DIRECTED: {
+                            type: 'DIRECTED',
+                            orientation: 'UNDIRECTED',
+                            aggregation: 'SINGLE'
+                        }}
+                    )
+                    YIELD nodeCount, relationshipCount
+                    RETURN nodeCount, relationshipCount
+                    """,
+                    graph_name=graph_name,
+                    node_label=raw_workspace_label,
+                )
+                await projection_result.consume()
+                projected = True
+
+                leiden_result = await session.run(
+                    """
+                    CALL gds.leiden.stream($graph_name, $config)
+                    YIELD nodeId, communityId
+                    RETURN gds.util.asNode(nodeId).entity_id AS entity_id,
+                           communityId
+                    """,
+                    graph_name=graph_name,
+                    config={
+                        "randomSeed": random_seed,
+                        "gamma": gamma,
+                        "theta": theta,
+                        "maxLevels": max_levels,
+                        "concurrency": concurrency,
+                    },
+                )
+                rows = await leiden_result.data()
+                await leiden_result.consume()
+            assignments = {
+                str(row["entity_id"]): int(row["communityId"])
+                for row in rows
+                if row.get("entity_id") is not None
+            }
+            if len(assignments) != node_count:
+                raise RuntimeError(
+                    "GDS Leiden returned an incomplete workspace partition: "
+                    f"expected {node_count} nodes, received {len(assignments)}"
+                )
+            return {
+                "assignments": assignments,
+                "node_count": node_count,
+                "relationship_count": relationship_count,
+                "algorithm_version": gds_version,
+            }
+        finally:
+            if projected:
+                try:
+                    async with self._driver.session(database=self._DATABASE) as session:
+                        drop_result = await session.run(
+                            "CALL gds.graph.drop($graph_name, false) YIELD graphName",
+                            graph_name=graph_name,
+                        )
+                        await drop_result.consume()
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Failed to drop temporary GDS graph %s: %s",
+                        self.workspace,
+                        graph_name,
+                        exc,
+                    )
+
+    async def get_dreaming_community_contexts(
+        self, assignments: dict[str, str]
+    ) -> dict[str, dict]:
+        """Load entity and intra-community relation evidence for reports."""
+
+        if self._driver is None:
+            raise RuntimeError("Neo4j storage is not initialized")
+        contexts: dict[str, dict] = {
+            community_id: {"members": [], "relationships": []}
+            for community_id in sorted(set(assignments.values()))
+        }
+        if not assignments:
+            return contexts
+
+        workspace_label = self._get_workspace_label()
+        entity_ids = list(assignments)
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            node_result = await session.run(
+                f"""
+                MATCH (n:`{workspace_label}`)
+                WHERE n.entity_id IN $entity_ids
+                RETURN n.entity_id AS entity_id,
+                       n.entity_type AS entity_type,
+                       n.description AS description
+                """,
+                entity_ids=entity_ids,
+            )
+            node_rows = await node_result.data()
+            await node_result.consume()
+
+            edge_result = await session.run(
+                f"""
+                MATCH (a:`{workspace_label}`)-[r:DIRECTED]->(b:`{workspace_label}`)
+                WHERE a.entity_id IN $entity_ids AND b.entity_id IN $entity_ids
+                RETURN a.entity_id AS source,
+                       b.entity_id AS target,
+                       r.keywords AS keywords,
+                       r.description AS description
+                """,
+                entity_ids=entity_ids,
+            )
+            edge_rows = await edge_result.data()
+            await edge_result.consume()
+
+        for row in node_rows:
+            entity_id = str(row["entity_id"])
+            community_id = assignments.get(entity_id)
+            if community_id is None:
+                continue
+            contexts[community_id]["members"].append(
+                {
+                    "name": entity_id,
+                    "type": row.get("entity_type"),
+                    "description": row.get("description"),
+                }
+            )
+        for row in edge_rows:
+            source = str(row["source"])
+            target = str(row["target"])
+            community_id = assignments.get(source)
+            if community_id is None or assignments.get(target) != community_id:
+                continue
+            contexts[community_id]["relationships"].append(
+                {
+                    "source": source,
+                    "target": target,
+                    "keywords": row.get("keywords"),
+                    "description": row.get("description"),
+                }
+            )
+        for context in contexts.values():
+            context["members"].sort(key=lambda item: item["name"])
+            context["relationships"].sort(
+                key=lambda item: (item["source"], item["target"])
+            )
+        return contexts
+
+    async def get_dreaming_community_reports(
+        self, snapshot_id: str | None = None
+    ) -> list[dict]:
+        """Return the current Neo4j-resident community reports."""
+
+        if self._driver is None:
+            raise RuntimeError("Neo4j storage is not initialized")
+        query = """
+        MATCH (community:DreamCommunity {workspace_id: $workspace_id})
+        WHERE $snapshot_id IS NULL OR community.snapshot_id = $snapshot_id
+        RETURN community{.*} AS report
+        ORDER BY community.member_count DESC, community.community_id ASC
+        """
+        async with self._driver.session(
+            database=self._DATABASE, default_access_mode="READ"
+        ) as session:
+            result = await session.run(
+                query,
+                workspace_id=self.workspace,
+                snapshot_id=snapshot_id,
+            )
+            rows = await result.data()
+            await result.consume()
+        return [dict(row["report"]) for row in rows]
+
+    async def publish_dreaming_memberships(
+        self,
+        *,
+        snapshot_id: str,
+        assignments: dict[str, str],
+        published_at: str,
+        reports: dict[str, dict] | None = None,
+    ) -> None:
+        """Atomically replace the workspace's currently published partition."""
+
+        if self._driver is None:
+            raise RuntimeError("Neo4j storage is not initialized")
+        workspace_label = self._get_workspace_label()
+        reports = reports or {}
+        rows = [
+            {
+                "entity_id": entity_id,
+                "community_id": community_id,
+                "community_name": reports.get(community_id, {}).get(
+                    "community_name"
+                ),
+            }
+            for entity_id, community_id in assignments.items()
+        ]
+        report_rows = [
+            {
+                "community_id": community_id,
+                **report,
+            }
+            for community_id, report in reports.items()
+        ]
+        async with self._driver.session(database=self._DATABASE) as session:
+
+            async def publish(tx: AsyncManagedTransaction) -> None:
+                clear_result = await tx.run(
+                    f"""
+                    MATCH (n:`{workspace_label}`)
+                    REMOVE n.dream_community_id,
+                           n.dream_community_name,
+                           n.dream_membership_status,
+                           n.dream_snapshot_id,
+                           n.dream_published_at
+                    """
+                )
+                await clear_result.consume()
+                write_result = await tx.run(
+                    f"""
+                    UNWIND $assignments AS assignment
+                    MATCH (n:`{workspace_label}` {{entity_id: assignment.entity_id}})
+                    SET n.dream_community_id = assignment.community_id,
+                        n.dream_community_name = assignment.community_name,
+                        n.dream_membership_status = 'stable',
+                        n.dream_snapshot_id = $snapshot_id,
+                        n.dream_published_at = $published_at
+                    """,
+                    assignments=rows,
+                    snapshot_id=snapshot_id,
+                    published_at=published_at,
+                )
+                await write_result.consume()
+                delete_reports = await tx.run(
+                    """
+                    MATCH (community:DreamCommunity {workspace_id: $workspace_id})
+                    DETACH DELETE community
+                    """,
+                    workspace_id=self.workspace,
+                )
+                await delete_reports.consume()
+                create_reports = await tx.run(
+                    """
+                    UNWIND $reports AS report
+                    CREATE (community:DreamCommunity)
+                    SET community.workspace_id = $workspace_id,
+                        community.snapshot_id = $snapshot_id,
+                        community.community_id = report.community_id,
+                        community.community_name = report.community_name,
+                        community.report = report.report,
+                        community.member_count = report.member_count,
+                        community.prompt_tokens = report.prompt_tokens,
+                        community.completion_tokens = report.completion_tokens,
+                        community.total_tokens = report.total_tokens,
+                        community.llm_call_count = report.llm_call_count,
+                        community.token_usage_source = report.token_usage_source,
+                        community.published_at = $published_at
+                    """,
+                    reports=report_rows,
+                    workspace_id=self.workspace,
+                    snapshot_id=snapshot_id,
+                    published_at=published_at,
+                )
+                await create_reports.consume()
+
+            await session.execute_write(publish)
 
     async def drop(self) -> dict[str, str]:
         """Drop all data from current workspace storage and clean up resources

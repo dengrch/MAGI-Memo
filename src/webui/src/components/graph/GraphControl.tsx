@@ -20,6 +20,11 @@ const isButtonPressed = (ev: MouseEvent | TouchEvent) => {
   return false
 }
 
+// Tabs unmount their graph viewers when hidden. Remember which graph objects
+// have already completed their initial layout so remounting a cached graph does
+// not replay the entrance animation.
+const settledLayoutGraphs = new WeakSet<object>()
+
 const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) => {
   const graphStore = useGraphRuntimeStore()
   const sigma = useSigma<NodeType, EdgeType>()
@@ -97,7 +102,10 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
     // (e.g. edge-events gating crosses the threshold during the first load),
     // the new instance re-runs FA2 from where it was instead of freezing on a
     // half-relaxed layout. Rebuilds after settling still match and skip.
-    if (laidOutGraphRef.current === sigmaGraph) return
+    if (laidOutGraphRef.current === sigmaGraph || settledLayoutGraphs.has(sigmaGraph)) {
+      laidOutGraphRef.current = sigmaGraph
+      return
+    }
 
     let layout: { start: () => void; stop: () => void; kill: () => void } | null = null
     try {
@@ -123,6 +131,7 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
         // Mark this graph as laid out only now (settled), so a rebuild during
         // the budget window re-runs the layout rather than skipping it.
         laidOutGraphRef.current = sigmaGraph
+        settledLayoutGraphs.add(sigmaGraph)
         console.log('FA2 worker layout stopped after budget')
         // Release the shared slot so the store invariant "activeLayoutSupervisor
         // != null => a layout is running" holds (the budget just stopped this
@@ -461,9 +470,16 @@ const GraphControl = ({ disableHoverEffect }: { disableHoverEffect?: boolean }) 
         const newData = { ...data, hidden: false, labelColor, color: edgeColor }
 
         if (focusedNodeValid) {
+          // `sigma.setGraph()` may synchronously render the replacement graph
+          // before React has installed this effect's next reducer. Resolve the
+          // edge against sigma's live graph instead of the graph captured when
+          // the reducer was created, otherwise a view switch can ask the old
+          // graph for a newly-created edge and crash with NotFoundGraphError.
+          const reducerGraph = sigma.getGraph()
           // No graph.extremities() here: it allocates an array per edge.
           const touchesFocused =
-            graph.source(edge) === _focusedNode || graph.target(edge) === _focusedNode
+            reducerGraph.hasEdge(edge) &&
+            (reducerGraph.source(edge) === _focusedNode || reducerGraph.target(edge) === _focusedNode)
           if (hideUnselectedEdges) {
             if (!touchesFocused) newData.hidden = true
           } else if (touchesFocused) {

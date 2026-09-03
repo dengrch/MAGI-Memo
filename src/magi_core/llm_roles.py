@@ -56,6 +56,7 @@ ROLES: tuple[RoleSpec, ...] = (
     RoleSpec("keyword", "KEYWORD", "keyword LLM func"),
     RoleSpec("query", "QUERY", "query LLM func"),
     RoleSpec("vlm", "VLM", "vlm LLM func"),
+    RoleSpec("dream", "DREAM", "BALTHASAR Dreaming LLM func"),
 )
 ROLE_NAMES: frozenset[str] = frozenset(spec.name for spec in ROLES)
 ROLES_BY_NAME: dict[str, RoleSpec] = {spec.name: spec for spec in ROLES}
@@ -515,6 +516,18 @@ class _RoleLLMMixin:
             return role_config(self._normalize_llm_role(role))
 
         return {spec.name: role_config(spec.name) for spec in ROLES}
+
+    def _get_llm_role_runtime_metadata(self, role: str) -> dict[str, Any]:
+        """Return a private builder snapshot for trusted in-process services.
+
+        Unlike :meth:`get_llm_role_config`, this may contain credentials and
+        must never be serialized, logged, or returned by an HTTP endpoint.
+        Provider model discovery uses it server-side so operators do not need
+        to re-enter an already configured key merely to list models.
+        """
+
+        normalized = self._normalize_llm_role(role)
+        return deepcopy(self._role_llm_states[normalized].metadata)
 
     def _log_llm_role_config(self, reason: str, role: str | None = None) -> None:
         """Log the sanitized role LLM runtime configuration."""

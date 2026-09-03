@@ -271,14 +271,69 @@
   border-top-color: currentColor;
 }
 
+.magi-memory-workspace {
+  position: relative;
+  isolation: isolate;
+  background: var(--magi-canvas);
+}
+
+.magi-memory-workspace::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 760px 440px at 180px -40px, rgba(59, 130, 246, 0.12), transparent 74%),
+    radial-gradient(ellipse 620px 760px at calc(100% + 80px) 520px, rgba(45, 212, 191, 0.095), transparent 76%),
+    radial-gradient(ellipse 680px 460px at 58% calc(100vh - 20px), rgba(124, 58, 237, 0.085), transparent 76%),
+    radial-gradient(ellipse 420px 300px at 31% 260px, rgba(96, 165, 250, 0.055), transparent 82%);
+  content: '';
+  pointer-events: none;
+}
+
+.magi-memory-workspace > * {
+  position: relative;
+  z-index: 1;
+}
+
+.magi-memory-scroll {
+  scrollbar-gutter: stable;
+}
+
+.magi-memory-panel,
+.magi-memory-control {
+  border: 1px solid color-mix(in srgb, var(--foreground) 9%, transparent);
+  background: color-mix(in srgb, var(--magi-panel) 70%, transparent);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.055),
+    0 14px 36px -26px rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(20px) saturate(135%);
+  -webkit-backdrop-filter: blur(20px) saturate(135%);
+}
+
+.magi-memory-panel,
+.magi-memory-control {
+  border-radius: 0.75rem;
+}
+
+.magi-memory-control {
+  background: color-mix(in srgb, var(--magi-panel) 64%, transparent);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.045),
+    0 8px 24px -20px rgba(0, 0, 0, 0.68);
+}
+
+.magi-memory-overview {
+  border: 1px solid color-mix(in srgb, var(--foreground) 6.5%, transparent);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--magi-panel) 31%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+  backdrop-filter: blur(12px) saturate(115%);
+  -webkit-backdrop-filter: blur(12px) saturate(115%);
+}
+
 .magi-memory-intro {
   position: relative;
   overflow: hidden;
-  border-color: var(--magi-standard-border);
-  background:
-    radial-gradient(circle at 88% 15%, rgba(113, 112, 255, 0.14), transparent 19rem),
-    linear-gradient(135deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012));
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
 }
 
 .magi-memory-intro h1 {
@@ -286,29 +341,223 @@
   letter-spacing: -0.035em;
 }
 
-.magi-stat-card {
-  border-color: var(--magi-subtle-border);
-  background: color-mix(in srgb, var(--magi-surface) 76%, transparent);
-  transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease;
+.magi-memory-stat {
+  border: 1px solid color-mix(in srgb, var(--foreground) 6.5%, transparent);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--magi-panel) 28%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.022);
+  backdrop-filter: blur(10px) saturate(112%);
+  -webkit-backdrop-filter: blur(10px) saturate(112%);
 }
 
-.magi-stat-card:hover {
-  border-color: var(--magi-standard-border);
-  background: var(--magi-surface-hover);
-  transform: translateY(-1px);
+.magi-memory-stat-icon {
+  border: 0;
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+}
+
+.magi-memory-meta {
+  border-left: 1px solid color-mix(in srgb, var(--foreground) 9%, transparent);
+  border-radius: 0 0.5rem 0.5rem 0;
+  background: color-mix(in srgb, var(--background) 18%, transparent);
+}
+
+.magi-memory-inset {
+  border: 1px solid color-mix(in srgb, var(--foreground) 7%, transparent);
+  background: color-mix(in srgb, var(--background) 36%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.035);
+}
+
+.magi-memory-inset {
+  border-radius: 0.5rem;
 }
 
 .magi-memory-toolbar {
-  border-color: var(--magi-subtle-border);
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.018);
+  z-index: 10;
+}
+
+.magi-memory-tab {
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+}
+
+.magi-memory-tab.is-active {
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--magi-accent-bright) 22%, transparent);
+  background: color-mix(in srgb, var(--magi-accent) 17%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.065);
+}
+
+.magi-memory-input,
+.magi-memory-icon-button {
+  border-color: color-mix(in srgb, var(--foreground) 9%, transparent);
+  background: color-mix(in srgb, var(--background) 34%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.035);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.magi-memory-row:hover {
+  background: color-mix(in srgb, var(--foreground) 4.5%, transparent);
+}
+
+.magi-memory-linked-item,
+.magi-memory-evolution-link {
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.magi-memory-linked-item:hover {
+  border-color: color-mix(in srgb, var(--magi-accent-bright) 22%, transparent);
+  background: color-mix(in srgb, var(--magi-accent) 7%, transparent);
+}
+
+.magi-memory-evolution-link:hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+}
+
+.magi-memory-timeline {
+  position: relative;
+  padding-left: 0.625rem;
+}
+
+.magi-memory-timeline::before {
+  position: absolute;
+  top: 0.75rem;
+  bottom: 0.75rem;
+  left: 0;
+  width: 1px;
+  content: '';
+  background: linear-gradient(
+    to bottom,
+    rgba(34, 211, 238, 0.28),
+    rgba(139, 92, 246, 0.24),
+    transparent
+  );
+}
+
+.magi-memory-dual-range {
+  position: relative;
+  height: 1.25rem;
+}
+
+.magi-memory-range-track,
+.magi-memory-range-fill {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 2px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+}
+
+.magi-memory-range-track {
+  background: color-mix(in srgb, var(--foreground) 11%, transparent);
+}
+
+.magi-memory-range-fill {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--magi-accent-bright) 38%, var(--foreground) 15%),
+    color-mix(in srgb, var(--magi-accent) 32%, var(--foreground) 14%)
+  );
+  box-shadow: 0 0 7px color-mix(in srgb, var(--magi-accent) 10%, transparent);
+}
+
+.magi-memory-range-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border: 1px solid color-mix(in srgb, var(--foreground) 24%, transparent);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--magi-panel) 82%, var(--foreground) 18%);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.12),
+    0 2px 6px rgba(0, 0, 0, 0.34);
+  transform: translate(-50%, -50%);
+  cursor: grab;
+  transition: border-color 120ms ease, background-color 120ms ease, box-shadow 120ms ease;
+}
+
+.magi-memory-range-thumb:hover,
+.magi-memory-range-thumb:focus-visible {
+  border-color: color-mix(in srgb, var(--magi-accent-bright) 42%, transparent);
+  outline: none;
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.15),
+    0 0 0 3px color-mix(in srgb, var(--magi-accent) 9%, transparent),
+    0 2px 6px rgba(0, 0, 0, 0.34);
+}
+
+.magi-memory-dual-range:active .magi-memory-range-thumb {
+  cursor: grabbing;
+}
+
+.magi-memory-list-body {
+  min-height: 0;
+  scrollbar-gutter: stable;
+}
+
+.magi-memory-ingest {
+  background: color-mix(in srgb, var(--magi-panel) 58%, transparent);
+}
+
+.magi-memory-document-manager {
+  color: var(--foreground);
+}
+
+.magi-memory-document-scroll,
+.magi-memory-queue-toolbar {
+  scrollbar-gutter: stable;
+}
+
+.magi-memory-document-list {
+  border-color: color-mix(in srgb, var(--foreground) 8%, transparent);
+  background: color-mix(in srgb, var(--background) 28%, transparent);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.035);
+  backdrop-filter: blur(16px) saturate(125%);
+  -webkit-backdrop-filter: blur(16px) saturate(125%);
+}
+
+.magi-memory-table-well {
+  border-color: color-mix(in srgb, var(--foreground) 7%, transparent);
+  background: color-mix(in srgb, var(--background) 18%, transparent);
+}
+
+.magi-memory-table-header {
+  background: color-mix(in srgb, var(--magi-panel) 74%, transparent);
+  box-shadow: 0 8px 20px -18px rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(18px) saturate(130%);
+  -webkit-backdrop-filter: blur(18px) saturate(130%);
 }
 
 .magi-retrieval {
+  isolation: isolate;
+  position: relative;
   background:
-    linear-gradient(var(--magi-subtle-border) 1px, transparent 1px),
-    linear-gradient(90deg, var(--magi-subtle-border) 1px, transparent 1px);
-  background-size: 32px 32px;
-  background-position: -1px -1px;
+    radial-gradient(ellipse 52% 66% at 8% 92%, rgba(34, 211, 238, 0.11), transparent 72%),
+    radial-gradient(ellipse 48% 62% at 94% 10%, rgba(139, 92, 246, 0.13), transparent 74%),
+    radial-gradient(ellipse 42% 54% at 52% 48%, rgba(59, 130, 246, 0.07), transparent 76%),
+    var(--magi-canvas);
+}
+
+.magi-retrieval::before {
+  position: absolute;
+  z-index: 0;
+  inset: 7% 5%;
+  border-radius: 3rem;
+  background:
+    radial-gradient(ellipse 36% 28% at 22% 74%, rgba(56, 189, 248, 0.1), transparent 78%),
+    radial-gradient(ellipse 32% 24% at 78% 28%, rgba(129, 140, 248, 0.11), transparent 80%);
+  content: '';
+  filter: blur(42px);
+  pointer-events: none;
+}
+
+.magi-retrieval > * {
+  position: relative;
+  z-index: 1;
 }
 
 .magi-chat-surface {

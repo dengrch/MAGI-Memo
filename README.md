@@ -11,10 +11,10 @@ MAGI Memo 是一个以知识图谱为主要组织与检索结构、面向 Agent 
 1. 从文档 RAG 演进为可持续维护的图谱记忆系统；
 2. 从单一服务演进为可被 Agent Harness 调用的记忆基础设施。
 
-当前主线是 DeepSeek Harness（DSH）接入、由插件状态机约束的主动图谱检索，以及 Reflect / 社区摘要研究。未来的 MAGI Sys 才负责人格化的 CASPER、MELCHIOR、BALTHASAR、Blackboard、MQP、MCC 与通用多 Agent 协商。
+当前主线是 DeepSeek Harness（DSH）接入、由插件状态机约束的主动图谱检索，以及 BALTHASAR Dreaming。Dreaming v1 已经能够离线重建图社区、生成社区名称与报告，并把可回滚快照发布到 SQLite 和 Neo4j；更高层的 Reflect 与长期记忆写回仍在研究。未来的 MAGI Sys 才负责人格化的 CASPER、MELCHIOR、BALTHASAR、Blackboard、MQP、MCC 与通用多 Agent 协商。
 
 > [!IMPORTANT]
-> MAGI Memo 当前处于 Beta / research preview。记忆内核、Runtime、REST API、WebUI 和 DSH 插件已经可用；主动检索 v1/v2、冷热启动、多 Explorer 并发和 Balthasar 实时回放已进入验收，Reflect、社区摘要和通用 MCP 入口仍在演进。
+> MAGI Memo 当前处于 Beta / research preview。记忆内核、Runtime、REST API、WebUI 和 DSH 插件已经可用；主动检索 v1/v2、冷热启动、多 Explorer 并发和 Melchior 实时回放已进入验收；BALTHASAR Dreaming v1 已可手动运行，自动调度、分层覆盖摘要、成本策略和面向 `global.md` / `user.md` / LLM Wiki 的高层写回仍在演进。
 
 ## 快速开始
 
@@ -23,7 +23,7 @@ MAGI Memo 是一个以知识图谱为主要组织与检索结构、面向 Agent 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
 - 一个 LLM 与 embedding provider；默认示例使用 OpenAI-compatible API
-- Neo4j（当前完整图谱记忆主路径）
+- Neo4j（当前完整图谱记忆主路径）；运行 Dreaming 还需要 Graph Data Science plugin
 - Bun（仅修改或重新构建 WebUI 时需要）
 
 ### 2. 安装
@@ -64,7 +64,7 @@ NEO4J_PASSWORD=your_password
 NEO4J_DATABASE=neo4j
 ```
 
-角色级 LLM 可以用 `EXTRACT_*`、`RESOLVE_*`、`DEDUPLICATE_*`、`KEYWORD_*`、`QUERY_*`、`VLM_*` 单独覆盖。完整变量及注释以 [`env.example`](./env.example) 为准。
+角色级 LLM 可以用 `EXTRACT_*`、`RESOLVE_*`、`DEDUPLICATE_*`、`KEYWORD_*`、`QUERY_*`、`DREAM_*`、`VLM_*` 单独覆盖。WebUI 的模型设置也可以在运行期间调整这些角色路由，无需重启服务。完整变量及注释以 [`env.example`](./env.example) 为准。
 
 > [!WARNING]
 > 未配置 `AUTH_ACCOUNTS` 或 `LIGHTRAG_API_KEY` 时，服务没有身份验证。仅本机使用请保持 `HOST=127.0.0.1`；暴露到网络前必须配置认证，并检查 `WHITELIST_PATHS`。
@@ -126,6 +126,7 @@ Episode
 - **可恢复**：SQLite 是记忆事实源，Neo4j 与向量索引是可重建投影；
 - **可接入**：Python API、REST/WebUI 与 DSH plugin 共用同一套服务端语义；
 - **可探索**：普通召回不足时，隔离的 Explorer 可以只读展开图谱并下钻 Evidence。
+- **可反思**：BALTHASAR 可以离线重建图社区，把局部实体关系提升为可浏览的社区主题与报告。
 
 因此，“Episode / Atom-aware”是 MAGI Memo 的内部记忆语义，不是项目最上层的品类定位；项目首先是图谱记忆系统，这套语义负责让图谱能够长期演化而不丢失身份、时间和来源。
 
@@ -144,8 +145,9 @@ Episode
 | DSH plugin                | 可用     | Session 级`auto` / `manual` / `explore` / `off` 记忆模式   |
 | 主动图谱检索 v1           | 验收中   | Mix 冷启动、单 Explorer、`expand → describe → evidence` 渐进加载    |
 | 主动图谱检索 v2           | 验收中   | Auto 热启动、动态 subquery、一层多 Explorer 并发与部分失败保留      |
-| 主动探索可视化            | 验收中   | Balthasar 实时增量图、Agent 分段光晕、Trace 持久化与历史回放        |
-| Reflect / 社区摘要        | 研究中   | Neo4j/GDS 社区、主题识别与带 Evidence 血缘的层次摘要                |
+| 主动探索可视化            | 验收中   | Melchior 实时增量图、Agent 分段光晕、Trace 持久化与历史回放         |
+| BALTHASAR Dreaming v1     | 可用     | Neo4j GDS Leiden 全量聚类、社区报告、快照发布与新节点临时归属       |
+| 高层 Reflect / 记忆写回   | 研究中   | 分层覆盖摘要、Evidence 血缘及 `global.md` / `user.md` 等受控更新    |
 
 ## 架构
 
@@ -166,7 +168,7 @@ WebUI / Python caller / DSH plugin / future MCP clients
 ┌──────────────────────────────────────────────────────────────┐
 │ MagiCore                                                     │
 │ queue · parsing · extraction · resolution · Atom evolution   │
-│ graph/vector retrieval · active exploration read surface     │
+│ graph/vector retrieval · active exploration · Dreaming       │
 └───────────────┬──────────────────────┬───────────────────────┘
                 │                      │
                 ▼                      ▼
@@ -184,6 +186,8 @@ WebUI / Python caller / DSH plugin / future MCP clients
 - `magi_core` 负责记忆语义、写入管线、图投影与检索。
 
 上层 Agent 不应直接持有 SQLite、Neo4j 或底层 LightRAG 资源对象。
+
+Dreaming 是一条与实时写入解耦的派生管线：SQLite 记录运行、完整分区和报告快照，Neo4j 保存当前可查询的社区归属与 `DreamCommunity` 报告节点。它不会修改 Episode、Atom 或 Evidence，也不会把社区报告提升为事实源。
 
 ### 写入链路
 
@@ -245,6 +249,24 @@ query → ordinary recall / seeds ──┤
 ```
 
 Explorer 始终只读，所有真实记忆写入仍统一经过单一 Memory Writer。完整协议见 [`doc/phase3-mag25-active-graph-retrieval-design.md`](./doc/phase3-mag25-active-graph-retrieval-design.md)。
+
+### BALTHASAR Dreaming
+
+Dreaming 与实时写入解耦，由用户在 Balthasar 页面显式启动：
+
+```text
+Neo4j 语义图
+  → GDS 无权 Leiden 全量分区
+  → 排除单节点分区 + 稳定 community ID
+  → dream 角色模型生成 community_name / report
+  → SQLite prepared snapshot
+  → Neo4j 当前社区投影
+  → SQLite published snapshot
+```
+
+新写入且尚未归属的节点会按 1–3 跳内的最近已发布社区标记为 `provisional`，下一次全量 Dreaming 再统一裁定。Balthasar 同时提供按社区着色的成员图和按成员规模缩放的社区图，并展示报告、运行阶段与 token 成本。
+
+当前入口是 `POST /dreaming/runs`，只支持单进程 server 手动触发。自动调度、超大社区的分层覆盖摘要、Evidence 下钻和高层文件写回尚未实现；完整协议与失败语义见 [`doc/phase3-balthasar-dreaming.md`](./doc/phase3-balthasar-dreaming.md)。
 
 ## 图谱记忆如何形成
 
@@ -655,6 +677,7 @@ FastAPI 服务同时承载 WebUI 与公开 API。常用接口包括：
 | 主动探索原语      | `POST /memory/explore/expand`、`POST /memory/explore/describe`、`POST /memory/explore/evidence` |
 | 探索 Trace        | `POST/GET /memory/explore/traces`、`GET .../{id}/events`、`POST .../{id}/archive`   |
 | 图谱              | `GET /graphs` 与 `/graph/*`                                                           |
+| BALTHASAR Dreaming | `GET /dreaming/status`、`GET /dreaming/communities`、`POST /dreaming/runs`          |
 | 管线状态          | `GET /documents/pipeline_status`                                                        |
 
 WebUI 当前提供：
@@ -662,9 +685,11 @@ WebUI 当前提供：
 - Episode 上传、文本写入、扫描、队列与错误状态；
 - Episode、Atom、Evidence、Entity、Relation 与演化详情；
 - 语义图可视化和普通检索控制台；
-- Balthasar 主动探索实时增量图、Agent 光晕与历史场景回放；
+- Melchior 主动探索实时增量图、Agent 光晕与历史场景回放；
+- Casper 快速静态 recall 集合入口，承载完整普通检索模式与结果交互；
+- Balthasar 社区成员图、社区聚合图、报告详情、Dream now 与 token 成本；
 - Workspace 创建、切换与受控删除；
-- Runtime 状态和近期日志。
+- Runtime 状态、角色模型热切换和近期日志。
 
 具体请求 schema 以运行中的 `/docs` 为准。
 
@@ -713,9 +738,9 @@ MAGI 的命名仍然保留，但在 **Memo** 中代表三条能力研究线，�
 
 | 研究线           | 当前含义                                                          |
 | ---------------- | ----------------------------------------------------------------- |
-| CASPER / 直觉    | 让外部 Harness 低开销、可靠地调用基础记忆检索，并持续优化召回效率 |
+| CASPER / 直觉    | 功能完备的快速静态 recall 集合入口，统一普通检索模式与结果交互     |
 | MELCHIOR / 分析  | 渐进式主动图谱探索、冷热启动、Evidence 下钻与动态多 Explorer      |
-| BALTHASAR / 判断 | 主动探索实时可视化；以及后续 Neo4j/GDS 社区、Reflect 与层次摘要研究 |
+| BALTHASAR / 判断 | 已实现离线 Leiden 社区重建、主题报告与快照发布；继续研究高层 Reflect |
 
 人格、群聊、投票、Blackboard、MQP、MCC 和通用 Agent 状态机属于未来 **MAGI Sys**，不应被描述为 MAGI Memo 的现有功能。
 
@@ -732,15 +757,20 @@ MAGI 的命名仍然保留，但在 **Memo** 中代表三条能力研究线，�
    - Episode、Atom、Evidence、实体/关系注册表与双时间；
    - 实体消歧、五类 Atom 演化、删除备份与可靠 projection outbox；
    - `MagiAPI`、多 Handle、Workspace 生命周期、REST 与新版 WebUI。
+3. **三期阶段成果：主动检索与 Dreaming v1**
+
+   - DSH plugin、冷热启动、一层多 Explorer 与 Melchior Trace 回放；
+   - Balthasar 无权 Leiden 聚类、稳定社区 ID、报告生成、token 记录与补偿发布；
+   - 新节点最近社区 provisional 归属及成员/社区双视图。
 
 ### 当前主线
 
-3. **三期：DSH 主动图谱检索与 Reflect**
-   - DSH plugin 与 Session 级记忆模式；
-   - 主动检索 v1：单 Explorer 的 `mix → expand → describe → evidence` 闭环；
-   - 主动检索 v2：Auto 热启动、s0 动态 subquery 与一层自适应多 Explorer；
-   - Balthasar：Core 权威 Trace、实时增量图、多 Agent 分段光晕与历史回放；
-   - Neo4j/GDS 社区聚类、Reflect 与证据可追溯的摘要。
+4. **三期后续：Dreaming 成本控制与高层 Reflect**
+
+   - 定时/阈值触发、预算、失败退避与跨 worker 作业所有权；
+   - 超大社区的分层计算、连续 report/reduce 与重要子图覆盖；
+   - 社区报告到 Atom/Evidence 的可下钻血缘；
+   - 受审核、可版本化和可回滚的 `global.md` / `user.md` / LLM Wiki 更新。
 
 ### 明确不在当前范围
 
@@ -775,6 +805,7 @@ MAGI-Memo/
 - [`doc/memory-core-quickstart.md`](./doc/memory-core-quickstart.md)：Memory Core 使用方式
 - [`doc/phase2-completion-and-phase3-handoff.md`](./doc/phase2-completion-and-phase3-handoff.md)：二期架构与三期交接
 - [`doc/phase3-mag25-active-graph-retrieval-design.md`](./doc/phase3-mag25-active-graph-retrieval-design.md)：主动图谱检索设计
+- [`doc/phase3-balthasar-dreaming.md`](./doc/phase3-balthasar-dreaming.md)：Dreaming v1 算法、报告、快照与边界
 - [`doc/dsh-magi-memo-plugin.md`](./doc/dsh-magi-memo-plugin.md)：DSH plugin 的工具与安全边界
 - [`doc/magi-storage-schema-manual.md`](./doc/magi-storage-schema-manual.md)：SQLite / Neo4j / VDB 存储模型
 - [`AGENTS.md`](./AGENTS.md)：仓库架构、并发契约与开发约定

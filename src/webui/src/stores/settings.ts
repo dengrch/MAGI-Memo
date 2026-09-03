@@ -6,7 +6,7 @@ import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'balthasar' | 'api'
+type Tab = 'documents' | 'knowledge-graph' | 'balthasar' | 'casper' | 'melchior' | 'api'
 
 interface SettingsState {
   // Document manager settings
@@ -229,7 +229,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 20,
+      version: 21,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -341,6 +341,12 @@ const useSettingsStoreBase = create<SettingsState>()(
             ...existing,
             ...suggestedUserPrompts.filter((p: string) => !existing.includes(p))
           ]
+        }
+        if (version < 21) {
+          // Correct the Sage ownership without stranding persisted tabs:
+          // active exploration belongs to Melchior; static recall belongs to Casper.
+          if (state.currentTab === 'balthasar') state.currentTab = 'melchior'
+          if (state.currentTab === 'retrieval') state.currentTab = 'casper'
         }
         return state
       }

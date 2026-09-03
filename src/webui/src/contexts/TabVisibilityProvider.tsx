@@ -19,8 +19,9 @@ export const TabVisibilityProvider: React.FC<TabVisibilityProviderProps> = ({ ch
   const [visibleTabs, setVisibleTabs] = useState<Record<string, boolean>>(() => ({
     'documents': true,
     'knowledge-graph': true,
-    'retrieval': true,
     'balthasar': true,
+    'casper': true,
+    'melchior': true,
     'api': true
   }));
 
@@ -32,8 +33,9 @@ export const TabVisibilityProvider: React.FC<TabVisibilityProviderProps> = ({ ch
       ...prev,
       'documents': true,
       'knowledge-graph': true,
-      'retrieval': true,
       'balthasar': true,
+      'casper': true,
+      'melchior': true,
       'api': true
     })), 0)
     return () => clearTimeout(timer)

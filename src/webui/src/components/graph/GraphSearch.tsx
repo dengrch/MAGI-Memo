@@ -206,7 +206,7 @@ export const GraphSearchInput = ({
 
   return (
     <AsyncSearch
-      className="bg-background/60 w-24 rounded-xl border-1 opacity-60 backdrop-blur-lg transition-all hover:w-fit hover:opacity-100 w-full"
+      className="bg-background/60 w-60 rounded-xl border-1 opacity-60 backdrop-blur-lg transition-opacity hover:opacity-100"
       fetcher={loadOptions}
       renderOption={OptionComponent}
       getOptionValue={(item) => item.id}

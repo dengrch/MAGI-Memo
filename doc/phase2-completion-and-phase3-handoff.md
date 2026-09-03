@@ -3,6 +3,8 @@
 日期：2026-08-11
 文档状态：二期最终汇总，替代各阶段进度文档中的历史结论
 
+> 后续状态（2026-09-03）：本文是二期封板时的历史交接快照。文中延期的主动探索与 BALTHASAR Dreaming 已在三期推进；Dreaming v1 的当前实现见 [`phase3-balthasar-dreaming.md`](./phase3-balthasar-dreaming.md)。`global.md` 等高层写回仍未实现。
+
 ## 1. 验收结论
 
 MAGI Memo 二期已经达到 **功能完成、可以进入三期工程** 的状态。

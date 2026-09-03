@@ -24,6 +24,9 @@ from magi_core.backend.sqlite.migrations import (
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
+    MIGRATION_9,
+    MIGRATION_10,
 )
 from magi_core.memory import (
     AtomEvidence,
@@ -232,6 +235,46 @@ class SQLiteBackend:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
                 "VALUES (?, ?)",
                 (7, _utc_now()),
+            )
+            connection.executescript(MIGRATION_8)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
+                (8, _utc_now()),
+            )
+            migration_9_applied = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 9"
+            ).fetchone()
+            if migration_9_applied is None:
+                connection.executescript(MIGRATION_9)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (9, _utc_now()),
+                )
+            connection.executescript(MIGRATION_10)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (?, ?)",
+                (10, _utc_now()),
+            )
+            # This backend is single-process for Dreaming. Any active row
+            # surviving initialization belongs to an interrupted prior process.
+            connection.execute(
+                """
+                UPDATE dreaming_runs
+                SET status = 'failed', phase = 'failed',
+                    error = COALESCE(error, 'Interrupted by process restart'),
+                    finished_at = ?
+                WHERE workspace_id = ? AND status = 'running'
+                """,
+                (_utc_now(), self.workspace_id),
+            )
+            connection.execute(
+                """
+                UPDATE dreaming_snapshots SET status = 'failed'
+                WHERE workspace_id = ? AND status = 'prepared'
+                """,
+                (self.workspace_id,),
             )
             self._prune_orphan_projection_owners(connection)
 
@@ -1677,6 +1720,34 @@ class SQLiteBackend:
                 """,
                 (self.workspace_id,),
             ).fetchall()
+            episode_time_row = connection.execute(
+                "SELECT min(reference_at), max(reference_at) FROM episodes "
+                "WHERE workspace_id = ?",
+                (self.workspace_id,),
+            ).fetchone()
+            atom_valid_time_row = connection.execute(
+                """
+                SELECT min(value), max(value) FROM (
+                    SELECT valid_at AS value FROM atoms
+                    WHERE workspace_id = ? AND valid_at IS NOT NULL
+                    UNION ALL
+                    SELECT invalid_at AS value FROM atoms
+                    WHERE workspace_id = ? AND invalid_at IS NOT NULL
+                )
+                """,
+                (self.workspace_id, self.workspace_id),
+            ).fetchone()
+            atom_system_time_row = connection.execute(
+                """
+                SELECT min(value), max(value) FROM (
+                    SELECT created_at AS value FROM atoms WHERE workspace_id = ?
+                    UNION ALL
+                    SELECT expired_at AS value FROM atoms
+                    WHERE workspace_id = ? AND expired_at IS NOT NULL
+                )
+                """,
+                (self.workspace_id, self.workspace_id),
+            ).fetchone()
         episode_statuses = {row["status"]: row["count"] for row in episode_rows}
         atom_statuses = {row["temporal_status"]: row["count"] for row in atom_rows}
         return {
@@ -1696,7 +1767,26 @@ class SQLiteBackend:
             "relations": scalar(
                 "SELECT count(*) FROM relation_registry WHERE workspace_id = ?"
             ),
+            "communities": scalar(
+                "SELECT COALESCE((SELECT community_count FROM dreaming_snapshots "
+                "WHERE workspace_id = ? AND status = 'published' "
+                "ORDER BY published_at DESC LIMIT 1), 0)"
+            ),
             "projection_outbox": {row["status"]: row["count"] for row in outbox_rows},
+            "time_bounds": {
+                "episode_reference": {
+                    "min": episode_time_row[0],
+                    "max": episode_time_row[1],
+                },
+                "atom_validity": {
+                    "min": atom_valid_time_row[0],
+                    "max": atom_valid_time_row[1],
+                },
+                "atom_system": {
+                    "min": atom_system_time_row[0],
+                    "max": atom_system_time_row[1],
+                },
+            },
         }
 
     async def list_episodes(
@@ -1707,12 +1797,21 @@ class SQLiteBackend:
         status: str | None = None,
         kind: str | None = None,
         query: str | None = None,
+        reference_from: str | None = None,
+        reference_to: str | None = None,
     ) -> dict[str, Any]:
         """List Episodes with Atom/evidence counts for the WebUI."""
 
         self._require_initialized()
         return await asyncio.to_thread(
-            self._list_episodes_sync, page, page_size, status, kind, query
+            self._list_episodes_sync,
+            page,
+            page_size,
+            status,
+            kind,
+            query,
+            reference_from,
+            reference_to,
         )
 
     def _list_episodes_sync(
@@ -1722,6 +1821,8 @@ class SQLiteBackend:
         status: str | None,
         kind: str | None,
         query: str | None,
+        reference_from: str | None,
+        reference_to: str | None,
     ) -> dict[str, Any]:
         where = ["e.workspace_id = ?"]
         params: list[Any] = [self.workspace_id]
@@ -1737,6 +1838,12 @@ class SQLiteBackend:
             )
             needle = f"%{query}%"
             params.extend((needle, needle, needle))
+        if reference_from:
+            where.append("julianday(e.reference_at) >= julianday(?)")
+            params.append(reference_from)
+        if reference_to:
+            where.append("julianday(e.reference_at) <= julianday(?)")
+            params.append(reference_to)
         where_sql = " AND ".join(where)
         offset = (page - 1) * page_size
         with self._connect() as connection:
@@ -1807,6 +1914,771 @@ class SQLiteBackend:
         episode["atoms"] = [self._atom_ui_row(row) for row in rows]
         return episode
 
+    async def list_entities(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """List canonical entities with alias, Atom, and ambiguity counts."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._list_entities_sync, page, page_size, query
+        )
+
+    def _list_entities_sync(
+        self,
+        page: int,
+        page_size: int,
+        query: str | None,
+    ) -> dict[str, Any]:
+        where = ["e.workspace_id = ?", "e.expired_at IS NULL"]
+        params: list[Any] = [self.workspace_id]
+        if query:
+            where.append(
+                "(e.entity_id LIKE ? OR e.canonical_name LIKE ? OR EXISTS ("
+                "SELECT 1 FROM entity_aliases search_alias "
+                "WHERE search_alias.workspace_id = e.workspace_id "
+                "AND search_alias.entity_id = e.entity_id "
+                "AND search_alias.alias LIKE ?))"
+            )
+            needle = f"%{query}%"
+            params.extend((needle, needle, needle))
+        where_sql = " AND ".join(where)
+        offset = (page - 1) * page_size
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT count(*) FROM entity_registry e WHERE {where_sql}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT e.*,
+                       count(DISTINCT a.atom_id) AS atom_count
+                FROM entity_registry e
+                LEFT JOIN atoms a
+                  ON a.workspace_id = e.workspace_id
+                 AND a.owner_id = e.entity_id
+                WHERE {where_sql}
+                GROUP BY e.entity_id
+                ORDER BY EXISTS (
+                    SELECT 1
+                    FROM entity_aliases priority_alias
+                    JOIN entity_aliases priority_other
+                      ON priority_other.workspace_id = priority_alias.workspace_id
+                     AND priority_other.normalized_alias = priority_alias.normalized_alias
+                     AND priority_other.entity_id <> priority_alias.entity_id
+                    JOIN entity_registry priority_candidate
+                      ON priority_candidate.workspace_id = priority_other.workspace_id
+                     AND priority_candidate.entity_id = priority_other.entity_id
+                     AND priority_candidate.expired_at IS NULL
+                    WHERE priority_alias.workspace_id = e.workspace_id
+                      AND priority_alias.entity_id = e.entity_id
+                ) DESC,
+                e.canonical_name COLLATE NOCASE, e.entity_id
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, offset),
+            ).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                aliases = list(json.loads(item.pop("aliases_json") or "[]"))
+                item["aliases"] = aliases
+                item["alias_count"] = len(aliases)
+                item["ambiguity_count"] = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM (
+                            SELECT mine.normalized_alias
+                            FROM entity_aliases mine
+                            JOIN entity_aliases other
+                              ON other.workspace_id = mine.workspace_id
+                             AND other.normalized_alias = mine.normalized_alias
+                             AND other.entity_id <> mine.entity_id
+                            JOIN entity_registry candidate
+                              ON candidate.entity_id = other.entity_id
+                             AND candidate.workspace_id = other.workspace_id
+                             AND candidate.expired_at IS NULL
+                            WHERE mine.workspace_id = ? AND mine.entity_id = ?
+                            GROUP BY mine.normalized_alias
+                        )
+                        """,
+                        (self.workspace_id, item["entity_id"]),
+                    ).fetchone()[0]
+                )
+                items.append(item)
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "pages": (total + page_size - 1) // page_size,
+        }
+
+    async def get_entity_memory_view(self, entity_id: str) -> dict[str, Any] | None:
+        """Return one canonical entity, alias collisions, and owned Atoms."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(self._get_entity_memory_view_sync, entity_id)
+
+    def _get_entity_memory_view_sync(self, entity_id: str) -> dict[str, Any] | None:
+        now = _utc_now()
+        status_sql = """CASE
+            WHEN a.expired_at IS NOT NULL THEN 'expired'
+            WHEN a.valid_at IS NOT NULL AND a.valid_at > ? THEN 'pending'
+            WHEN a.invalid_at IS NOT NULL AND a.invalid_at <= ? THEN 'invalid'
+            ELSE 'active' END"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM entity_registry "
+                "WHERE entity_id = ? AND workspace_id = ?",
+                (entity_id, self.workspace_id),
+            ).fetchone()
+            if row is None:
+                return None
+            item = dict(row)
+            aliases = list(json.loads(item.pop("aliases_json") or "[]"))
+            item["aliases"] = aliases
+            collision_rows = connection.execute(
+                """
+                SELECT mine.alias, mine.normalized_alias,
+                       candidate.entity_id AS candidate_entity_id,
+                       candidate.canonical_name AS candidate_canonical_name,
+                       candidate.entity_type AS candidate_entity_type
+                FROM entity_aliases mine
+                JOIN entity_aliases other
+                  ON other.workspace_id = mine.workspace_id
+                 AND other.normalized_alias = mine.normalized_alias
+                 AND other.entity_id <> mine.entity_id
+                JOIN entity_registry candidate
+                  ON candidate.entity_id = other.entity_id
+                 AND candidate.workspace_id = other.workspace_id
+                 AND candidate.expired_at IS NULL
+                WHERE mine.workspace_id = ? AND mine.entity_id = ?
+                ORDER BY mine.normalized_alias,
+                         candidate.canonical_name COLLATE NOCASE
+                """,
+                (self.workspace_id, entity_id),
+            ).fetchall()
+            ambiguity_by_alias: dict[str, dict[str, Any]] = {}
+            for collision in collision_rows:
+                normalized = str(collision["normalized_alias"])
+                ambiguity = ambiguity_by_alias.setdefault(
+                    normalized,
+                    {
+                        "alias": collision["alias"],
+                        "normalized_alias": normalized,
+                        "candidates": [],
+                    },
+                )
+                ambiguity["candidates"].append(
+                    {
+                        "entity_id": collision["candidate_entity_id"],
+                        "canonical_name": collision["candidate_canonical_name"],
+                        "entity_type": collision["candidate_entity_type"],
+                    }
+                )
+            atom_rows = connection.execute(
+                f"""
+                SELECT a.*, {status_sql} AS temporal_status,
+                       e.canonical_name AS owner_name,
+                       count(DISTINCT ae.episode_id) AS evidence_count
+                FROM atoms a
+                LEFT JOIN entity_registry e ON e.entity_id = a.owner_id
+                LEFT JOIN atom_evidence ae ON ae.atom_id = a.atom_id
+                WHERE a.workspace_id = ? AND a.owner_id = ?
+                GROUP BY a.atom_id
+                -- Memory Core is an operational view: newly inserted evidence and
+                -- manually seeded/backfilled records should remain discoverable even
+                -- when their bitemporal ``created_at`` deliberately points into the
+                -- past. ``updated_at`` records when SQLite most recently observed the
+                -- Atom, while the detail view still exposes the original system time.
+                ORDER BY a.updated_at DESC, a.created_at DESC, a.rowid DESC
+                LIMIT 100
+                """,
+                (now, now, self.workspace_id, entity_id),
+            ).fetchall()
+            atom_count = int(
+                connection.execute(
+                    "SELECT count(*) FROM atoms "
+                    "WHERE workspace_id = ? AND owner_id = ?",
+                    (self.workspace_id, entity_id),
+                ).fetchone()[0]
+            )
+        item["alias_ambiguities"] = list(ambiguity_by_alias.values())
+        item["atoms"] = [self._atom_ui_row(atom) for atom in atom_rows]
+        item["atom_count"] = atom_count
+        return item
+
+    async def resolve_entity_alias(
+        self, alias: str, winner_entity_id: str
+    ) -> dict[str, Any]:
+        """Assign one ambiguous alias to a single existing entity."""
+
+        self._require_initialized()
+        await asyncio.to_thread(
+            self._resolve_entity_alias_sync, alias, winner_entity_id
+        )
+        result = await self.get_entity_memory_view(winner_entity_id)
+        if result is None:
+            raise KeyError(f"unknown entity {winner_entity_id!r}")
+        return result
+
+    def _resolve_entity_alias_sync(
+        self, alias: str, winner_entity_id: str
+    ) -> None:
+        normalized_alias = normalize_name(alias)
+        if not normalized_alias:
+            raise ValueError("alias must not be empty")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            candidates = connection.execute(
+                """
+                SELECT a.entity_id, a.alias, e.canonical_name, e.aliases_json
+                FROM entity_aliases a
+                JOIN entity_registry e
+                  ON e.workspace_id = a.workspace_id AND e.entity_id = a.entity_id
+                WHERE a.workspace_id = ? AND a.normalized_alias = ?
+                  AND e.expired_at IS NULL
+                ORDER BY e.entity_id
+                """,
+                (self.workspace_id, normalized_alias),
+            ).fetchall()
+            candidate_ids = {str(row["entity_id"]) for row in candidates}
+            if winner_entity_id not in candidate_ids:
+                raise ValueError("winner entity must be one of the alias candidates")
+            exact_duplicates = [
+                str(row["entity_id"])
+                for row in candidates
+                if row["entity_id"] != winner_entity_id
+                and normalize_name(str(row["canonical_name"])) == normalized_alias
+            ]
+            for duplicate_entity_id in exact_duplicates:
+                self._merge_duplicate_entity_sync(
+                    connection,
+                    winner_entity_id=winner_entity_id,
+                    duplicate_entity_id=duplicate_entity_id,
+                )
+            if exact_duplicates:
+                candidates = [
+                    row
+                    for row in candidates
+                    if str(row["entity_id"]) not in exact_duplicates
+                ]
+            for row in candidates:
+                entity_id = str(row["entity_id"])
+                if entity_id == winner_entity_id:
+                    continue
+                connection.execute(
+                    "DELETE FROM entity_aliases WHERE workspace_id = ? "
+                    "AND entity_id = ? AND normalized_alias = ?",
+                    (self.workspace_id, entity_id, normalized_alias),
+                )
+                aliases = [
+                    value
+                    for value in json.loads(row["aliases_json"] or "[]")
+                    if normalize_name(str(value)) != normalized_alias
+                ]
+                connection.execute(
+                    "UPDATE entity_registry SET aliases_json = ?, revision = revision + 1 "
+                    "WHERE workspace_id = ? AND entity_id = ?",
+                    (json.dumps(aliases, ensure_ascii=False), self.workspace_id, entity_id),
+                )
+                connection.execute(
+                    "DELETE FROM entity_name_fts WHERE workspace_id = ? AND entity_id = ?",
+                    (self.workspace_id, entity_id),
+                )
+                connection.executemany(
+                    "INSERT INTO entity_name_fts(workspace_id, entity_id, name) "
+                    "VALUES (?, ?, ?)",
+                    [(self.workspace_id, entity_id, value) for value in aliases],
+                )
+            connection.execute(
+                "UPDATE entity_registry SET revision = revision + 1 "
+                "WHERE workspace_id = ? AND entity_id = ?",
+                (self.workspace_id, winner_entity_id),
+            )
+
+    def _merge_duplicate_entity_sync(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        winner_entity_id: str,
+        duplicate_entity_id: str,
+    ) -> None:
+        """Merge two legacy Entity rows with the same canonical identity."""
+
+        winner = connection.execute(
+            "SELECT * FROM entity_registry WHERE workspace_id = ? AND entity_id = ?",
+            (self.workspace_id, winner_entity_id),
+        ).fetchone()
+        duplicate = connection.execute(
+            "SELECT * FROM entity_registry WHERE workspace_id = ? AND entity_id = ?",
+            (self.workspace_id, duplicate_entity_id),
+        ).fetchone()
+        if winner is None or duplicate is None:
+            raise ValueError("duplicate Entity merge candidates no longer exist")
+        if normalize_name(str(winner["canonical_name"])) != normalize_name(
+            str(duplicate["canonical_name"])
+        ):
+            raise ValueError("only Entities with the same canonical name can be merged")
+
+        duplicate_relations = connection.execute(
+            "SELECT relation_id, entity_a_id, entity_b_id FROM relation_registry "
+            "WHERE workspace_id = ? AND (entity_a_id = ? OR entity_b_id = ?)",
+            (self.workspace_id, duplicate_entity_id, duplicate_entity_id),
+        ).fetchall()
+        for relation in duplicate_relations:
+            entity_a_id = (
+                winner_entity_id
+                if relation["entity_a_id"] == duplicate_entity_id
+                else str(relation["entity_a_id"])
+            )
+            entity_b_id = (
+                winner_entity_id
+                if relation["entity_b_id"] == duplicate_entity_id
+                else str(relation["entity_b_id"])
+            )
+            collision = connection.execute(
+                "SELECT relation_id FROM relation_registry "
+                "WHERE workspace_id = ? AND entity_a_id = ? AND entity_b_id = ? "
+                "AND relation_id <> ?",
+                (
+                    self.workspace_id,
+                    entity_a_id,
+                    entity_b_id,
+                    relation["relation_id"],
+                ),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError(
+                    "duplicate Entity merge would collide with an existing relation"
+                )
+
+        aliases: list[str] = []
+        seen_aliases: set[str] = set()
+        for value in (
+            str(winner["canonical_name"]),
+            *json.loads(winner["aliases_json"] or "[]"),
+            str(duplicate["canonical_name"]),
+            *json.loads(duplicate["aliases_json"] or "[]"),
+        ):
+            normalized = normalize_name(str(value))
+            if normalized and normalized not in seen_aliases:
+                seen_aliases.add(normalized)
+                aliases.append(str(value))
+
+        now = _utc_now()
+        connection.execute(
+            "UPDATE atoms SET owner_id = ?, updated_at = ? "
+            "WHERE workspace_id = ? AND owner_id = ?",
+            (winner_entity_id, now, self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "UPDATE atoms SET subject_entity_id = ? "
+            "WHERE workspace_id = ? AND subject_entity_id = ?",
+            (winner_entity_id, self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "UPDATE atoms SET object_entity_id = ? "
+            "WHERE workspace_id = ? AND object_entity_id = ?",
+            (winner_entity_id, self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "UPDATE relation_registry SET entity_a_id = ?, entity_a_name = ?, "
+            "revision = revision + 1 WHERE workspace_id = ? AND entity_a_id = ?",
+            (
+                winner_entity_id,
+                winner["canonical_name"],
+                self.workspace_id,
+                duplicate_entity_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE relation_registry SET entity_b_id = ?, entity_b_name = ?, "
+            "revision = revision + 1 WHERE workspace_id = ? AND entity_b_id = ?",
+            (
+                winner_entity_id,
+                winner["canonical_name"],
+                self.workspace_id,
+                duplicate_entity_id,
+            ),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO dreaming_memberships("
+            "snapshot_id, entity_id, community_id, membership_status) "
+            "SELECT snapshot_id, ?, community_id, membership_status "
+            "FROM dreaming_memberships WHERE entity_id = ?",
+            (winner_entity_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "DELETE FROM dreaming_memberships WHERE entity_id = ?",
+            (duplicate_entity_id,),
+        )
+        connection.execute(
+            "UPDATE memory_embeddings SET owner_id = ? "
+            "WHERE workspace_id = ? AND owner_id = ?",
+            (winner_entity_id, self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "DELETE FROM memory_embeddings WHERE workspace_id = ? "
+            "AND object_kind = 'entity' AND object_id = ?",
+            (self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "DELETE FROM owner_summary_checkpoints "
+            "WHERE workspace_id = ? AND owner_id = ?",
+            (self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "DELETE FROM projection_outbox WHERE workspace_id = ? AND owner_id = ?",
+            (self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO entity_aliases("
+            "workspace_id, entity_id, alias, normalized_alias, created_at) "
+            "SELECT workspace_id, ?, alias, normalized_alias, created_at "
+            "FROM entity_aliases WHERE workspace_id = ? AND entity_id = ?",
+            (winner_entity_id, self.workspace_id, duplicate_entity_id),
+        )
+        connection.execute(
+            "DELETE FROM entity_aliases WHERE workspace_id = ? AND entity_id = ?",
+            (self.workspace_id, duplicate_entity_id),
+        )
+        connection.executemany(
+            "INSERT OR IGNORE INTO entity_aliases("
+            "workspace_id, entity_id, alias, normalized_alias, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    self.workspace_id,
+                    winner_entity_id,
+                    value,
+                    normalize_name(value),
+                    now,
+                )
+                for value in aliases
+            ],
+        )
+        connection.execute(
+            "DELETE FROM entity_name_fts WHERE workspace_id = ? "
+            "AND entity_id IN (?, ?)",
+            (self.workspace_id, winner_entity_id, duplicate_entity_id),
+        )
+        connection.executemany(
+            "INSERT INTO entity_name_fts(workspace_id, entity_id, name) "
+            "VALUES (?, ?, ?)",
+            [(self.workspace_id, winner_entity_id, value) for value in aliases],
+        )
+        connection.execute(
+            "UPDATE entity_registry SET aliases_json = ?, "
+            "entity_type = COALESCE(entity_type, ?), revision = revision + 1 "
+            "WHERE workspace_id = ? AND entity_id = ?",
+            (
+                json.dumps(aliases, ensure_ascii=False),
+                duplicate["entity_type"],
+                self.workspace_id,
+                winner_entity_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE entity_registry SET expired_at = ?, revision = revision + 1 "
+            "WHERE workspace_id = ? AND entity_id = ?",
+            (now, self.workspace_id, duplicate_entity_id),
+        )
+        self._queue_owner_projection_sync(connection, winner_entity_id)
+        for relation in duplicate_relations:
+            self._queue_owner_projection_sync(connection, str(relation["relation_id"]))
+
+    async def list_relations(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """List relation owners with their endpoints and Atom counts."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._list_relations_sync, page, page_size, query
+        )
+
+    def _list_relations_sync(
+        self, page: int, page_size: int, query: str | None
+    ) -> dict[str, Any]:
+        where = ["r.workspace_id = ?", "r.expired_at IS NULL"]
+        params: list[Any] = [self.workspace_id]
+        if query:
+            needle = f"%{query}%"
+            where.append(
+                "(r.relation_id LIKE ? OR r.entity_a_name LIKE ? "
+                "OR r.entity_b_name LIKE ? OR r.keywords_json LIKE ?)"
+            )
+            params.extend((needle, needle, needle, needle))
+        where_sql = " AND ".join(where)
+        offset = (page - 1) * page_size
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT count(*) FROM relation_registry r WHERE {where_sql}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT r.*, count(DISTINCT a.atom_id) AS atom_count
+                FROM relation_registry r
+                LEFT JOIN atoms a
+                  ON a.workspace_id = r.workspace_id AND a.owner_id = r.relation_id
+                WHERE {where_sql}
+                GROUP BY r.relation_id
+                ORDER BY r.entity_a_name COLLATE NOCASE,
+                         r.entity_b_name COLLATE NOCASE, r.relation_id
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["keywords"] = list(json.loads(item.pop("keywords_json") or "[]"))
+            item.pop("atom_ids_json", None)
+            items.append(item)
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "pages": (total + page_size - 1) // page_size,
+        }
+
+    async def get_relation_memory_view(
+        self, relation_id: str
+    ) -> dict[str, Any] | None:
+        """Return a relation owner, endpoint entities, and owned Atoms."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._get_relation_memory_view_sync, relation_id
+        )
+
+    def _get_relation_memory_view_sync(
+        self, relation_id: str
+    ) -> dict[str, Any] | None:
+        now = _utc_now()
+        status_sql = """CASE
+            WHEN a.expired_at IS NOT NULL THEN 'expired'
+            WHEN a.valid_at IS NOT NULL AND a.valid_at > ? THEN 'pending'
+            WHEN a.invalid_at IS NOT NULL AND a.invalid_at <= ? THEN 'invalid'
+            ELSE 'active' END"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM relation_registry "
+                "WHERE relation_id = ? AND workspace_id = ?",
+                (relation_id, self.workspace_id),
+            ).fetchone()
+            if row is None:
+                return None
+            atom_rows = connection.execute(
+                f"""
+                SELECT a.*, {status_sql} AS temporal_status,
+                       r.entity_a_name || ' ↔ ' || r.entity_b_name AS owner_name,
+                       count(DISTINCT ae.episode_id) AS evidence_count
+                FROM atoms a
+                JOIN relation_registry r ON r.relation_id = a.owner_id
+                LEFT JOIN atom_evidence ae ON ae.atom_id = a.atom_id
+                WHERE a.workspace_id = ? AND a.owner_id = ?
+                GROUP BY a.atom_id
+                ORDER BY a.created_at DESC, a.rowid DESC LIMIT 100
+                """,
+                (now, now, self.workspace_id, relation_id),
+            ).fetchall()
+            endpoint_rows = connection.execute(
+                "SELECT entity_id, canonical_name, entity_type FROM entity_registry "
+                "WHERE workspace_id = ? AND entity_id IN (?, ?)",
+                (self.workspace_id, row["entity_a_id"], row["entity_b_id"]),
+            ).fetchall()
+        item = dict(row)
+        item["keywords"] = list(json.loads(item.pop("keywords_json") or "[]"))
+        item.pop("atom_ids_json", None)
+        item["atoms"] = [self._atom_ui_row(atom) for atom in atom_rows]
+        item["atom_count"] = len(atom_rows)
+        endpoints = {endpoint["entity_id"]: dict(endpoint) for endpoint in endpoint_rows}
+        item["endpoints"] = [
+            endpoints.get(item["entity_a_id"], {
+                "entity_id": item["entity_a_id"],
+                "canonical_name": item["entity_a_name"],
+                "entity_type": None,
+            }),
+            endpoints.get(item["entity_b_id"], {
+                "entity_id": item["entity_b_id"],
+                "canonical_name": item["entity_b_name"],
+                "entity_type": None,
+            }),
+        ]
+        return item
+
+    async def list_communities(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 20,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        """List communities from the latest published SQLite snapshot."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._list_communities_sync, page, page_size, query
+        )
+
+    def _list_communities_sync(
+        self, page: int, page_size: int, query: str | None
+    ) -> dict[str, Any]:
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                "SELECT snapshot_id, published_at FROM dreaming_snapshots "
+                "WHERE workspace_id = ? AND status = 'published' "
+                "ORDER BY published_at DESC LIMIT 1",
+                (self.workspace_id,),
+            ).fetchone()
+            if snapshot is None:
+                return {"items": [], "page": page, "page_size": page_size, "total": 0, "pages": 0}
+            where = ["m.snapshot_id = ?"]
+            params: list[Any] = [snapshot["snapshot_id"]]
+            if query:
+                needle = f"%{query}%"
+                where.append(
+                    "(m.community_id LIKE ? OR cr.community_name LIKE ? OR cr.report LIKE ?)"
+                )
+                params.extend((needle, needle, needle))
+            where_sql = " AND ".join(where)
+            total = int(connection.execute(
+                f"SELECT count(*) FROM (SELECT m.community_id FROM dreaming_memberships m "
+                f"LEFT JOIN dreaming_community_reports cr ON cr.snapshot_id = m.snapshot_id "
+                f"AND cr.community_id = m.community_id WHERE {where_sql} GROUP BY m.community_id)",
+                params,
+            ).fetchone()[0])
+            rows = connection.execute(
+                f"""
+                SELECT m.community_id, m.snapshot_id,
+                       COALESCE(cr.community_name, m.community_id) AS community_name,
+                       cr.report, count(*) AS member_count,
+                       COALESCE(cr.prompt_tokens, 0) AS prompt_tokens,
+                       COALESCE(cr.completion_tokens, 0) AS completion_tokens,
+                       COALESCE(cr.total_tokens, 0) AS total_tokens,
+                       COALESCE(cr.llm_call_count, 0) AS llm_call_count,
+                       cr.token_usage_source,
+                       s.published_at
+                FROM dreaming_memberships m
+                JOIN dreaming_snapshots s ON s.snapshot_id = m.snapshot_id
+                LEFT JOIN dreaming_community_reports cr
+                  ON cr.snapshot_id = m.snapshot_id AND cr.community_id = m.community_id
+                WHERE {where_sql}
+                GROUP BY m.community_id
+                ORDER BY member_count DESC, m.community_id
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page_size, (page - 1) * page_size),
+            ).fetchall()
+        return {"items": [dict(row) for row in rows], "page": page, "page_size": page_size,
+                "total": total, "pages": (total + page_size - 1) // page_size}
+
+    async def get_community_memory_view(
+        self, community_id: str
+    ) -> dict[str, Any] | None:
+        """Return one latest community with its member entities."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(
+            self._get_community_memory_view_sync, community_id
+        )
+
+    def _get_community_memory_view_sync(
+        self, community_id: str
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                "SELECT snapshot_id, published_at FROM dreaming_snapshots "
+                "WHERE workspace_id = ? AND status = 'published' "
+                "ORDER BY published_at DESC LIMIT 1",
+                (self.workspace_id,),
+            ).fetchone()
+            if snapshot is None:
+                return None
+            membership_rows = connection.execute(
+                """
+                SELECT m.entity_id AS membership_key, m.membership_status
+                FROM dreaming_memberships m
+                WHERE m.snapshot_id = ? AND m.community_id = ?
+                ORDER BY m.entity_id COLLATE NOCASE
+                """,
+                (snapshot["snapshot_id"], community_id),
+            ).fetchall()
+            if not membership_rows:
+                return None
+            entity_rows = connection.execute(
+                "SELECT entity_id, canonical_name, normalized_name, entity_type "
+                "FROM entity_registry WHERE workspace_id = ? AND expired_at IS NULL",
+                (self.workspace_id,),
+            ).fetchall()
+            alias_rows = connection.execute(
+                "SELECT entity_id, normalized_alias FROM entity_aliases "
+                "WHERE workspace_id = ?",
+                (self.workspace_id,),
+            ).fetchall()
+            report = connection.execute(
+                "SELECT * FROM dreaming_community_reports "
+                "WHERE snapshot_id = ? AND community_id = ?",
+                (snapshot["snapshot_id"], community_id),
+            ).fetchone()
+        entities_by_id = {str(row["entity_id"]): dict(row) for row in entity_rows}
+        entities_by_name = {
+            normalize_name(str(row["canonical_name"])): dict(row)
+            for row in entity_rows
+        }
+        for alias in alias_rows:
+            entity = entities_by_id.get(str(alias["entity_id"]))
+            if entity is not None:
+                entities_by_name.setdefault(str(alias["normalized_alias"]), entity)
+        members: list[dict[str, Any]] = []
+        for membership in membership_rows:
+            membership_key = str(membership["membership_key"])
+            entity = entities_by_id.get(membership_key) or entities_by_name.get(
+                normalize_name(membership_key)
+            )
+            members.append(
+                {
+                    "membership_key": membership_key,
+                    "entity_id": entity["entity_id"] if entity else None,
+                    "canonical_name": (
+                        entity["canonical_name"] if entity else membership_key
+                    ),
+                    "entity_type": entity["entity_type"] if entity else None,
+                    "membership_status": membership["membership_status"],
+                    "resolved": entity is not None,
+                }
+            )
+        members.sort(
+            key=lambda member: normalize_name(str(member["canonical_name"]))
+        )
+        item = dict(report) if report is not None else {
+            "snapshot_id": snapshot["snapshot_id"],
+            "community_id": community_id,
+            "community_name": community_id,
+            "report": None,
+        }
+        item["published_at"] = snapshot["published_at"]
+        item["member_count"] = len(members)
+        item["members"] = members
+        return item
+
     async def list_atoms(
         self,
         *,
@@ -1816,6 +2688,11 @@ class SQLiteBackend:
         temporal_status: str | None = None,
         query: str | None = None,
         episode_id: str | None = None,
+        evolution_type: str | None = None,
+        valid_time_from: str | None = None,
+        valid_time_to: str | None = None,
+        system_time_from: str | None = None,
+        system_time_to: str | None = None,
     ) -> dict[str, Any]:
         """List Atom records without projecting their payload into Neo4j."""
 
@@ -1828,6 +2705,11 @@ class SQLiteBackend:
             temporal_status,
             query,
             episode_id,
+            evolution_type,
+            valid_time_from,
+            valid_time_to,
+            system_time_from,
+            system_time_to,
         )
 
     def _list_atoms_sync(
@@ -1838,6 +2720,11 @@ class SQLiteBackend:
         temporal_status: str | None,
         query: str | None,
         episode_id: str | None,
+        evolution_type: str | None,
+        valid_time_from: str | None,
+        valid_time_to: str | None,
+        system_time_from: str | None,
+        system_time_to: str | None,
     ) -> dict[str, Any]:
         now = _utc_now()
         status_sql = """CASE
@@ -1858,6 +2745,41 @@ class SQLiteBackend:
             where.append("(a.atom_id LIKE ? OR a.content LIKE ? OR a.owner_id LIKE ?)")
             needle = f"%{query}%"
             params.extend((needle, needle, needle))
+        if evolution_type:
+            relation_filter = ""
+            if evolution_type != "any":
+                relation_filter = " AND evolution.relation_type = ?"
+                params.append(evolution_type)
+            where.append(
+                "EXISTS (SELECT 1 FROM atom_evolution evolution "
+                "WHERE (evolution.source_atom_id = a.atom_id "
+                "OR evolution.target_atom_id = a.atom_id)"
+                f"{relation_filter})"
+            )
+        if valid_time_from or valid_time_to:
+            endpoint_conditions: list[str] = []
+            for column in ("a.valid_at", "a.invalid_at"):
+                conditions = [f"{column} IS NOT NULL"]
+                if valid_time_from:
+                    conditions.append(f"julianday({column}) >= julianday(?)")
+                    params.append(valid_time_from)
+                if valid_time_to:
+                    conditions.append(f"julianday({column}) <= julianday(?)")
+                    params.append(valid_time_to)
+                endpoint_conditions.append("(" + " AND ".join(conditions) + ")")
+            where.append("(" + " OR ".join(endpoint_conditions) + ")")
+        if system_time_from or system_time_to:
+            endpoint_conditions = []
+            for column in ("a.created_at", "a.expired_at"):
+                conditions = [f"{column} IS NOT NULL"]
+                if system_time_from:
+                    conditions.append(f"julianday({column}) >= julianday(?)")
+                    params.append(system_time_from)
+                if system_time_to:
+                    conditions.append(f"julianday({column}) <= julianday(?)")
+                    params.append(system_time_to)
+                endpoint_conditions.append("(" + " AND ".join(conditions) + ")")
+            where.append("(" + " OR ".join(endpoint_conditions) + ")")
         joins = ""
         if episode_id:
             joins = "JOIN atom_evidence episode_filter ON episode_filter.atom_id = a.atom_id"
@@ -1879,14 +2801,24 @@ class SQLiteBackend:
                        COALESCE(er.canonical_name,
                                 rr.entity_a_name || ' ↔ ' || rr.entity_b_name,
                                 a.owner_id) AS owner_name,
-                       count(DISTINCT ae.episode_id) AS evidence_count
+                       count(DISTINCT ae.episode_id) AS evidence_count,
+                       (SELECT count(*) FROM atom_evolution evolution
+                        WHERE evolution.source_atom_id = a.atom_id
+                           OR evolution.target_atom_id = a.atom_id) AS evolution_count,
+                       (SELECT count(*) FROM atom_evolution conflict
+                        WHERE conflict.relation_type = 'CONTRADICTION'
+                          AND (conflict.source_atom_id = a.atom_id
+                            OR conflict.target_atom_id = a.atom_id)
+                          AND json_extract(conflict.metadata_json, '$.resolved_at')
+                              IS NULL) AS unresolved_conflict_count
                 FROM atoms a {joins}
                 LEFT JOIN atom_evidence ae ON ae.atom_id = a.atom_id
                 LEFT JOIN entity_registry er ON er.entity_id = a.owner_id
                 LEFT JOIN relation_registry rr ON rr.relation_id = a.owner_id
                 WHERE {where_sql}
                 GROUP BY a.atom_id
-                ORDER BY a.created_at DESC, a.rowid DESC
+                ORDER BY unresolved_conflict_count DESC,
+                         a.updated_at DESC, a.created_at DESC, a.rowid DESC
                 LIMIT ? OFFSET ?
                 """,
                 (now, now, *params, page_size, offset),
@@ -1940,7 +2872,176 @@ class SQLiteBackend:
             ).fetchall()
         item = self._atom_ui_row(row)
         item["evidence"] = [dict(evidence) for evidence in evidence_rows]
+        item["evolutions"] = self._list_atom_evolution_views_sync(atom_id)
         return item
+
+    def _list_atom_evolution_views_sync(self, atom_id: str) -> list[dict[str, Any]]:
+        """Return evolution edges enriched with the Atom on the other end."""
+
+        now = _utc_now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT evolution.source_atom_id, evolution.target_atom_id,
+                       evolution.relation_type, evolution.created_at,
+                       evolution.metadata_json,
+                       related.atom_id AS related_atom_id,
+                       related.content AS related_content,
+                       related.valid_at AS related_valid_at,
+                       related.invalid_at AS related_invalid_at,
+                       related.expired_at AS related_expired_at,
+                       CASE
+                           WHEN related.expired_at IS NOT NULL THEN 'expired'
+                           WHEN related.valid_at IS NOT NULL AND related.valid_at > ?
+                               THEN 'pending'
+                           WHEN related.invalid_at IS NOT NULL AND related.invalid_at <= ?
+                               THEN 'invalid'
+                           ELSE 'active'
+                       END AS related_temporal_status
+                FROM atom_evolution evolution
+                JOIN atoms related
+                  ON related.atom_id = CASE
+                      WHEN evolution.source_atom_id = ?
+                      THEN evolution.target_atom_id
+                      ELSE evolution.source_atom_id
+                  END
+                WHERE (evolution.source_atom_id = ? OR evolution.target_atom_id = ?)
+                  AND related.workspace_id = ?
+                ORDER BY evolution.created_at DESC,
+                         evolution.source_atom_id, evolution.target_atom_id
+                """,
+                (now, now, atom_id, atom_id, atom_id, self.workspace_id),
+            ).fetchall()
+        evolutions: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            evolutions.append(
+                {
+                    "source_atom_id": row["source_atom_id"],
+                    "target_atom_id": row["target_atom_id"],
+                    "relation_type": row["relation_type"],
+                    "created_at": row["created_at"],
+                    "metadata": metadata,
+                    "direction": (
+                        "outgoing" if row["source_atom_id"] == atom_id else "incoming"
+                    ),
+                    "resolved": bool(metadata.get("resolved_at")),
+                    "related_atom": {
+                        "atom_id": row["related_atom_id"],
+                        "content": row["related_content"],
+                        "valid_at": row["related_valid_at"],
+                        "invalid_at": row["related_invalid_at"],
+                        "expired_at": row["related_expired_at"],
+                        "temporal_status": row["related_temporal_status"],
+                    },
+                }
+            )
+        return evolutions
+
+    async def resolve_atom_conflict(
+        self,
+        source_atom_id: str,
+        target_atom_id: str,
+        winner_atom_id: str,
+        *,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve one contradiction while retaining its complete audit trail."""
+
+        self._require_initialized()
+        result = await asyncio.to_thread(
+            self._resolve_atom_conflict_sync,
+            source_atom_id,
+            target_atom_id,
+            winner_atom_id,
+            note,
+        )
+        result["winner_atom"] = await self.get_atom_memory_view(winner_atom_id)
+        result["retired_atom"] = await self.get_atom_memory_view(
+            str(result["retired_atom_id"])
+        )
+        return result
+
+    def _resolve_atom_conflict_sync(
+        self,
+        source_atom_id: str,
+        target_atom_id: str,
+        winner_atom_id: str,
+        note: str | None,
+    ) -> dict[str, Any]:
+        if winner_atom_id not in {source_atom_id, target_atom_id}:
+            raise ValueError("winner_atom_id must be one of the conflicting Atoms")
+        retired_atom_id = (
+            target_atom_id if winner_atom_id == source_atom_id else source_atom_id
+        )
+        now = _utc_now()
+        with self._connect() as connection:
+            evolution = connection.execute(
+                """
+                SELECT source_atom_id, target_atom_id, metadata_json
+                FROM atom_evolution
+                WHERE relation_type = 'CONTRADICTION'
+                  AND ((source_atom_id = ? AND target_atom_id = ?)
+                    OR (source_atom_id = ? AND target_atom_id = ?))
+                """,
+                (
+                    source_atom_id,
+                    target_atom_id,
+                    target_atom_id,
+                    source_atom_id,
+                ),
+            ).fetchone()
+            if evolution is None:
+                raise KeyError("contradiction relation not found")
+            atom_rows = connection.execute(
+                "SELECT atom_id, owner_id FROM atoms "
+                "WHERE workspace_id = ? AND atom_id IN (?, ?)",
+                (self.workspace_id, source_atom_id, target_atom_id),
+            ).fetchall()
+            if len(atom_rows) != 2:
+                raise KeyError("one or both conflicting Atoms were not found")
+            owners = {str(row["owner_id"]) for row in atom_rows}
+            if len(owners) != 1:
+                raise ValueError("conflicting Atoms must belong to the same owner")
+            metadata = json.loads(evolution["metadata_json"] or "{}")
+            existing_winner = metadata.get("winner_atom_id")
+            if metadata.get("resolved_at") and existing_winner != winner_atom_id:
+                raise ValueError("conflict was already resolved with another winner")
+            metadata.update(
+                {
+                    "resolved_at": metadata.get("resolved_at") or now,
+                    "resolution": "manual",
+                    "winner_atom_id": winner_atom_id,
+                    "retired_atom_id": retired_atom_id,
+                }
+            )
+            if note:
+                metadata["resolution_note"] = note
+            connection.execute(
+                "UPDATE atoms SET expired_at = COALESCE(expired_at, ?), updated_at = ? "
+                "WHERE workspace_id = ? AND atom_id = ?",
+                (now, now, self.workspace_id, retired_atom_id),
+            )
+            connection.execute(
+                """
+                UPDATE atom_evolution SET metadata_json = ?
+                WHERE source_atom_id = ? AND target_atom_id = ?
+                  AND relation_type = 'CONTRADICTION'
+                """,
+                (
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    evolution["source_atom_id"],
+                    evolution["target_atom_id"],
+                ),
+            )
+            self._queue_owner_projection_sync(connection, owners.pop())
+        return {
+            "source_atom_id": source_atom_id,
+            "target_atom_id": target_atom_id,
+            "winner_atom_id": winner_atom_id,
+            "retired_atom_id": retired_atom_id,
+            "resolved_at": metadata["resolved_at"],
+        }
 
     @staticmethod
     def _atom_ui_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -2275,6 +3376,19 @@ class SQLiteBackend:
 
     def _clear_registry_sync(self) -> None:
         with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM dreaming_memberships WHERE snapshot_id IN "
+                "(SELECT snapshot_id FROM dreaming_snapshots WHERE workspace_id = ?)",
+                (self.workspace_id,),
+            )
+            connection.execute(
+                "DELETE FROM dreaming_snapshots WHERE workspace_id = ?",
+                (self.workspace_id,),
+            )
+            connection.execute(
+                "DELETE FROM dreaming_runs WHERE workspace_id = ?",
+                (self.workspace_id,),
+            )
             connection.execute(
                 "DELETE FROM memory_embeddings WHERE workspace_id = ?",
                 (self.workspace_id,),
@@ -2665,6 +3779,423 @@ class SQLiteBackend:
                 (self.workspace_id,),
             ).fetchone()
         return row["setting_value"] if row else None
+
+    async def start_dreaming_run(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        """Reserve the workspace's single full-rebuild Dreaming slot."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(self._start_dreaming_run_sync, dict(config))
+
+    def _start_dreaming_run_sync(self, config: dict[str, Any]) -> dict[str, Any]:
+        run_id = f"dream-run-{uuid4()}"
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT run_id FROM dreaming_runs
+                WHERE workspace_id = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (self.workspace_id,),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError(
+                    f"Dreaming run {active['run_id']} is already active"
+                )
+            connection.execute(
+                """
+                INSERT INTO dreaming_runs(
+                    run_id, workspace_id, status, phase, config_json,
+                    created_at, started_at
+                ) VALUES (?, ?, 'running', 'queued', ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    self.workspace_id,
+                    json.dumps(config, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+        return {
+            "run_id": run_id,
+            "workspace_id": self.workspace_id,
+            "status": "running",
+            "phase": "queued",
+            "config": config,
+            "created_at": now,
+            "started_at": now,
+        }
+
+    async def update_dreaming_run_phase(self, run_id: str, phase: str) -> None:
+        self._require_initialized()
+        await asyncio.to_thread(self._update_dreaming_run_phase_sync, run_id, phase)
+
+    def _update_dreaming_run_phase_sync(self, run_id: str, phase: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE dreaming_runs SET phase = ?
+                WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                """,
+                (phase, self.workspace_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Dreaming run {run_id} is not active")
+
+    async def prepare_dreaming_snapshot(
+        self,
+        *,
+        run_id: str,
+        snapshot_id: str,
+        assignments: Mapping[str, str],
+        algorithm: str,
+        algorithm_version: str | None,
+        config: Mapping[str, Any],
+        node_count: int,
+        relationship_count: int,
+        reports: Mapping[str, Mapping[str, Any]] | None = None,
+        usage: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist a complete, unpublished membership snapshot atomically."""
+
+        self._require_initialized()
+        await asyncio.to_thread(
+            self._prepare_dreaming_snapshot_sync,
+            run_id,
+            snapshot_id,
+            dict(assignments),
+            algorithm,
+            algorithm_version,
+            dict(config),
+            node_count,
+            relationship_count,
+            {key: dict(value) for key, value in (reports or {}).items()},
+            dict(usage or {}),
+        )
+
+    def _prepare_dreaming_snapshot_sync(
+        self,
+        run_id: str,
+        snapshot_id: str,
+        assignments: dict[str, str],
+        algorithm: str,
+        algorithm_version: str | None,
+        config: dict[str, Any],
+        node_count: int,
+        relationship_count: int,
+        reports: dict[str, dict[str, Any]],
+        usage: dict[str, Any],
+    ) -> None:
+        now = _utc_now()
+        community_count = len(set(assignments.values()))
+        report_count = int(usage.get("report_count", 0))
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        completion_tokens = int(usage.get("completion_tokens", 0))
+        total_tokens = int(usage.get("total_tokens", 0))
+        llm_call_count = int(usage.get("llm_call_count", 0))
+        token_usage_source = usage.get("token_usage_source")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT 1 FROM dreaming_runs
+                WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                """,
+                (self.workspace_id, run_id),
+            ).fetchone()
+            if active is None:
+                raise RuntimeError(f"Dreaming run {run_id} is not active")
+            connection.execute(
+                """
+                INSERT INTO dreaming_snapshots(
+                    snapshot_id, workspace_id, run_id, status, algorithm,
+                    algorithm_version, config_json, node_count,
+                    relationship_count, community_count, report_count,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    llm_call_count, token_usage_source, created_at
+                ) VALUES (?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    self.workspace_id,
+                    run_id,
+                    algorithm,
+                    algorithm_version,
+                    json.dumps(config, ensure_ascii=False, sort_keys=True),
+                    node_count,
+                    relationship_count,
+                    community_count,
+                    report_count,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    llm_call_count,
+                    token_usage_source,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO dreaming_memberships(
+                    snapshot_id, entity_id, community_id, membership_status
+                ) VALUES (?, ?, ?, 'stable')
+                """,
+                [
+                    (snapshot_id, entity_id, community_id)
+                    for entity_id, community_id in assignments.items()
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO dreaming_community_reports(
+                    snapshot_id, community_id, community_name, report,
+                    member_count, prompt_tokens, completion_tokens,
+                    total_tokens, llm_call_count, token_usage_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        snapshot_id,
+                        community_id,
+                        str(report.get("community_name") or community_id),
+                        str(report.get("report") or ""),
+                        int(report.get("member_count", 0)),
+                        int(report.get("prompt_tokens", 0)),
+                        int(report.get("completion_tokens", 0)),
+                        int(report.get("total_tokens", 0)),
+                        int(report.get("llm_call_count", 0)),
+                        report.get("token_usage_source"),
+                    )
+                    for community_id, report in reports.items()
+                ],
+            )
+            connection.execute(
+                """
+                UPDATE dreaming_runs
+                SET phase = 'publishing', snapshot_id = ?, node_count = ?,
+                    relationship_count = ?, community_count = ?,
+                    report_count = ?, prompt_tokens = ?, completion_tokens = ?,
+                    total_tokens = ?, llm_call_count = ?, token_usage_source = ?
+                WHERE workspace_id = ? AND run_id = ?
+                """,
+                (
+                    snapshot_id,
+                    node_count,
+                    relationship_count,
+                    community_count,
+                    report_count,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    llm_call_count,
+                    token_usage_source,
+                    self.workspace_id,
+                    run_id,
+                ),
+            )
+
+    async def publish_dreaming_snapshot(
+        self, run_id: str, snapshot_id: str
+    ) -> None:
+        self._require_initialized()
+        await asyncio.to_thread(
+            self._publish_dreaming_snapshot_sync, run_id, snapshot_id
+        )
+
+    def _publish_dreaming_snapshot_sync(
+        self, run_id: str, snapshot_id: str
+    ) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE dreaming_snapshots
+                SET status = 'published', published_at = ?
+                WHERE workspace_id = ? AND snapshot_id = ?
+                  AND run_id = ? AND status = 'prepared'
+                """,
+                (now, self.workspace_id, snapshot_id, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"Dreaming snapshot {snapshot_id} is not prepared")
+            connection.execute(
+                """
+                UPDATE dreaming_runs
+                SET status = 'succeeded', phase = 'complete', finished_at = ?
+                WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                """,
+                (now, self.workspace_id, run_id),
+            )
+
+    async def fail_dreaming_run(self, run_id: str, error: str) -> None:
+        self._require_initialized()
+        await asyncio.to_thread(self._fail_dreaming_run_sync, run_id, error)
+
+    def _fail_dreaming_run_sync(self, run_id: str, error: str) -> None:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE dreaming_snapshots SET status = 'failed'
+                WHERE workspace_id = ? AND run_id = ? AND status = 'prepared'
+                """,
+                (self.workspace_id, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE dreaming_runs
+                SET status = 'failed', phase = 'failed', error = ?, finished_at = ?
+                WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                """,
+                (error[:4000], now, self.workspace_id, run_id),
+            )
+
+    async def get_dreaming_status(self) -> dict[str, Any]:
+        self._require_initialized()
+        return await asyncio.to_thread(self._get_dreaming_status_sync)
+
+    @staticmethod
+    def _dreaming_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        if "config_json" in item:
+            item["config"] = json.loads(item.pop("config_json") or "{}")
+        return item
+
+    def _get_dreaming_status_sync(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            active = connection.execute(
+                """
+                SELECT * FROM dreaming_runs
+                WHERE workspace_id = ? AND status = 'running'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (self.workspace_id,),
+            ).fetchone()
+            latest_run = connection.execute(
+                """
+                SELECT * FROM dreaming_runs
+                WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (self.workspace_id,),
+            ).fetchone()
+            latest_snapshot = connection.execute(
+                """
+                SELECT * FROM dreaming_snapshots
+                WHERE workspace_id = ? AND status = 'published'
+                ORDER BY published_at DESC LIMIT 1
+                """,
+                (self.workspace_id,),
+            ).fetchone()
+        return {
+            "workspace_id": self.workspace_id,
+            "active_run": self._dreaming_row(active),
+            "latest_run": self._dreaming_row(latest_run),
+            "latest_snapshot": self._dreaming_row(latest_snapshot),
+        }
+
+    async def get_latest_dreaming_memberships(self) -> dict[str, Any] | None:
+        """Return the last published partition for compensating rollback."""
+
+        self._require_initialized()
+        return await asyncio.to_thread(self._get_latest_dreaming_memberships_sync)
+
+    def _get_latest_dreaming_memberships_sync(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                """
+                SELECT snapshot_id, published_at FROM dreaming_snapshots
+                WHERE workspace_id = ? AND status = 'published'
+                ORDER BY published_at DESC LIMIT 1
+                """,
+                (self.workspace_id,),
+            ).fetchone()
+            if snapshot is None:
+                return None
+            rows = connection.execute(
+                """
+                SELECT entity_id, community_id FROM dreaming_memberships
+                WHERE snapshot_id = ?
+                """,
+                (snapshot["snapshot_id"],),
+            ).fetchall()
+            report_rows = connection.execute(
+                "SELECT * FROM dreaming_community_reports WHERE snapshot_id = ?",
+                (snapshot["snapshot_id"],),
+            ).fetchall()
+        return {
+            "snapshot_id": snapshot["snapshot_id"],
+            "published_at": snapshot["published_at"],
+            "assignments": {
+                row["entity_id"]: row["community_id"] for row in rows
+            },
+            "reports": {
+                report["community_id"]: dict(report)
+                for report in report_rows
+            },
+        }
+
+    async def store_dreaming_community_reports(
+        self, snapshot_id: str, reports: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Backfill graph-resident reports into an existing SQLite snapshot."""
+
+        self._require_initialized()
+        await asyncio.to_thread(
+            self._store_dreaming_community_reports_sync,
+            snapshot_id,
+            [dict(report) for report in reports],
+        )
+
+    def _store_dreaming_community_reports_sync(
+        self, snapshot_id: str, reports: list[dict[str, Any]]
+    ) -> None:
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                "SELECT 1 FROM dreaming_snapshots "
+                "WHERE snapshot_id = ? AND workspace_id = ?",
+                (snapshot_id, self.workspace_id),
+            ).fetchone()
+            if snapshot is None:
+                raise KeyError(f"unknown Dreaming snapshot {snapshot_id!r}")
+            connection.executemany(
+                """
+                INSERT INTO dreaming_community_reports(
+                    snapshot_id, community_id, community_name, report,
+                    member_count, prompt_tokens, completion_tokens,
+                    total_tokens, llm_call_count, token_usage_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id, community_id) DO UPDATE SET
+                    community_name = excluded.community_name,
+                    report = excluded.report,
+                    member_count = excluded.member_count,
+                    prompt_tokens = excluded.prompt_tokens,
+                    completion_tokens = excluded.completion_tokens,
+                    total_tokens = excluded.total_tokens,
+                    llm_call_count = excluded.llm_call_count,
+                    token_usage_source = excluded.token_usage_source
+                """,
+                [
+                    (
+                        snapshot_id,
+                        str(report["community_id"]),
+                        str(report.get("community_name") or report["community_id"]),
+                        str(report.get("report") or ""),
+                        int(report.get("member_count", 0)),
+                        int(report.get("prompt_tokens", 0)),
+                        int(report.get("completion_tokens", 0)),
+                        int(report.get("total_tokens", 0)),
+                        int(report.get("llm_call_count", 0)),
+                        report.get("token_usage_source"),
+                    )
+                    for report in reports
+                ],
+            )
 
     async def register_exploration_trace(
         self, exploration_id: str, query: str | None = None

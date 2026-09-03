@@ -23,8 +23,11 @@ export const EXPLORER_AGENT_COLORS = [
   '#facc15'
 ]
 
+export const EXPLORATION_TRACE_COLOR = '#22D3EE'
+
 const SEMANTIC_GRAPH_NODE_BORDER_COLOR = '#EEEEEE'
 const CANDIDATE_NODE_COLOR = '#4B5563'
+const INACTIVE_EXPLORATION_EDGE_COLOR = '#737373'
 
 function stableHash(value: string): number {
   let hash = 2166136261
@@ -68,6 +71,7 @@ export function buildExplorationGraph(frames: Record<string, ExpandFrame>): Undi
   const visitedRelations = new Set<string>()
   const visitedRelationEndpoints = new Map<string, [string, string]>()
   const currentCandidates: CandidateContext[] = []
+  const currentCandidateRelations = new Set<string>()
   const orderedFrames = Object.values(frames).sort((left, right) => left.startedSeq - right.startedSeq)
   const latestFrames = Object.values(latestExpandFramesByAgent(frames))
   const agentOrder = [...new Set(orderedFrames.map(frame => frame.agentId))]
@@ -136,6 +140,9 @@ export function buildExplorationGraph(frames: Record<string, ExpandFrame>): Undi
     for (const result of frame.event.payload.result?.results ?? []) {
       for (const candidate of result.candidates ?? []) {
         currentCandidates.push({ frontier: result.frontier, candidate })
+        currentCandidateRelations.add(
+          relationKey(candidate.relation.endpoints[0], candidate.relation.endpoints[1])
+        )
       }
     }
   }
@@ -213,7 +220,7 @@ export function buildExplorationGraph(frames: Record<string, ExpandFrame>): Undi
     if (!graph.hasEdge(edge)) {
       graph.addUndirectedEdgeWithKey(edge, nodeKey(source), nodeKey(target), {
         size: visitedRelations.has(edge) ? 1.8 : 1,
-        ...(visitedRelations.has(edge) ? {} : { color: '#64748B' }),
+        color: EXPLORATION_TRACE_COLOR,
         explorationState: visitedRelations.has(edge) ? 'visited' : 'candidate',
         label: Array.isArray(candidate.relation.keywords)
           ? candidate.relation.keywords.join(', ')
@@ -226,7 +233,13 @@ export function buildExplorationGraph(frames: Record<string, ExpandFrame>): Undi
 
   for (const edge of visitedRelations) {
     if (graph.hasEdge(edge)) {
-      graph.mergeEdgeAttributes(edge, { size: 1.8, explorationState: 'visited' })
+      graph.mergeEdgeAttributes(edge, {
+        size: 1.8,
+        color: currentCandidateRelations.has(edge)
+          ? EXPLORATION_TRACE_COLOR
+          : INACTIVE_EXPLORATION_EDGE_COLOR,
+        explorationState: 'visited'
+      })
       continue
     }
     const relation = relationMetadata.get(edge)
@@ -237,6 +250,7 @@ export function buildExplorationGraph(frames: Record<string, ExpandFrame>): Undi
     if (!graph.hasNode(nodeKey(target))) addNode(target)
     graph.addUndirectedEdgeWithKey(edge, nodeKey(source), nodeKey(target), {
       size: 1.8,
+      color: INACTIVE_EXPLORATION_EDGE_COLOR,
       explorationState: 'visited',
       label: Array.isArray(relation?.keywords)
         ? relation.keywords.join(', ')

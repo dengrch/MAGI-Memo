@@ -13,7 +13,8 @@ import MagiCoreMark from '@/components/icons/MagiCoreMark'
 
 import GraphViewer from '@/features/GraphViewer'
 import MemoryWorkspace from '@/features/MemoryWorkspace'
-import RetrievalView from '@/features/RetrievalView'
+import CasperView from '@/features/RetrievalView'
+import MelchiorView from '@/features/MelchiorView'
 import BalthasarView from '@/features/BalthasarView'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
@@ -172,13 +173,13 @@ function App() {
           // Loading state while initializing with simplified header
           <div className="magi-app-shell flex h-screen w-screen max-md:flex-col">
             {/* Simplified header during initialization - matches SiteHeader structure */}
-            <header className="magi-system-header flex h-full w-[240px] shrink-0 flex-col border-r p-3 max-md:h-14 max-md:w-full max-md:flex-row max-md:border-r-0 max-md:border-b">
-              <div className="flex min-h-11 items-center px-2">
-                <a href={webuiPrefix} className="flex items-center gap-2">
-                  <span className="magi-brand-mark flex size-7 items-center justify-center rounded-lg">
-                    <MagiCoreMark className="size-5" />
+            <header className="magi-system-header relative z-50 flex h-full w-[240px] shrink-0 flex-col border-r p-3 max-md:h-14 max-md:w-full max-md:flex-row max-md:items-center max-md:border-r-0 max-md:border-b max-md:px-3 max-md:py-1.5">
+              <div className="flex min-h-11 items-center px-2 max-md:min-h-0 max-md:px-0">
+                <a href={webuiPrefix} className="flex items-center gap-2.5">
+                  <span className="text-foreground flex size-8 items-center justify-center">
+                    <MagiCoreMark variant="solid" className="size-7" />
                   </span>
-                  <span className="text-sm font-medium">{SiteInfo.name}</span>
+                  <span className="text-sm font-medium tracking-[-0.01em] max-sm:hidden">{SiteInfo.name}</span>
                 </a>
               </div>
             </header>
@@ -201,14 +202,17 @@ function App() {
             >
               <SiteHeader />
               <div className="magi-workspace relative min-w-0 grow overflow-hidden">
-                <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
+                <TabsContent value="documents" className="magi-memory-scroll absolute top-0 right-0 bottom-0 left-0 overflow-auto">
                   <MemoryWorkspace />
                 </TabsContent>
                 <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <GraphViewer />
                 </TabsContent>
-                <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <RetrievalView />
+                <TabsContent value="casper" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                  <CasperView />
+                </TabsContent>
+                <TabsContent value="melchior" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                  <MelchiorView />
                 </TabsContent>
                 <TabsContent value="balthasar" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <BalthasarView />

@@ -44,7 +44,7 @@ relation stable ids are validated inside MAGI and stripped by the client before
 any recall, expansion, or evidence result reaches model context.
 
 All workers in one run write expansion events under the coordinator's shared
-exploration id while retaining their own agent id and subquery. Balthasar can
+exploration id while retaining their own agent id and subquery. Melchior can
 therefore render the batch live, color each worker independently, and replay
 the exact worker/subquery/expand sequence. Workers intentionally do not share a
 coverage lock: isolation preserves each assigned reasoning chain, while s0

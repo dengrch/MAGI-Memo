@@ -150,7 +150,7 @@ export default function UserPromptInputWithHistory({
           <button
             type="button"
             onClick={handleInputClick}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-0 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            className="hover:bg-accent absolute top-1/2 right-2 -translate-y-1/2 rounded-lg p-0 transition-colors"
             tabIndex={-1}
           >
             <ChevronDown
@@ -165,15 +165,15 @@ export default function UserPromptInputWithHistory({
 
       {/* Dropdown */}
       {isOpen && history.length > 0 && (
-        <div className="absolute top-full left-0 right-0 z-50 mt-0.5 bg-gray-100 dark:bg-gray-900 border border-gray-300 dark:border-gray-700 rounded-md shadow-lg max-h-96 overflow-auto min-w-0">
+        <div className="absolute top-full right-0 left-0 z-50 mt-1 max-h-96 min-w-0 overflow-auto rounded-xl border border-border/70 bg-background/55 p-1 shadow-[inset_0_1px_rgba(255,255,255,0.06),0_12px_30px_-16px_rgba(0,0,0,0.78)] backdrop-blur-xl">
           {history.map((prompt, index) => (
             <div
               key={index}
               className={cn(
-                'flex items-center justify-between pl-3 pr-1 py-2 text-sm hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors',
-                'border-b border-gray-100 dark:border-gray-700 last:border-b-0',
-                'focus-within:bg-gray-100 dark:focus-within:bg-gray-700',
-                selectedIndex === index && 'bg-gray-100 dark:bg-gray-700'
+                'flex items-center justify-between rounded-lg py-2 pr-1 pl-3 text-sm transition-colors hover:bg-white/[0.07]',
+                'border-b border-border/40 last:border-b-0',
+                'focus-within:bg-white/[0.06]',
+                selectedIndex === index && 'bg-white/[0.08]'
               )}
             >
               <button
@@ -188,7 +188,7 @@ export default function UserPromptInputWithHistory({
                 <button
                   type="button"
                   onClick={(e) => handleDeleteHistoryItem(index, e)}
-                  className="flex-shrink-0 p-0 rounded hover:bg-red-100 dark:hover:bg-red-900 transition-colors focus:outline-none ml-auto"
+                  className="ml-auto flex-shrink-0 rounded-lg p-0 transition-colors hover:bg-red-500/10 focus:outline-none"
                   title="Delete this history item"
                 >
                   <X className="h-3 w-3 text-gray-400 hover:text-red-500" />

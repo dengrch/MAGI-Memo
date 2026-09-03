@@ -78,6 +78,8 @@ from magi_core.parser.external.mineru.cache import MinerUParserOptions
 from magi_core.api.routers.query_routes import create_query_routes
 from magi_core.api.routers.graph_routes import create_graph_routes
 from magi_core.api.routers.memory_routes import create_memory_routes
+from magi_core.api.routers.runtime_llm_routes import create_runtime_llm_routes
+from magi_core.api.routers.dreaming_routes import create_dreaming_routes
 from magi_core.api.routers.ollama_api import OllamaAPI
 
 from magi_core.utils import logger, set_verbose_debug
@@ -2417,6 +2419,8 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
     app.include_router(create_memory_routes(rag, memory_db, api_key))
+    app.include_router(create_runtime_llm_routes(rag, api_key))
+    app.include_router(create_dreaming_routes(rag, memory_db, api_key))
 
     workspace_auth = get_combined_auth_dependency(api_key)
 
