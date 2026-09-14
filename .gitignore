@@ -234,6 +234,15 @@ __marimo__/
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Retired local Sage research sandboxes
-/sages/pi/
-/sages/pi-adapters/
+# Local design references
+/Linear-ui-design/
+/Agent 能力扩展范式对比（精简版）.md
+
+# Local agent-harness framework checkouts and design sandboxes. Keep only the
+# directory guide and the MAGI Memo integration plugin in this repository.
+/sages/*
+!/sages/README.md
+!/sages/dsh/
+/sages/dsh/*
+!/sages/dsh/magi-memo/
+!/sages/dsh/magi-memo/**

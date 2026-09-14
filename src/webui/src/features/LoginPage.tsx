@@ -171,7 +171,10 @@ const LoginPage = () => {
               <span className="magi-brand-mark flex size-9 items-center justify-center rounded-xl">
                 <MagiCoreMark className="size-6" />
               </span>
-              <span className="text-sm font-medium">MAGI Memo</span>
+              <span className="magi-brand-lockup">
+                <span className="magi-brand-word">MAGI</span>
+                <span className="magi-brand-suffix">Memo</span>
+              </span>
             </div>
             <h1 className="mt-16 max-w-sm text-[40px] leading-[1.05] font-medium tracking-[-0.045em]">
               {t('login.heroTitle')}
@@ -203,7 +206,10 @@ const LoginPage = () => {
               <span className="magi-brand-mark flex size-8 items-center justify-center rounded-lg">
                 <MagiCoreMark className="size-5" />
               </span>
-              <span className="text-sm font-medium">MAGI Memo</span>
+              <span className="magi-brand-lockup">
+                <span className="magi-brand-word">MAGI</span>
+                <span className="magi-brand-suffix">Memo</span>
+              </span>
             </div>
             <p className="text-muted-foreground mb-2 text-xs font-medium tracking-[0.08em] uppercase">
               {t('login.workspaceAccess')}

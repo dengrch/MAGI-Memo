@@ -179,7 +179,7 @@ function App() {
                   <span className="text-foreground flex size-8 items-center justify-center">
                     <MagiCoreMark variant="solid" className="size-7" />
                   </span>
-                  <span className="text-sm font-medium tracking-[-0.01em] max-sm:hidden">{SiteInfo.name}</span>
+                  <span className="magi-brand-lockup max-sm:hidden"><span className="magi-brand-word">MAGI</span><span className="magi-brand-suffix">Memo</span></span>
                 </a>
               </div>
             </header>

@@ -129,11 +129,21 @@ export function currentOpenTurn(events: readonly SessionEvent[]): number | undef
   return undefined
 }
 
-export function memoryModePrompt(mode: MemoryMode, referenceAt = new Date().toISOString()): string {
+export function resolveTurnReferenceAt(
+  events: readonly SessionEvent[],
+  cached: { turn: number | undefined, value: string } | undefined,
+  now: () => string = () => new Date().toISOString(),
+): { turn: number | undefined, value: string } {
+  const turn = currentOpenTurn(events)
+  if (cached !== undefined && cached.turn === turn) return cached
+  return { turn, value: now() }
+}
+
+export function memoryModePrompt(mode: MemoryMode): string {
   const common = [
     `MAGI Memo memory mode for this session: ${mode}.`,
-    `Current system time and default Episode reference_at: ${referenceAt}.`,
-    'Unless the user explicitly provides a historical Episode time, use this reference_at before generating Atom temporal fields. Do not invent a different current year.',
+    'The current turn\'s default Episode reference_at is supplied separately in runtime context.',
+    'Unless the user explicitly provides a historical Episode time, use that reference_at before generating Atom temporal fields. Do not invent a different current year.',
     'MAGI memory tools always operate on the currently active workspace.',
     'Never create, switch, or activate a workspace proactively. Call magi_workspace_create or magi_workspace_activate only when the user explicitly asks to create or switch the memory workspace.',
     'If no suitable workspace is active, tell the user and ask which workspace to use; do not create or activate one on your own.',
@@ -179,12 +189,15 @@ export function memoryModePrompt(mode: MemoryMode, referenceAt = new Date().toIS
 export function scopedMemoryPrompt(
   mode: MemoryMode,
   delegated: boolean,
-  referenceAt = new Date().toISOString(),
 ): string {
   if (delegated) {
     return 'You are a delegated subagent. The parent-agent MAGI Recall Gate, Write Gate, workspace-management, and memory-mode policies do not apply inside this isolated task. Follow only the delegated task instructions and your restricted tool set.'
   }
-  return memoryModePrompt(mode, referenceAt)
+  return memoryModePrompt(mode)
+}
+
+export function memoryReferenceContext(referenceAt: string): string {
+  return `Current system time and default Episode reference_at: ${referenceAt}.`
 }
 
 const atomSchema = {
@@ -313,6 +326,13 @@ export function apply(ctx: Context, config: Config) {
   const explorationAgents = new Map<string, ExplorationAgentContext>()
   const recallHandoffs = new WeakMap<object, RecallHandoff>()
   const exploreApprovalDecisions = new WeakMap<object, ExploreApprovalDecision>()
+  const turnReferenceAts = new WeakMap<object, { turn: number | undefined, value: string }>()
+  const referenceAtFor = (agent: { session: { events: readonly SessionEvent[] } } | undefined): string => {
+    if (agent === undefined) return new Date().toISOString()
+    const resolved = resolveTurnReferenceAt(agent.session.events, turnReferenceAts.get(agent))
+    turnReferenceAts.set(agent, resolved)
+    return resolved.value
+  }
   const explorationForAgent = (agent: {
     id: unknown
     session: { header: { parentSession?: unknown } }
@@ -334,6 +354,14 @@ export function apply(ctx: Context, config: Config) {
         : foldMemoryMode(context.agent.session.events, config.defaultMemoryMode),
       context.agent?.session.header.parentSession !== undefined,
     ),
+  })
+  ctx.systemPrompt.context({
+    name: 'magi-memo:reference-at',
+    order: 112,
+    text: context => context.agent === undefined
+      || context.agent.session.header.parentSession !== undefined
+      ? ''
+      : memoryReferenceContext(referenceAtFor(context.agent)),
   })
 
   ctx.inject(['sessionProjections'], (projectionCtx) => {
@@ -484,10 +512,10 @@ export function apply(ctx: Context, config: Config) {
       const payload: JsonValue = {
         content: args.content,
         kind: args.kind ?? 'conversation',
+        reference_at: args.reference_at ?? referenceAtFor(exec.agent),
         metadata: args.metadata ?? {},
         entities: args.entities ?? [],
         relations: args.relations ?? [],
-        ...(args.reference_at === undefined ? {} : { reference_at: args.reference_at }),
         ...(args.source_uri === undefined ? {} : { source_uri: args.source_uri }),
       }
       return client.writeExtracted(payload, exec.signal)

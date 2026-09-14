@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import { currentOpenTurn, foldMemoryMode, memoryModePrompt, parseMemoryMode, scopedMemoryPrompt } from '../src/index.ts'
+import { currentOpenTurn, foldMemoryMode, memoryModePrompt, memoryReferenceContext, parseMemoryMode, resolveTurnReferenceAt, scopedMemoryPrompt } from '../src/index.ts'
 
 function events(...rows: Array<Record<string, unknown>>): SessionEvent[] {
   return rows as unknown as SessionEvent[]
@@ -37,8 +37,9 @@ test('ignores an incomplete command and honors the configured default', () => {
 })
 
 test('auto prompt defines per-turn recall and write gates', () => {
-  const prompt = memoryModePrompt('auto', '2026-08-19T12:34:56.000Z')
-  assert.match(prompt, /Current system time and default Episode reference_at: 2026-08-19T12:34:56\.000Z/)
+  const prompt = memoryModePrompt('auto')
+  assert.match(prompt, /reference_at is supplied separately in runtime context/)
+  assert.doesNotMatch(prompt, /2026-\d{2}-\d{2}T|Current system time/)
   assert.match(prompt, /Do not invent a different current year/)
   assert.match(prompt, /Recall Gate/)
   assert.match(prompt, /Write Gate/)
@@ -54,6 +55,28 @@ test('auto prompt defines per-turn recall and write gates', () => {
   assert.match(prompt, /native approval prompt/)
   assert.match(prompt, /without repeating Mix/)
   assert.match(prompt, /do not retry during that turn/)
+})
+
+test('places the changing Episode reference time in runtime context', () => {
+  assert.equal(
+    memoryReferenceContext('2026-08-19T12:34:56.000Z'),
+    'Current system time and default Episode reference_at: 2026-08-19T12:34:56.000Z.',
+  )
+})
+
+test('keeps the Episode reference time stable within a turn and refreshes it for the next turn', () => {
+  let clockCalls = 0
+  const now = () => `instant-${++clockCalls}`
+  const turnOne = events({ type: 'turn/start', data: { turn: 1 } })
+  const first = resolveTurnReferenceAt(turnOne, undefined, now)
+  const sameTurn = resolveTurnReferenceAt(turnOne, first, now)
+  const turnTwo = events({ type: 'turn/start', data: { turn: 2 } })
+  const nextTurn = resolveTurnReferenceAt(turnTwo, sameTurn, now)
+
+  assert.equal(first.value, 'instant-1')
+  assert.strictEqual(sameTurn, first)
+  assert.equal(nextTurn.value, 'instant-2')
+  assert.equal(clockCalls, 2)
 })
 
 test('identifies only a currently open durable turn for recall handoff', () => {
@@ -89,7 +112,7 @@ test('explore mode selects single or concurrent retrieval through one composite 
 })
 
 test('delegated subagents do not inherit host recall and write policy', () => {
-  const prompt = scopedMemoryPrompt('explore', true, '2026-08-19T12:34:56.000Z')
+  const prompt = scopedMemoryPrompt('explore', true)
   assert.match(prompt, /delegated subagent/)
   assert.match(prompt, /do not apply inside this isolated task/)
   assert.doesNotMatch(prompt, /For every user turn|Temporal Pass|reference_at/)

@@ -1,6 +1,0 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
-#   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-21-magi-active-memory-explorer.md
-2026-08-21-magi-active-memory-explorer.md: 5ceac98365017bb955c01533ff52b1676d1af7fc
-2026-08-21-magi-active-memory-explorer.zh.md: 6889bf17609a9443f2d2fe77af258c304367aef1

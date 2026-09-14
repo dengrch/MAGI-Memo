@@ -703,6 +703,27 @@ body > [id^="dmermaid-"] {
   color: #dc2626;
 }
 
+.magi-brand-lockup {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  letter-spacing: -0.025em;
+  white-space: nowrap;
+}
+
+.magi-brand-word {
+  font-size: 1.02rem;
+  font-weight: 650;
+}
+
+.magi-brand-suffix {
+  color: var(--muted-foreground);
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 450;
+  letter-spacing: -0.01em;
+}
+
 .dark .katex .katex-error {
   background-color: rgba(255, 0, 0, 0.2);
   border-color: rgba(255, 0, 0, 0.4);

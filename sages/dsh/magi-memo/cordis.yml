@@ -1,6 +1,6 @@
 - insert:
     - id: magi-memo
-      name: '/Users/dengruochen/Desktop/MAGI-Memo/sages/dsh/magi-memo/src/index.ts'
+      name: './magi-memo/src/index.ts'
       config:
         baseUrl: !!js process.env.MAGI_MEMO_BASE_URL ?? 'http://127.0.0.1:3491'
         apiKey: !!js process.env.MAGI_MEMO_API_KEY ?? ''
