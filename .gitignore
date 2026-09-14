@@ -213,6 +213,23 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# JavaScript / TypeScript dependencies and build caches
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.pnp.*
+.vite/
+.turbo/
+*.tsbuildinfo
+
+# Local credentials and certificate material
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+
 # PyPI configuration file
 .pypirc
 
@@ -233,6 +250,8 @@ __marimo__/
 /mgc-test/
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Keep dependency lockfiles (uv.lock, bun.lock, pnpm-lock.yaml, etc.) tracked.
 
 # Local design references
 /Linear-ui-design/
