@@ -7,7 +7,7 @@ interface ImportMetaEnv {
   readonly VITE_API_PROXY: string
   /** Comma-separated list of paths the dev server forwards to the backend. */
   readonly VITE_API_ENDPOINTS: string
-  /** Backend origin the dev server forwards to (e.g. `http://localhost:3491`). */
+  /** Backend origin the dev server forwards to (e.g. `http://localhost:34913`). */
   readonly VITE_BACKEND_URL: string
 
   /* ───────────── dev-time multi-site simulation ─────────────

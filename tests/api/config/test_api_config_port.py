@@ -19,7 +19,7 @@ def test_integrated_server_defaults_to_magi_port(monkeypatch):
 
     args = parse_args()
 
-    assert DEFAULT_SERVER_PORT == 3491
+    assert DEFAULT_SERVER_PORT == 34913
     assert args.port == DEFAULT_SERVER_PORT
 
 

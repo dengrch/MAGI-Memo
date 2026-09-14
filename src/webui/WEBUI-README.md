@@ -53,11 +53,11 @@ npm run build
 
   The Vite development server listens on
   [http://127.0.0.1:5173/](http://127.0.0.1:5173/) and proxies API calls to the
-  integrated MAGI Memo server at `http://127.0.0.1:3491` by default.
+  integrated MAGI Memo server at `http://127.0.0.1:34913` by default.
 
   For normal use, build the WebUI and start `magi-core-server`. The integrated
-  service exposes the WebUI at [http://127.0.0.1:3491/](http://127.0.0.1:3491/),
-  the API documentation at [http://127.0.0.1:3491/docs](http://127.0.0.1:3491/docs),
+  service exposes the WebUI at [http://127.0.0.1:34913/](http://127.0.0.1:34913/),
+  the API documentation at [http://127.0.0.1:34913/docs](http://127.0.0.1:34913/docs),
   and the API on the same origin. No `/webui/` suffix is required.
 
 ## Script Commands

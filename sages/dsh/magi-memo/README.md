@@ -1,7 +1,7 @@
 # MAGI Memo plugin for DeepSeek Harness
 
 This local Cordis plugin connects DeepSeek Harness to the MAGI Memo service at
-`http://127.0.0.1:3491` by default. It registers the ordinary workspace and
+`http://127.0.0.1:34913` by default. It registers the ordinary workspace and
 memory tools plus an active-retrieval composite:
 
 - `magi_workspace_create`: create or reuse a workspace and activate it, only on an explicit user request.
@@ -117,7 +117,7 @@ the patch before the tools appear. Use a DSH-supported Node.js runtime
 Optional environment variables:
 
 ```sh
-export MAGI_MEMO_BASE_URL=http://127.0.0.1:3491
+export MAGI_MEMO_BASE_URL=http://127.0.0.1:34913
 export MAGI_MEMO_API_KEY=your-x-api-key
 export MAGI_MEMO_TIMEOUT_MS=30000
 export MAGI_MEMO_MAX_OUTPUT_CHARS=30000

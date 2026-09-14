@@ -44,7 +44,7 @@ cp env.example .env
 
 ```dotenv
 HOST=127.0.0.1
-PORT=3491
+PORT=34913
 WORKSPACE_HOME=./mgc-test
 
 LLM_BINDING=openai
@@ -77,9 +77,9 @@ NEO4J_DATABASE=neo4j
 
 默认入口：
 
-- WebUI：[http://127.0.0.1:3491/](http://127.0.0.1:3491/)
-- 健康检查：[http://127.0.0.1:3491/health](http://127.0.0.1:3491/health)
-- OpenAPI：[http://127.0.0.1:3491/docs](http://127.0.0.1:3491/docs)
+- WebUI：[http://127.0.0.1:34913/](http://127.0.0.1:34913/)
+- 健康检查：[http://127.0.0.1:34913/health](http://127.0.0.1:34913/health)
+- OpenAPI：[http://127.0.0.1:34913/docs](http://127.0.0.1:34913/docs)
 
 也可以使用安装后的入口：
 

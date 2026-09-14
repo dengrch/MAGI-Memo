@@ -76,12 +76,12 @@ python lightrag/evaluation/eval_rag_quality.py --dataset my_test.json
 
 **Specify custom RAG endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:3491
+python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:34913
 ```
 
 **Specify both (short form):**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:3491
+python lightrag/evaluation/eval_rag_quality.py -d my_test.json -r http://localhost:34913
 ```
 
 **Get help:**
@@ -114,7 +114,7 @@ The evaluation script supports command-line arguments for easy configuration:
 | Argument | Short | Default | Description |
 | -------- | ----- | ------- | ----------- |
 | `--dataset` | `-d` | `sample_dataset.json` | Path to test dataset JSON file |
-| `--ragendpoint` | `-r` | `http://localhost:3491` or `$LIGHTRAG_API_URL` | LightRAG API endpoint URL |
+| `--ragendpoint` | `-r` | `http://localhost:34913` or `$LIGHTRAG_API_URL` | LightRAG API endpoint URL |
 
 ### Usage Examples
 
@@ -130,12 +130,12 @@ python lightrag/evaluation/eval_rag_quality.py --dataset path/to/my_dataset.json
 
 **Default dataset with custom endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:3491
+python lightrag/evaluation/eval_rag_quality.py --ragendpoint http://my-server.com:34913
 ```
 
 **Custom dataset and endpoint:**
 ```bash
-python lightrag/evaluation/eval_rag_quality.py -d my_dataset.json -r http://localhost:3491
+python lightrag/evaluation/eval_rag_quality.py -d my_dataset.json -r http://localhost:34913
 ```
 
 **Absolute path to dataset:**
@@ -417,7 +417,7 @@ The evaluation uses your configured LLM (OpenAI by default). Ensure:
 
 ### Evaluation requires running LightRAG API
 
-The evaluator queries a running LightRAG API server at `http://localhost:3491`. Make sure:
+The evaluator queries a running LightRAG API server at `http://localhost:34913`. Make sure:
 1. LightRAG API server is running (`python lightrag/api/lightrag_server.py`)
 2. Documents are indexed in your LightRAG instance
 3. API is accessible at the configured URL
@@ -448,7 +448,7 @@ INFO:   • LLM Timeout:          180 seconds
 INFO: Test Configuration:
 INFO:   • Total Test Cases:     6
 INFO:   • Test Dataset:         sample_dataset.json
-INFO:   • LightRAG API:         http://localhost:3491
+INFO:   • LightRAG API:         http://localhost:34913
 INFO:   • Results Directory:    results
 INFO: ======================================================================
 INFO: 🚀 Starting RAGAS Evaluation of LightRAG System

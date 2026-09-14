@@ -59,7 +59,7 @@ mock.module('@/lib/utils', () => ({
 // these tests assert on.
 mock.module('@/lib/constants', () => ({
   ...realConstants,
-  backendBaseUrl: 'http://localhost:9621',
+  backendBaseUrl: 'http://localhost:34913',
   popularLabelsDefaultLimit: 300,
   searchLabelsDefaultLimit: 50,
 }))
@@ -485,7 +485,7 @@ describe('queryTextStream — auth headers', () => {
       () => {}
     )
 
-    expect(capturedUrl).toBe('http://localhost:9621/query/stream')
+    expect(capturedUrl).toBe('http://localhost:34913/query/stream')
   })
 })
 

@@ -56,7 +56,7 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  baseUrl: Schema.string().default('http://127.0.0.1:3491'),
+  baseUrl: Schema.string().default('http://127.0.0.1:34913'),
   apiKey: Schema.string().default(''),
   timeoutMs: Schema.number().default(30_000),
   maxModelOutputChars: Schema.number().default(30_000),

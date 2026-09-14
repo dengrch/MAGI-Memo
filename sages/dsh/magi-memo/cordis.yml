@@ -2,7 +2,7 @@
     - id: magi-memo
       name: './magi-memo/src/index.ts'
       config:
-        baseUrl: !!js process.env.MAGI_MEMO_BASE_URL ?? 'http://127.0.0.1:3491'
+        baseUrl: !!js process.env.MAGI_MEMO_BASE_URL ?? 'http://127.0.0.1:34913'
         apiKey: !!js process.env.MAGI_MEMO_API_KEY ?? ''
         timeoutMs: !!js Number(process.env.MAGI_MEMO_TIMEOUT_MS ?? 30000)
         maxModelOutputChars: !!js Number(process.env.MAGI_MEMO_MAX_OUTPUT_CHARS ?? 30000)

@@ -11,7 +11,7 @@ index.ts：工具 JSON Schema、system prompt、输出渲染
   ↓ typed method
 client.ts：参数检查、认证、超时、HTTP 请求与错误转换
   ↓ HTTP
-MAGI Memo :3491：workspace、Episode、Atom、图谱与检索
+MAGI Memo :34913：workspace、Episode、Atom、图谱与检索
 ```
 
 插件目录只有四类关键文件：
@@ -37,7 +37,7 @@ export function apply(ctx: Context, config: Config) { /* registrations */ }
 
 | 配置                    |                    默认值 | 作用                                  |
 | ----------------------- | ------------------------: | ------------------------------------- |
-| `baseUrl`             | `http://127.0.0.1:3491` | MAGI Memo 根地址                      |
+| `baseUrl`             | `http://127.0.0.1:34913` | MAGI Memo 根地址                      |
 | `apiKey`              |                        空 | 可选 API Key，以`X-API-Key` 发送    |
 | `timeoutMs`           |                 `30000` | 单次 HTTP 请求超时                    |
 | `maxModelOutputChars` |                 `30000` | 工具结果进入模型上下文前的最大字符数  |
@@ -161,7 +161,7 @@ pnpm dsh web --patch ./magi-memo/cordis.yml
 `cordis.yml` 支持以下环境变量：
 
 ```sh
-export MAGI_MEMO_BASE_URL=http://127.0.0.1:3491
+export MAGI_MEMO_BASE_URL=http://127.0.0.1:34913
 export MAGI_MEMO_API_KEY=
 export MAGI_MEMO_TIMEOUT_MS=30000
 export MAGI_MEMO_MAX_OUTPUT_CHARS=30000

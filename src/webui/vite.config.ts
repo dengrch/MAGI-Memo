@@ -81,7 +81,7 @@ export default defineConfig(({ mode }) => {
       }
     },
     server: {
-      // The integrated MAGI server owns 3491. Vite is only a hot-reload
+      // The integrated MAGI server owns 34913. Vite is only a hot-reload
       // development surface and proxies API calls to that server.
       port: 5173,
       strictPort: true,
@@ -90,7 +90,7 @@ export default defineConfig(({ mode }) => {
           env.VITE_API_ENDPOINTS.split(',').map(endpoint => [
             devApiPrefix + endpoint,
             {
-              target: env.VITE_BACKEND_URL || 'http://localhost:3491',
+              target: env.VITE_BACKEND_URL || 'http://localhost:34913',
               changeOrigin: true
               // No rewrite: the backend already understands its own prefix
               // via FastAPI's root_path, so forward the path verbatim.
